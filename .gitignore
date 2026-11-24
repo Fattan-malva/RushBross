@@ -1,0 +1,51 @@
+# Rust build output
+/target/
+**/target/
+
+# Debug symbols and linker leftovers
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.o
+*.d
+
+# Logs, temp files, local config
+*.log
+*.tmp
+*.bak
+*.rs.bk
+.env
+.env.*
+!.env.example
+
+# WebView2 user data profile
+*.exe.WebView2/
+**/EBWebView/
+
+# Packaged binaries and artifacts
+*.exe
+*.dll
+*.msi
+*.appx
+*.zip
+*.7z
+/dist/
+/release/
+/build/
+/out/
+
+# IDE and OS files
+.idea/
+.vscode/
+.vs/
+.fleet/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,13 @@
+[package]
+name = "rb-ui-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rb-ui.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glyphon.workspace = true
+cosmic-text.workspace = true
+bytemuck.workspace = true

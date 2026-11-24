@@ -1,0 +1,1747 @@
+use rb_bookmarks::{Bookmark, BookmarkId, BookmarkStore};
+use rb_tabs::{Tab, TabId, TabManager};
+use rb_ui::{Align, Color, FontFamily, Frame, Rect, RectShape, TextInput, TextShape, Theme, Vec2};
+
+const TAB_STRIP_HEIGHT: f32 = 40.0;
+const TAB_HEIGHT: f32 = 32.0;
+const TAB_GAP: f32 = 4.0;
+const TAB_MAX_RATIO: f32 = 0.42;
+const TOOLBAR_HEIGHT: f32 = 48.0;
+const ADDRESS_HEIGHT: f32 = 36.0;
+const BOOKMARK_BAR_HEIGHT: f32 = 32.0;
+const BOOKMARK_CHIP_HEIGHT: f32 = 24.0;
+const POPOVER_WIDTH: f32 = 320.0;
+const POPOVER_MAX_LIST_HEIGHT: f32 = 240.0;
+const ROW_HEIGHT: f32 = 36.0;
+const CONTEXT_WIDTH: f32 = 160.0;
+
+const ICON_SEARCH: &str = "\u{e721}";
+const ICON_LOCK: &str = "\u{e72e}";
+const ICON_STAR: &str = "\u{e734}";
+const ICON_STAR_FILLED: &str = "\u{e735}";
+const ICON_RELOAD: &str = "\u{e72c}";
+const ICON_ADD: &str = "\u{e710}";
+const ICON_CLOSE: &str = "\u{e711}";
+const ICON_MORE: &str = "\u{e712}";
+const ICON_BOOKMARK: &str = "\u{e8a4}";
+const ICON_EDIT: &str = "\u{e70f}";
+const ICON_DELETE: &str = "\u{e74d}";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Address,
+    BookmarkTitle,
+    BookmarkUrl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Element {
+    Tab(TabId),
+    TabClose(TabId),
+    NewTabButton,
+    Address,
+    AddressClear,
+    BookmarkStar,
+    Reload,
+    BookmarkHint,
+    BookmarkChip(BookmarkId),
+    BookmarkManage,
+    PopoverArea,
+    PopoverRow(BookmarkId),
+    PopoverEdit(BookmarkId),
+    PopoverDelete(BookmarkId),
+    EditTitle,
+    EditUrl,
+    EditCancel,
+    EditSave,
+    ContextArea,
+    ContextOpen,
+    ContextEdit,
+    ContextDelete,
+}
+
+impl Element {
+    fn is_popover(self) -> bool {
+        matches!(
+            self,
+            Element::BookmarkManage
+                | Element::PopoverArea
+                | Element::PopoverRow(_)
+                | Element::PopoverEdit(_)
+                | Element::PopoverDelete(_)
+                | Element::EditTitle
+                | Element::EditUrl
+                | Element::EditCancel
+                | Element::EditSave
+        )
+    }
+
+    fn is_context(self) -> bool {
+        matches!(
+            self,
+            Element::ContextArea
+                | Element::ContextOpen
+                | Element::ContextEdit
+                | Element::ContextDelete
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BookmarkEdit {
+    id: BookmarkId,
+    title: TextInput,
+    url: TextInput,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ContextMenu {
+    id: BookmarkId,
+    position: Vec2,
+}
+
+#[derive(Clone, Debug)]
+struct TabDrag {
+    id: TabId,
+    start: Vec2,
+    current: Vec2,
+    visual_x: f32,
+    grab_offset: f32,
+    order: Vec<TabId>,
+    target: usize,
+    dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Layout {
+    viewport: Rect,
+    manage_button: Rect,
+}
+
+#[derive(Clone, Debug)]
+pub struct NavigationRequest {
+    pub url: String,
+    pub title: String,
+}
+
+pub struct BrowserShell {
+    theme: Theme,
+    tabs: TabManager,
+    bookmarks: BookmarkStore,
+    address: TextInput,
+    focus: Option<Focus>,
+    show_bookmarks: bool,
+    editing: Option<BookmarkEdit>,
+    context_menu: Option<ContextMenu>,
+    pointer: Vec2,
+    hover: Option<Element>,
+    hits: Vec<(Element, Rect)>,
+    layout: Layout,
+    tab_rects: Vec<(TabId, Rect)>,
+    tab_drag: Option<TabDrag>,
+    pending: Option<NavigationRequest>,
+}
+
+impl Default for BrowserShell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserShell {
+    pub fn new() -> Self {
+        let mut tabs = TabManager::new();
+        tabs.open("Tab baru", Some("about:blank".to_string()));
+        let mut shell = Self {
+            theme: Theme::dark(),
+            tabs,
+            bookmarks: BookmarkStore::new(),
+            address: TextInput::new(),
+            focus: None,
+            show_bookmarks: false,
+            editing: None,
+            context_menu: None,
+            pointer: Vec2::new(-1000.0, -1000.0),
+            hover: None,
+            hits: Vec::new(),
+            layout: Layout::default(),
+            tab_rects: Vec::new(),
+            tab_drag: None,
+            pending: None,
+        };
+        shell.request_active_navigation();
+        shell
+    }
+
+    pub fn render(&mut self, width: f32, height: f32) -> Frame {
+        let _ = self.build(width, height);
+        let hover = self.hit_at(self.pointer).map(|(element, _)| element);
+        if hover != self.hover {
+            self.hover = hover;
+        }
+        self.build(width, height)
+    }
+
+    pub fn pointer_moved(&mut self, position: Vec2) {
+        self.pointer = position;
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return;
+        };
+        drag.current = position;
+        let moved = (position.x - drag.start.x).hypot(position.y - drag.start.y);
+        if !drag.dragging && moved > 4.0 {
+            drag.dragging = true;
+        }
+        if !drag.dragging {
+            return;
+        }
+        let order = drag.order.clone();
+        let dragged = drag.id;
+        let mut target = 0usize;
+        for id in order.iter() {
+            if *id == dragged {
+                continue;
+            }
+            if let Some((_, rect)) = self.tab_rects.iter().find(|(tab_id, _)| tab_id == id) {
+                if position.x < rect.center().x {
+                    break;
+                }
+            }
+            target += 1;
+        }
+        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.target = target;
+        }
+        self.tabs.move_to(dragged, target);
+    }
+
+    pub fn left_click(&mut self, position: Vec2) {
+        self.pointer = position;
+        let hit = self.hit_at(position);
+
+        if let Some((Element::Tab(id), rect)) = hit {
+            self.tab_drag = Some(TabDrag {
+                id,
+                start: position,
+                current: position,
+                visual_x: rect.x,
+                grab_offset: position.x - rect.x,
+                order: self.tabs.tabs().iter().map(|tab| tab.id).collect(),
+                target: self.tabs.index_of(id).unwrap_or(0),
+                dragging: false,
+            });
+        }
+
+        if let Some(element) = hit.map(|(element, _)| element) {
+            if self.context_menu.is_some() && !element.is_context() {
+                self.context_menu = None;
+            }
+            if self.show_bookmarks && !element.is_popover() {
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.blur();
+            }
+            self.activate(element);
+        } else {
+            self.context_menu = None;
+            if self.show_bookmarks {
+                self.show_bookmarks = false;
+                self.editing = None;
+            }
+            self.blur();
+        }
+    }
+
+    pub fn left_released(&mut self, position: Vec2) {
+        self.pointer = position;
+        self.tab_drag = None;
+    }
+
+    pub fn animate_tabs(&mut self) -> bool {
+        let Some(drag) = self.tab_drag.as_mut() else {
+            return false;
+        };
+        if !drag.dragging {
+            return false;
+        }
+        let target = drag.current.x - drag.grab_offset;
+        drag.visual_x += (target - drag.visual_x) * 0.35;
+        (target - drag.visual_x).abs() > 0.4
+    }
+
+    pub fn right_click(&mut self, position: Vec2) {
+        self.pointer = position;
+        let hit = self.hit_at(position).map(|(element, _)| element);
+        let target = match hit {
+            Some(Element::BookmarkChip(id)) | Some(Element::PopoverRow(id)) => Some(id),
+            _ => None,
+        };
+        match target {
+            Some(id) => {
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.context_menu = Some(ContextMenu { id, position });
+                self.blur();
+            }
+            None => {
+                self.context_menu = None;
+            }
+        }
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    pub fn insert_text(&mut self, text: &str) {
+        match self.focus {
+            Some(Focus::Address) => self.address.insert_text(text),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.insert_text(text);
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.insert_text(text);
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        match self.focus {
+            Some(Focus::Address) => self.address.backspace(),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.backspace();
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.backspace();
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn delete_forward(&mut self) {
+        match self.focus {
+            Some(Focus::Address) => self.address.delete_forward(),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.delete_forward();
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.delete_forward();
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn move_left(&mut self, word: bool) {
+        match self.focus {
+            Some(Focus::Address) => self.address.move_left(word),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.move_left(word);
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.move_left(word);
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn move_right(&mut self, word: bool) {
+        match self.focus {
+            Some(Focus::Address) => self.address.move_right(word),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.move_right(word);
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.move_right(word);
+                }
+            }
+            None => {}
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.field_mut(|field| field.move_home());
+    }
+
+    pub fn move_end(&mut self) {
+        self.field_mut(|field| field.move_end());
+    }
+
+    pub fn select_all(&mut self) {
+        self.field_mut(|field| field.select_all());
+    }
+
+    pub fn focus_address(&mut self) {
+        self.focus = Some(Focus::Address);
+        self.address.select_all();
+    }
+
+    pub fn submit(&mut self) {
+        let raw = self.address.text().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let url = resolve_target(&raw);
+        let title = host_from_url(&url);
+        self.navigate(url, title);
+        self.focus = None;
+    }
+
+    pub fn escape(&mut self) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            return;
+        }
+        if self.show_bookmarks {
+            self.show_bookmarks = false;
+            self.editing = None;
+            return;
+        }
+        self.blur();
+    }
+
+    pub fn new_tab(&mut self) {
+        self.tabs.open("Tab baru", Some("about:blank".to_string()));
+        self.request_active_navigation();
+        self.address.clear();
+        self.focus = None;
+        self.show_bookmarks = false;
+    }
+
+    pub fn close_active_tab(&mut self) {
+        if let Some(id) = self.tabs.active_id() {
+            self.close_tab(id);
+        }
+    }
+
+    pub fn cycle_tabs(&mut self, delta: isize) {
+        if self.tabs.tabs().len() < 2 {
+            return;
+        }
+        self.tabs.cycle(delta);
+        self.request_active_navigation();
+        self.sync_address_to_active();
+        self.focus = None;
+    }
+
+    pub fn toggle_bookmark(&mut self) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let Some(url) = tab.url.clone() else {
+            return;
+        };
+        let normalized = normalize_url(&url).unwrap_or(url);
+        if let Some(existing) = self.bookmarks.find_by_url(&normalized) {
+            let id = existing.id;
+            self.bookmarks.remove(id);
+            if self.editing.as_ref().map(|edit| edit.id) == Some(id) {
+                self.editing = None;
+            }
+            return;
+        }
+        self.bookmarks.add(tab.title.clone(), normalized);
+    }
+
+    pub fn take_navigation(&mut self) -> Option<NavigationRequest> {
+        self.pending.take()
+    }
+
+    pub fn content_rect(&self, width: f32, height: f32) -> Rect {
+        let (width, height) = (width.max(0.0), height.max(0.0));
+        let top = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT + BOOKMARK_BAR_HEIGHT;
+        Rect::new(0.0, top, width, (height - top).max(0.0))
+    }
+
+    pub fn webview_title_changed(&mut self, title: &str) {
+        if title.trim().is_empty() {
+            return;
+        }
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.title = title.to_string();
+        }
+    }
+
+    pub fn webview_url_changed(&mut self, url: &str) {
+        if url.is_empty() || url == "about:blank" {
+            return;
+        }
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        if tab.url.as_deref() == Some(url) {
+            return;
+        }
+        tab.push_navigation(url.to_string());
+        if self.focus != Some(Focus::Address) {
+            self.address.set_text(url);
+        }
+    }
+
+    pub fn webview_new_window(&mut self, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        self.tabs.open(host_from_url(url), Some(url.to_string()));
+        self.request_active_navigation();
+    }
+
+    pub fn reload(&mut self) {
+        self.request_active_navigation();
+    }
+
+    pub fn go_back(&mut self) {
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        if let Some(url) = tab.back() {
+            self.address.set_text(&url);
+            self.pending = Some(NavigationRequest {
+                url,
+                title: self
+                    .tabs
+                    .active()
+                    .map(|tab| tab.title.clone())
+                    .unwrap_or_default(),
+            });
+            self.focus = None;
+        }
+    }
+
+    pub fn go_forward(&mut self) {
+        let Some(tab) = self.tabs.active_mut() else {
+            return;
+        };
+        if let Some(url) = tab.forward() {
+            self.address.set_text(&url);
+            self.pending = Some(NavigationRequest {
+                url,
+                title: self
+                    .tabs
+                    .active()
+                    .map(|tab| tab.title.clone())
+                    .unwrap_or_default(),
+            });
+            self.focus = None;
+        }
+    }
+
+    fn field_mut(&mut self, action: impl FnOnce(&mut TextInput)) {
+        match self.focus {
+            Some(Focus::Address) => action(&mut self.address),
+            Some(Focus::BookmarkTitle) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    action(&mut edit.title);
+                }
+            }
+            Some(Focus::BookmarkUrl) => {
+                if let Some(edit) = self.editing.as_mut() {
+                    action(&mut edit.url);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn blur(&mut self) {
+        self.focus = None;
+    }
+
+    fn activate(&mut self, element: Element) {
+        match element {
+            Element::Tab(id) => {
+                let changed = self.tabs.active_id() != Some(id);
+                self.tabs.activate(id);
+                if changed {
+                    self.request_active_navigation();
+                }
+                self.sync_address_to_active();
+                self.focus = None;
+            }
+            Element::TabClose(id) => self.close_tab(id),
+            Element::NewTabButton => self.new_tab(),
+            Element::Address => {
+                self.focus = Some(Focus::Address);
+                self.address.select_all();
+            }
+            Element::AddressClear => {
+                self.address.clear();
+                self.focus = Some(Focus::Address);
+            }
+            Element::BookmarkStar => self.toggle_bookmark(),
+            Element::Reload => self.reload(),
+            Element::BookmarkHint => {
+                self.show_bookmarks = true;
+            }
+            Element::BookmarkChip(id) => {
+                if let Some(bookmark) = self.bookmarks.get(id).cloned() {
+                    self.navigate(bookmark.url, bookmark.title);
+                    self.show_bookmarks = false;
+                    self.focus = None;
+                }
+            }
+            Element::BookmarkManage => {
+                self.show_bookmarks = !self.show_bookmarks;
+                self.editing = None;
+                self.context_menu = None;
+            }
+            Element::PopoverArea => {}
+            Element::PopoverRow(id) => {
+                if let Some(bookmark) = self.bookmarks.get(id).cloned() {
+                    self.navigate(bookmark.url, bookmark.title);
+                    self.show_bookmarks = false;
+                    self.focus = None;
+                }
+            }
+            Element::PopoverEdit(id) => {
+                if let Some(bookmark) = self.bookmarks.get(id).cloned() {
+                    self.editing = Some(BookmarkEdit {
+                        id,
+                        title: text_input(bookmark.title),
+                        url: text_input(bookmark.url),
+                    });
+                    if let Some(edit) = self.editing.as_mut() {
+                        edit.title.select_all();
+                    }
+                    self.focus = Some(Focus::BookmarkTitle);
+                }
+            }
+            Element::PopoverDelete(id) => {
+                self.bookmarks.remove(id);
+                if self.editing.as_ref().map(|edit| edit.id) == Some(id) {
+                    self.editing = None;
+                    self.focus = None;
+                }
+            }
+            Element::EditTitle => {
+                self.focus = Some(Focus::BookmarkTitle);
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.title.select_all();
+                }
+            }
+            Element::EditUrl => {
+                self.focus = Some(Focus::BookmarkUrl);
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.url.select_all();
+                }
+            }
+            Element::EditCancel => {
+                self.editing = None;
+                self.focus = None;
+            }
+            Element::EditSave => self.save_bookmark_edit(),
+            Element::ContextArea => {}
+            Element::ContextOpen => {
+                if let Some(menu) = self.context_menu {
+                    if let Some(bookmark) = self.bookmarks.get(menu.id).cloned() {
+                        self.navigate(bookmark.url, bookmark.title);
+                    }
+                }
+                self.context_menu = None;
+                self.focus = None;
+            }
+            Element::ContextEdit => {
+                if let Some(menu) = self.context_menu {
+                    if let Some(bookmark) = self.bookmarks.get(menu.id).cloned() {
+                        self.editing = Some(BookmarkEdit {
+                            id: menu.id,
+                            title: text_input(bookmark.title),
+                            url: text_input(bookmark.url),
+                        });
+                        if let Some(edit) = self.editing.as_mut() {
+                            edit.title.select_all();
+                        }
+                        self.focus = Some(Focus::BookmarkTitle);
+                    }
+                    self.show_bookmarks = true;
+                }
+                self.context_menu = None;
+            }
+            Element::ContextDelete => {
+                if let Some(menu) = self.context_menu {
+                    self.bookmarks.remove(menu.id);
+                }
+                self.context_menu = None;
+            }
+        }
+    }
+
+    fn save_bookmark_edit(&mut self) {
+        let Some(edit) = self.editing.take() else {
+            return;
+        };
+        let normalized = normalize_url(edit.url.text()).unwrap_or_default();
+        if normalized.is_empty() {
+            self.editing = Some(edit);
+            return;
+        }
+        let title = if edit.title.text().trim().is_empty() {
+            host_from_url(&normalized)
+        } else {
+            edit.title.text().trim().to_string()
+        };
+        self.bookmarks.update(edit.id, title, normalized);
+        self.focus = None;
+    }
+
+    fn close_tab(&mut self, id: TabId) {
+        let was_active = self.tabs.active_id() == Some(id);
+        self.tabs.close(id);
+        if self.tab_drag.as_ref().map(|drag| drag.id) == Some(id) {
+            self.tab_drag = None;
+        }
+        if was_active {
+            self.request_active_navigation();
+            self.sync_address_to_active();
+            self.focus = None;
+        }
+    }
+
+    fn sync_address_to_active(&mut self) {
+        let value = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.url.clone())
+            .unwrap_or_default();
+        if value.is_empty() {
+            self.address.clear();
+        } else {
+            self.address.set_text(value);
+        }
+    }
+
+    fn navigate(&mut self, url: String, title: String) {
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.push_navigation(url.clone());
+            tab.title = title.clone();
+        } else {
+            self.tabs.open(title.clone(), Some(url.clone()));
+        }
+        self.address.set_text(url.clone());
+        self.pending = Some(NavigationRequest { url, title });
+        self.show_bookmarks = false;
+        self.context_menu = None;
+    }
+
+    fn request_active_navigation(&mut self) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let url = tab.url.clone().unwrap_or_else(|| "about:blank".to_string());
+        let title = tab.title.clone();
+        self.pending = Some(NavigationRequest { url, title });
+    }
+
+    fn hit_at(&self, position: Vec2) -> Option<(Element, Rect)> {
+        self.hits
+            .iter()
+            .rev()
+            .find(|(_, rect)| rect.contains(position))
+            .copied()
+    }
+
+    fn push_hit(&mut self, element: Element, rect: Rect) {
+        self.hits.push((element, rect));
+    }
+
+    fn build(&mut self, width: f32, height: f32) -> Frame {
+        let theme = self.theme;
+        let tabs: Vec<Tab> = self.tabs.tabs().to_vec();
+        let active_id = self.tabs.active_id();
+        let bookmarks: Vec<Bookmark> = self.bookmarks.items().to_vec();
+        let address_text = self.address.text().to_string();
+        let address_cursor = self.address.cursor();
+        let focus = self.focus;
+        let editing = self.editing.clone();
+        let hover = self.hover;
+        let show_bookmarks = self.show_bookmarks;
+        let context_menu = self.context_menu;
+
+        self.hits.clear();
+        let mut frame = Frame::default();
+        let base = &mut frame.base;
+
+        base.push_rect(RectShape::filled(
+            Rect::new(0.0, 0.0, width, height),
+            theme.background,
+            0.0,
+        ));
+
+        let tab_strip = Rect::new(0.0, 0.0, width, TAB_STRIP_HEIGHT);
+        base.push_rect(RectShape::filled(tab_strip, theme.tab_strip, 0.0));
+
+        let toolbar = Rect::new(0.0, TAB_STRIP_HEIGHT, width, TOOLBAR_HEIGHT);
+        let bookmark_bar = Rect::new(0.0, toolbar.bottom(), width, BOOKMARK_BAR_HEIGHT);
+        let viewport = Rect::new(
+            0.0,
+            bookmark_bar.bottom(),
+            width,
+            (height - bookmark_bar.bottom()).max(0.0),
+        );
+        self.layout.viewport = viewport;
+
+        self.build_tabs(base, tab_strip, width, &tabs, active_id, hover);
+        self.build_toolbar(
+            base,
+            toolbar,
+            width,
+            active_id,
+            &address_text,
+            address_cursor,
+            focus,
+            hover,
+        );
+        self.build_bookmark_bar(base, bookmark_bar, width, &bookmarks, active_id, hover);
+        self.build_viewport(base, viewport);
+
+        if show_bookmarks {
+            self.build_bookmark_popover(
+                &mut frame, width, height, &bookmarks, &editing, focus, hover,
+            );
+        }
+
+        if let Some(menu) = context_menu {
+            self.build_context_menu(&mut frame, width, height, &bookmarks, menu, hover);
+        }
+
+        frame
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tab(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        tab: &Tab,
+        rect: Rect,
+        is_active: bool,
+        is_hover: bool,
+        hover: Option<Element>,
+        floating: bool,
+    ) {
+        let theme = self.theme;
+        let background = if floating {
+            theme.accent.with_alpha(0.92)
+        } else if is_active {
+            theme.background
+        } else if is_hover {
+            theme.tab_hover
+        } else {
+            theme.tab_inactive
+        };
+        layer.push_rect(RectShape::filled(rect, background, 6.0));
+        if !floating {
+            self.push_hit(Element::Tab(tab.id), rect);
+        }
+
+        let close_rect = Rect::new(rect.right() - 10.0 - 20.0, rect.y + 6.0, 20.0, 20.0);
+        let title_width = (close_rect.x - 8.0 - (rect.x + 10.0)).max(0.0);
+        let title_color = if is_active || floating {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        let mut title = TextShape::new(
+            tab.title.clone(),
+            rect.x + 10.0,
+            rect.y + (TAB_HEIGHT - 12.0 * 1.3) * 0.5,
+            12.0,
+            title_color,
+        )
+        .width(title_width)
+        .ellipsis();
+        if title_width <= 0.0 {
+            title.text.clear();
+        }
+        layer.push_text(title);
+
+        if floating {
+            return;
+        }
+        let close_hover = hover == Some(Element::TabClose(tab.id));
+        if close_hover {
+            layer.push_rect(RectShape::filled(close_rect, theme.accent, 4.0));
+        }
+        let close_color = if close_hover {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        layer.push_text(icon(ICON_CLOSE, close_rect.center(), 12.0, close_color));
+        self.push_hit(Element::TabClose(tab.id), close_rect);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_tabs(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        strip: Rect,
+        width: f32,
+        tabs: &[Tab],
+        active_id: Option<TabId>,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let padding = 8.0;
+        let plus_size = 28.0;
+        let available = (width - padding * 2.0 - plus_size - TAB_GAP).max(0.0);
+        let max_width = width * TAB_MAX_RATIO;
+        let dragged = self
+            .tab_drag
+            .as_ref()
+            .filter(|drag| drag.dragging)
+            .map(|drag| (drag.id, drag.visual_x));
+
+        let naturals: Vec<f32> = tabs
+            .iter()
+            .map(|tab| {
+                let title = approx_text_width(&tab.title, 12.0);
+                (10.0 + title + 8.0 + 20.0 + 10.0)
+                    .clamp(60.0, max_width)
+                    .min(max_width)
+            })
+            .collect();
+        let mut widths = naturals.clone();
+        if !tabs.is_empty() {
+            let sum: f32 = naturals.iter().sum();
+            let gaps = TAB_GAP * (tabs.len() as f32 - 1.0);
+            if sum + gaps > available {
+                let scale = ((available - gaps).max(0.0) / sum.max(1.0)).clamp(0.0, 1.0);
+                widths = naturals
+                    .iter()
+                    .map(|value| (value * scale).max(48.0).min(*value))
+                    .collect();
+            }
+        }
+
+        self.tab_rects.clear();
+        let mut x = padding;
+        for (index, tab) in tabs.iter().enumerate() {
+            let tab_width = widths[index];
+            let tab_rect = Rect::new(x, strip.y + 8.0, tab_width, TAB_HEIGHT);
+            self.tab_rects.push((tab.id, tab_rect));
+            let is_active = active_id == Some(tab.id);
+            let is_hover = hover == Some(Element::Tab(tab.id));
+            if dragged.map(|(id, _)| id) != Some(tab.id) {
+                self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover, false);
+            }
+            x += tab_width + TAB_GAP;
+        }
+
+        let plus_rect = Rect::new(x, strip.y + 10.0, plus_size, plus_size);
+        let plus_hover = hover == Some(Element::NewTabButton);
+        if plus_hover {
+            layer.push_rect(RectShape::filled(plus_rect, theme.accent, 6.0));
+        }
+        let plus_color = if plus_hover {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        layer.push_text(icon(ICON_ADD, plus_rect.center(), 16.0, plus_color));
+        self.push_hit(Element::NewTabButton, plus_rect);
+
+        if let Some((dragged_id, visual_x)) = dragged {
+            if let Some(index) = tabs.iter().position(|tab| tab.id == dragged_id) {
+                let rect = Rect::new(visual_x, strip.y + 4.0, widths[index], TAB_HEIGHT);
+                self.draw_tab(
+                    layer,
+                    &tabs[index],
+                    rect,
+                    active_id == Some(dragged_id),
+                    true,
+                    hover,
+                    true,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_toolbar(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        toolbar: Rect,
+        width: f32,
+        active_id: Option<TabId>,
+        address: &str,
+        cursor: usize,
+        focus: Option<Focus>,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let left = 8.0;
+        let right = 8.0;
+        let reload_size = 32.0;
+        let gap = 8.0;
+
+        let form = Rect::new(
+            left,
+            toolbar.y + 6.0,
+            (width - left - right - reload_size - gap).max(1.0),
+            ADDRESS_HEIGHT,
+        );
+        let reload_rect = Rect::new(
+            form.right() + gap,
+            toolbar.y + 8.0,
+            reload_size,
+            reload_size,
+        );
+
+        let has_url = active_id
+            .and_then(|id| self.tabs.tab(id))
+            .and_then(|tab| tab.url.as_ref())
+            .is_some();
+        let form_focused = focus == Some(Focus::Address);
+        let is_url = normalize_url(address).is_some();
+
+        if form_focused {
+            let ring = Rect::new(
+                form.x - 2.0,
+                form.y - 2.0,
+                form.width + 4.0,
+                form.height + 4.0,
+            );
+            layer.push_rect(RectShape::bordered(
+                ring,
+                Color::TRANSPARENT,
+                20.0,
+                2.0,
+                theme.ring.with_alpha(0.35),
+            ));
+        }
+
+        let form_bg = if form_focused {
+            theme.background
+        } else {
+            theme.muted
+        };
+        if form_focused {
+            layer.push_rect(RectShape::bordered(form, form_bg, 18.0, 1.0, theme.ring));
+        } else {
+            layer.push_rect(RectShape::filled(form, form_bg, 18.0));
+        }
+        self.push_hit(Element::Address, form);
+
+        let icon_x = form.x + 12.0;
+        let icon_center = Vec2::new(icon_x + 8.0, form.center().y);
+        let icon_glyph = if is_url { ICON_LOCK } else { ICON_SEARCH };
+        layer.push_text(icon(icon_glyph, icon_center, 16.0, theme.muted_foreground));
+
+        let star_rect = Rect::new(form.right() - 10.0 - 20.0, form.y + 8.0, 20.0, 20.0);
+        let clear_rect = if address.is_empty() {
+            None
+        } else {
+            Some(Rect::new(
+                star_rect.x - 4.0 - 20.0,
+                form.y + 8.0,
+                20.0,
+                20.0,
+            ))
+        };
+        let text_x = icon_center.x + 8.0 + 8.0;
+        let text_end = clear_rect.map(|rect| rect.x).unwrap_or(star_rect.x);
+        let text_width = (text_end - 8.0 - text_x).max(0.0);
+
+        let active_bookmark = self
+            .tabs
+            .active()
+            .and_then(|tab| tab.url.as_deref())
+            .and_then(|url| self.bookmarks.find_by_url(url).map(|item| item.id));
+        let bookmarked = active_bookmark.is_some();
+        let caret = if form_focused { Some(cursor) } else { None };
+
+        if address.is_empty() {
+            layer.push_text(
+                TextShape::new(
+                    "Cari atau ketik URL",
+                    text_x,
+                    form.y + (ADDRESS_HEIGHT - 14.0 * 1.3) * 0.5,
+                    14.0,
+                    theme.muted_foreground,
+                )
+                .width(text_width)
+                .ellipsis(),
+            );
+        } else {
+            layer.push_text(
+                TextShape::new(
+                    address.to_string(),
+                    text_x,
+                    form.y + (ADDRESS_HEIGHT - 14.0 * 1.3) * 0.5,
+                    14.0,
+                    theme.foreground,
+                )
+                .width(text_width)
+                .ellipsis()
+                .caret(caret, theme.foreground),
+            );
+        }
+
+        if let Some(clear_rect) = clear_rect {
+            let is_hover = hover == Some(Element::AddressClear);
+            if is_hover {
+                layer.push_rect(RectShape::filled(clear_rect, theme.accent, 10.0));
+            }
+            let color = if is_hover {
+                theme.foreground
+            } else {
+                theme.muted_foreground
+            };
+            layer.push_text(icon(ICON_CLOSE, clear_rect.center(), 12.0, color));
+            self.push_hit(Element::AddressClear, clear_rect);
+        }
+
+        let star_hover = hover == Some(Element::BookmarkStar) && has_url;
+        if star_hover {
+            layer.push_rect(RectShape::filled(star_rect, theme.accent, 10.0));
+        }
+        let star_color = if !has_url {
+            theme.muted_foreground.with_alpha(0.4)
+        } else if bookmarked {
+            theme.star_fill
+        } else if star_hover {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        let star_glyph = if bookmarked {
+            ICON_STAR_FILLED
+        } else {
+            ICON_STAR
+        };
+        layer.push_text(icon(star_glyph, star_rect.center(), 16.0, star_color));
+        self.push_hit(Element::BookmarkStar, star_rect);
+
+        let reload_hover = hover == Some(Element::Reload) && has_url;
+        if reload_hover {
+            layer.push_rect(RectShape::filled(reload_rect, theme.accent, 6.0));
+        }
+        let reload_color = if !has_url {
+            theme.muted_foreground.with_alpha(0.4)
+        } else if reload_hover {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        layer.push_text(icon(ICON_RELOAD, reload_rect.center(), 16.0, reload_color));
+        self.push_hit(Element::Reload, reload_rect);
+    }
+
+    fn build_bookmark_bar(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        bar: Rect,
+        width: f32,
+        bookmarks: &[Bookmark],
+        _active_id: Option<TabId>,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        layer.push_rect(RectShape::filled(
+            Rect::new(bar.x, bar.bottom() - 1.0, bar.width, 1.0),
+            theme.border,
+            0.0,
+        ));
+
+        let icon_rect = Rect::new(bar.x + 12.0, bar.y + 9.0, 14.0, 14.0);
+        layer.push_text(icon(
+            ICON_BOOKMARK,
+            icon_rect.center(),
+            14.0,
+            theme.muted_foreground,
+        ));
+
+        let manage_rect = Rect::new(width - 12.0 - 24.0, bar.y + 4.0, 24.0, 24.0);
+        self.layout.manage_button = manage_rect;
+
+        let strip_left = icon_rect.right() + 8.0;
+        let strip_right = manage_rect.x - 8.0;
+
+        if bookmarks.is_empty() {
+            let message = "Belum ada bookmark. Klik bintang di alamat untuk menyimpan halaman.";
+            let width_est = approx_text_width(message, 11.0);
+            let text_rect = Rect::new(strip_left, bar.y + 8.0, width_est, 16.0);
+            let is_hover = hover == Some(Element::BookmarkHint);
+            let color = if is_hover {
+                theme.foreground
+            } else {
+                theme.muted_foreground
+            };
+            layer.push_text(
+                TextShape::new(
+                    message,
+                    strip_left,
+                    bar.y + (BOOKMARK_BAR_HEIGHT - 11.0 * 1.3) * 0.5,
+                    11.0,
+                    color,
+                )
+                .width((strip_right - strip_left).max(0.0))
+                .ellipsis(),
+            );
+            self.push_hit(Element::BookmarkHint, text_rect);
+        } else {
+            let mut x = strip_left;
+            for bookmark in bookmarks {
+                if x >= strip_right {
+                    break;
+                }
+                let chip_width =
+                    (8.0 + 14.0 + 6.0 + approx_text_width(&bookmark.title, 11.0) + 8.0).min(180.0);
+                let visible_width = (strip_right - x).min(chip_width);
+                if visible_width < 12.0 {
+                    break;
+                }
+                let chip_rect = Rect::new(
+                    x,
+                    bar.y + (BOOKMARK_BAR_HEIGHT - BOOKMARK_CHIP_HEIGHT) * 0.5,
+                    visible_width,
+                    BOOKMARK_CHIP_HEIGHT,
+                );
+                let is_hover = hover == Some(Element::BookmarkChip(bookmark.id));
+                if is_hover {
+                    layer.push_rect(RectShape::filled(chip_rect, theme.muted, 4.0));
+                }
+
+                let badge = Rect::new(
+                    chip_rect.x + 8.0,
+                    chip_rect.y + (BOOKMARK_CHIP_HEIGHT - 14.0) * 0.5,
+                    14.0,
+                    14.0,
+                );
+                layer.push_rect(RectShape::filled(badge, theme.muted, 2.0));
+                let first = bookmark
+                    .title
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_uppercase().to_string())
+                    .unwrap_or_default();
+                layer.push_text(
+                    TextShape::new(
+                        first,
+                        badge.x,
+                        badge.y + (14.0 - 9.0 * 1.3) * 0.5,
+                        9.0,
+                        theme.foreground,
+                    )
+                    .width(badge.width)
+                    .weight(600)
+                    .align(Align::Center),
+                );
+
+                let label_x = badge.right() + 6.0;
+                let label_width = (chip_rect.right() - 8.0 - label_x).max(0.0);
+                let label_color = if is_hover {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                };
+                layer.push_text(
+                    TextShape::new(
+                        bookmark.title.clone(),
+                        label_x,
+                        chip_rect.y + (BOOKMARK_CHIP_HEIGHT - 11.0 * 1.3) * 0.5,
+                        11.0,
+                        label_color,
+                    )
+                    .width(label_width)
+                    .ellipsis(),
+                );
+
+                self.push_hit(Element::BookmarkChip(bookmark.id), chip_rect);
+                x += chip_width + 4.0;
+            }
+        }
+
+        let manage_hover = hover == Some(Element::BookmarkManage);
+        if manage_hover {
+            layer.push_rect(RectShape::filled(manage_rect, theme.accent, 4.0));
+        }
+        let manage_color = if manage_hover {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        layer.push_text(icon(ICON_MORE, manage_rect.center(), 14.0, manage_color));
+        self.push_hit(Element::BookmarkManage, manage_rect);
+    }
+
+    fn build_viewport(&mut self, layer: &mut rb_ui::Layer, viewport: Rect) {
+        layer.push_rect(RectShape::filled(viewport, self.theme.background, 0.0));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_bookmark_popover(
+        &mut self,
+        frame: &mut Frame,
+        width: f32,
+        height: f32,
+        bookmarks: &[Bookmark],
+        editing: &Option<BookmarkEdit>,
+        focus: Option<Focus>,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let manage = self.layout.manage_button;
+        let x = (manage.right() - POPOVER_WIDTH)
+            .max(8.0)
+            .min((width - POPOVER_WIDTH - 8.0).max(8.0));
+        let y = (manage.bottom() + 4.0).min((height - 120.0).max(8.0));
+        let list_count = bookmarks
+            .len()
+            .min((POPOVER_MAX_LIST_HEIGHT / ROW_HEIGHT) as usize);
+        let list_height = list_count as f32 * ROW_HEIGHT;
+        let empty_height = if bookmarks.is_empty() { 48.0 } else { 0.0 };
+        let edit_height = if editing.is_some() { 132.0 } else { 0.0 };
+        let popover_height = 8.0 + 24.0 + 8.0 + list_height.max(empty_height) + edit_height + 8.0;
+
+        let popover = Rect::new(x, y, POPOVER_WIDTH, popover_height);
+        let layer = &mut frame.overlay;
+        layer.push_rect(RectShape::bordered(
+            popover,
+            theme.popover,
+            6.0,
+            1.0,
+            theme.border,
+        ));
+        self.push_hit(Element::PopoverArea, popover);
+
+        let header_y = popover.y + 8.0 + 4.0;
+        layer.push_text(
+            TextShape::new(
+                "Bookmark",
+                popover.x + 16.0,
+                header_y,
+                12.0,
+                theme.popover_foreground,
+            )
+            .weight(600),
+        );
+        layer.push_text(
+            TextShape::new(
+                format!("{} tersimpan", bookmarks.len()),
+                popover.x + 16.0,
+                header_y + 1.0,
+                10.0,
+                theme.muted_foreground,
+            )
+            .width(popover.width - 32.0)
+            .align(Align::Right),
+        );
+
+        let list_y = popover.y + 8.0 + 24.0 + 8.0;
+        if bookmarks.is_empty() {
+            layer.push_text(
+                TextShape::new(
+                    "Belum ada bookmark.",
+                    popover.x,
+                    list_y + 16.0,
+                    12.0,
+                    theme.muted_foreground,
+                )
+                .width(popover.width)
+                .align(Align::Center),
+            );
+        } else {
+            for (index, bookmark) in bookmarks.iter().take(list_count).enumerate() {
+                let row = Rect::new(
+                    popover.x + 8.0,
+                    list_y + index as f32 * ROW_HEIGHT,
+                    popover.width - 16.0,
+                    ROW_HEIGHT,
+                );
+                let is_hover = hover == Some(Element::PopoverRow(bookmark.id));
+                if is_hover {
+                    layer.push_rect(RectShape::filled(row, theme.muted, 6.0));
+                }
+                let edit_rect = Rect::new(row.right() - 48.0 - 4.0, row.y + 6.0, 24.0, 24.0);
+                let delete_rect = Rect::new(row.right() - 24.0 - 4.0, row.y + 6.0, 24.0, 24.0);
+                let title_width = (edit_rect.x - row.x - 8.0).max(0.0);
+                layer.push_text(
+                    TextShape::new(
+                        bookmark.title.clone(),
+                        row.x + 8.0,
+                        row.y + 4.0,
+                        12.0,
+                        theme.popover_foreground,
+                    )
+                    .width(title_width)
+                    .ellipsis(),
+                );
+                layer.push_text(
+                    TextShape::new(
+                        bookmark.url.clone(),
+                        row.x + 8.0,
+                        row.y + 19.0,
+                        10.0,
+                        theme.muted_foreground,
+                    )
+                    .width(title_width)
+                    .ellipsis(),
+                );
+                self.push_hit(
+                    Element::PopoverRow(bookmark.id),
+                    Rect::new(row.x, row.y, title_width + 8.0, row.height),
+                );
+
+                let edit_hover = hover == Some(Element::PopoverEdit(bookmark.id));
+                if edit_hover {
+                    layer.push_rect(RectShape::filled(edit_rect, theme.accent, 4.0));
+                }
+                layer.push_text(icon(
+                    ICON_EDIT,
+                    edit_rect.center(),
+                    12.0,
+                    if edit_hover {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    },
+                ));
+                self.push_hit(Element::PopoverEdit(bookmark.id), edit_rect);
+
+                let delete_hover = hover == Some(Element::PopoverDelete(bookmark.id));
+                if delete_hover {
+                    layer.push_rect(RectShape::filled(
+                        delete_rect,
+                        theme.destructive.with_alpha(0.1),
+                        4.0,
+                    ));
+                }
+                layer.push_text(icon(
+                    ICON_DELETE,
+                    delete_rect.center(),
+                    12.0,
+                    if delete_hover {
+                        theme.destructive
+                    } else {
+                        theme.muted_foreground
+                    },
+                ));
+                self.push_hit(Element::PopoverDelete(bookmark.id), delete_rect);
+            }
+        }
+
+        if let Some(edit) = editing {
+            let edit_top = list_y + list_height.max(empty_height) + 8.0;
+            let separator = Rect::new(popover.x + 8.0, edit_top - 4.0, popover.width - 16.0, 1.0);
+            layer.push_rect(RectShape::filled(separator, theme.border, 0.0));
+
+            let title_rect = Rect::new(popover.x + 8.0, edit_top, popover.width - 16.0, 32.0);
+            self.build_edit_input(
+                layer,
+                title_rect,
+                edit.title.text(),
+                edit.title.cursor(),
+                focus == Some(Focus::BookmarkTitle),
+                "Nama bookmark",
+                Element::EditTitle,
+            );
+
+            let url_rect = Rect::new(popover.x + 8.0, edit_top + 40.0, popover.width - 16.0, 32.0);
+            self.build_edit_input(
+                layer,
+                url_rect,
+                edit.url.text(),
+                edit.url.cursor(),
+                focus == Some(Focus::BookmarkUrl),
+                "https://...",
+                Element::EditUrl,
+            );
+
+            let save_rect = Rect::new(popover.right() - 8.0 - 56.0, edit_top + 80.0, 56.0, 28.0);
+            let cancel_rect = Rect::new(save_rect.x - 8.0 - 56.0, save_rect.y, 56.0, 28.0);
+            let cancel_hover = hover == Some(Element::EditCancel);
+            if cancel_hover {
+                layer.push_rect(RectShape::filled(cancel_rect, theme.accent, 6.0));
+            }
+            layer.push_text(
+                TextShape::new(
+                    "Batal",
+                    cancel_rect.x,
+                    cancel_rect.y + 6.0,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width(cancel_rect.width)
+                .weight(500)
+                .align(Align::Center),
+            );
+            self.push_hit(Element::EditCancel, cancel_rect);
+
+            let save_hover = hover == Some(Element::EditSave);
+            let save_bg = if save_hover {
+                theme.primary.mix(Color::rgb(255, 255, 255), 0.15)
+            } else {
+                theme.primary
+            };
+            layer.push_rect(RectShape::filled(save_rect, save_bg, 6.0));
+            layer.push_text(
+                TextShape::new(
+                    "Simpan",
+                    save_rect.x,
+                    save_rect.y + 6.0,
+                    12.0,
+                    theme.primary_foreground,
+                )
+                .width(save_rect.width)
+                .weight(500)
+                .align(Align::Center),
+            );
+            self.push_hit(Element::EditSave, save_rect);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_edit_input(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        rect: Rect,
+        value: &str,
+        cursor: usize,
+        focused: bool,
+        placeholder: &str,
+        element: Element,
+    ) {
+        let theme = self.theme;
+        let border = if focused { theme.ring } else { theme.border };
+        layer.push_rect(RectShape::bordered(
+            rect,
+            theme.background,
+            4.0,
+            1.0,
+            border,
+        ));
+        let text_x = rect.x + 10.0;
+        let text_width = (rect.width - 20.0).max(0.0);
+        if value.is_empty() {
+            layer.push_text(
+                TextShape::new(
+                    placeholder,
+                    text_x,
+                    rect.y + (rect.height - 12.0 * 1.3) * 0.5,
+                    12.0,
+                    theme.muted_foreground,
+                )
+                .width(text_width)
+                .ellipsis(),
+            );
+        } else {
+            layer.push_text(
+                TextShape::new(
+                    value.to_string(),
+                    text_x,
+                    rect.y + (rect.height - 12.0 * 1.3) * 0.5,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width(text_width)
+                .ellipsis()
+                .caret(if focused { Some(cursor) } else { None }, theme.foreground),
+            );
+        }
+        self.push_hit(element, rect);
+    }
+
+    fn build_context_menu(
+        &mut self,
+        frame: &mut Frame,
+        width: f32,
+        height: f32,
+        bookmarks: &[Bookmark],
+        menu: ContextMenu,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let item_height = 28.0;
+        let menu_height = 4.0 + item_height * 3.0 + 4.0;
+        let x = menu
+            .position
+            .x
+            .max(8.0)
+            .min((width - CONTEXT_WIDTH - 8.0).max(8.0));
+        let y = menu
+            .position
+            .y
+            .max(8.0)
+            .min((height - menu_height - 8.0).max(8.0));
+        let rect = Rect::new(x, y, CONTEXT_WIDTH, menu_height);
+        let layer = &mut frame.overlay;
+        layer.push_rect(RectShape::bordered(
+            rect,
+            theme.popover,
+            6.0,
+            1.0,
+            theme.border,
+        ));
+        self.push_hit(Element::ContextArea, rect);
+
+        let labels = ["Buka", "Edit", "Hapus"];
+        let elements = [
+            Element::ContextOpen,
+            Element::ContextEdit,
+            Element::ContextDelete,
+        ];
+        for (index, (label, element)) in labels.iter().zip(elements).enumerate() {
+            let item = Rect::new(
+                rect.x + 4.0,
+                rect.y + 4.0 + index as f32 * item_height,
+                rect.width - 8.0,
+                item_height,
+            );
+            let is_hover = hover == Some(element);
+            if is_hover {
+                let color = if element == Element::ContextDelete {
+                    theme.destructive.with_alpha(0.1)
+                } else {
+                    theme.muted
+                };
+                layer.push_rect(RectShape::filled(item, color, 4.0));
+            }
+            let color = if element == Element::ContextDelete {
+                theme.destructive
+            } else {
+                theme.popover_foreground
+            };
+            layer.push_text(
+                TextShape::new(*label, item.x + 8.0, item.y + 6.0, 12.0, color)
+                    .width(item.width - 16.0),
+            );
+            self.push_hit(element, item);
+        }
+
+        let _ = bookmarks;
+    }
+}
+
+fn icon(glyph: &str, center: Vec2, size: f32, color: Color) -> TextShape {
+    TextShape::new(
+        glyph,
+        center.x - size * 0.5,
+        center.y - size * 0.62,
+        size,
+        color,
+    )
+    .family(FontFamily::Icons)
+    .width(size)
+    .align(Align::Center)
+}
+
+fn approx_text_width(text: &str, size: f32) -> f32 {
+    text.chars()
+        .map(|ch| {
+            let factor = match ch {
+                'i' | 'l' | 'I' | 'j' | 't' | 'f' | '.' | ',' | ':' | ';' | '\'' | '!' => 0.28,
+                'm' | 'w' | 'M' | 'W' => 0.86,
+                ' ' => 0.28,
+                'A'..='Z' => 0.68,
+                '0'..='9' => 0.56,
+                _ if ch.is_ascii() => 0.53,
+                _ => 1.0,
+            };
+            factor * size
+        })
+        .sum()
+}
+
+fn normalize_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if trimmed.to_ascii_lowercase().starts_with("http://")
+        || trimmed.to_ascii_lowercase().starts_with("https://")
+    {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    parsed.host_str()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+fn looks_like_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return true;
+    }
+    if value.chars().any(|ch| ch.is_whitespace()) {
+        return false;
+    }
+    if lower == "localhost" || lower.starts_with("localhost:") || lower.starts_with("localhost/") {
+        return true;
+    }
+    let host = value.split('/').next().unwrap_or(value);
+    host.contains('.')
+}
+
+fn resolve_target(value: &str) -> String {
+    let trimmed = value.trim();
+    if looks_like_url(trimmed) {
+        if let Some(url) = normalize_url(trimmed) {
+            return url;
+        }
+    }
+    format!(
+        "https://www.google.com/search?q={}",
+        percent_encode(trimmed)
+    )
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn host_from_url(value: &str) -> String {
+    if value.is_empty() {
+        return "Tab baru".to_string();
+    }
+    match url::Url::parse(value) {
+        Ok(parsed) => parsed
+            .host_str()
+            .map(|host| host.trim_start_matches("www.").to_string())
+            .unwrap_or_else(|| "Tab baru".to_string()),
+        Err(_) => "Tab baru".to_string(),
+    }
+}
+
+fn text_input(text: impl Into<String>) -> TextInput {
+    let mut input = TextInput::new();
+    input.set_text(text);
+    input
+}
