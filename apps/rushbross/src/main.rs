@@ -2,6 +2,7 @@
 
 mod webview;
 
+mod app_icon;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -42,6 +43,10 @@ struct State {
     webview: Option<WebViewHost>,
     /// Bounds WebView terakhir yang dikirim, supaya SetBounds tidak dipanggil tiap frame.
     last_webview_bounds: Option<(i32, i32, i32, i32)>,
+    window_shown: bool,
+    webview_ready: bool,
+    webview_visible: bool,
+    overlay_open: bool,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
     modifiers: ModifiersState,
@@ -63,6 +68,10 @@ impl State {
             shell,
             webview: None,
             last_webview_bounds: None,
+            window_shown: false,
+            webview_ready: false,
+            webview_visible: false,
+            overlay_open: false,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
             size,
             modifiers: ModifiersState::empty(),
@@ -113,7 +122,27 @@ impl State {
                 }
             }
         }
+        if !self.window_shown {
+            self.window_shown = true;
+            self.window.set_visible(true);
+        }
+        self.overlay_open = frame.popup_open;
+        self.sync_webview_visibility();
         self.sync_webview_bounds();
+    }
+
+    /// WebView ditampilkan setelah halaman siap dan tidak tertutup popup/menu.
+    fn sync_webview_visibility(&mut self) {
+        let visible = self.webview_ready && !self.overlay_open;
+        if visible == self.webview_visible {
+            return;
+        }
+        self.webview_visible = visible;
+        if let Some(webview) = &self.webview {
+            if let Err(error) = webview.set_visible(visible) {
+                eprintln!("webview visible: {error}");
+            }
+        }
     }
 
     fn sync_webview_bounds(&mut self) {
@@ -336,6 +365,11 @@ impl State {
             _ => {}
         }
 
+        // Tombol edit (backspace, delete, panah, enter) mengubah teks tanpa event teks,
+        // jadi layar harus digambar ulang di sini.
+        self.pump_navigation();
+        self.redraw();
+
         if ctrl {
             let key = match &event.logical_key {
                 Key::Character(ch) => ch.to_lowercase(),
@@ -406,7 +440,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(width, height))
             .with_min_inner_size(LogicalSize::new(720.0, 480.0))
             .with_decorations(false)
-            .with_undecorated_shadow(true);
+            .with_undecorated_shadow(true)
+            .with_visible(false);
         if let Some(icon) = window_icon() {
             attributes = attributes.with_window_icon(Some(icon));
         }
@@ -579,11 +614,8 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match event {
             UserEvent::WebView(webview::WebViewEvent::Loaded) => {
-                if let Some(webview) = &state.webview {
-                    if let Err(error) = webview.set_visible(true) {
-                        eprintln!("webview visible: {error}");
-                    }
-                }
+                state.webview_ready = true;
+                state.sync_webview_visibility();
                 return;
             }
             UserEvent::WebView(webview::WebViewEvent::Favicon(favicon)) => {
@@ -699,56 +731,24 @@ fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
     let width = info.width;
     let height = info.height;
     let mut rgba = match info.color_type {
-        png::ColorType::Rgb => {
-            let (pixels, _) = bytes.as_chunks::<3>();
-            pixels
-                .iter()
-                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
-                .collect()
-        }
+        png::ColorType::Rgb => bytes
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+            .collect(),
         png::ColorType::Rgba => bytes.to_vec(),
         png::ColorType::Grayscale => bytes
             .iter()
             .flat_map(|value| [*value, *value, *value, 255])
             .collect(),
-        png::ColorType::GrayscaleAlpha => {
-            let (pixels, _) = bytes.as_chunks::<2>();
-            pixels
-                .iter()
-                .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
-                .collect()
-        }
+        png::ColorType::GrayscaleAlpha => bytes
+            .chunks_exact(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
         png::ColorType::Indexed => return None,
     };
-
-    let radius = (width.min(height) as f32) * 0.22;
-    let half_width = width as f32 * 0.5;
-    let half_height = height as f32 * 0.5;
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let index = (y * width as usize + x) * 4;
-            let luminance = 0.2126 * rgba[index] as f32
-                + 0.7152 * rgba[index + 1] as f32
-                + 0.0722 * rgba[index + 2] as f32;
-            let alpha = ((luminance - 24.0) * 255.0 / 210.0).clamp(0.0, 255.0) as u8;
-            let dx = ((x as f32 + 0.5) - half_width).abs() - (half_width - radius);
-            let dy = ((y as f32 + 0.5) - half_height).abs() - (half_height - radius);
-            let distance = dx.max(0.0).hypot(dy.max(0.0)) + dx.min(dy).min(0.0) - radius;
-            let corner_alpha = if distance > 1.0 {
-                0
-            } else if distance > 0.0 {
-                (255.0 * (1.0 - distance)).round() as u8
-            } else {
-                255
-            };
-            rgba[index] = 255;
-            rgba[index + 1] = 255;
-            rgba[index + 2] = 255;
-            rgba[index + 3] = alpha.min(corner_alpha);
-        }
-    }
-
-    Some((rgba, width, height))
+    app_icon::round_and_clear_background(&mut rgba, width, height);
+    let size = 256;
+    Some((app_icon::downscale(&rgba, width, height, size), size, size))
 }
 
 fn window_icon() -> Option<Icon> {

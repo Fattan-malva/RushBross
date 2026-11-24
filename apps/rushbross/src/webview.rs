@@ -243,12 +243,8 @@ impl WebViewHost {
                                     ));
                                     Ok(())
                                 }));
-                            unsafe {
-                                webview15.GetFavicon(
-                                    COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
-                                    &completed,
-                                )?;
-                            }
+                            webview15
+                                .GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &completed)?;
                             Ok(())
                         })),
                         &mut favicon_token,

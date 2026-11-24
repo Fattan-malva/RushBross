@@ -79,14 +79,23 @@ body::-webkit-scrollbar { display: none; }
   gap: 12px;
 }
 .wordmark {
-  transition: transform 0.18s ease-out;
   font-size: clamp(46px, 9vw, 80px);
   font-weight: 700;
   line-height: 1;
   letter-spacing: -0.05em;
   white-space: nowrap;
+  cursor: default;
+  user-select: none;
 }
-.wordmark .soft { color: #8c8c8c; }
+.wordmark .ch {
+  --base: #f5f5f5;
+  display: inline-block;
+  color: color-mix(in srgb, #ffffff calc(var(--h, 0) * 100%), var(--base));
+  transform: translateY(calc(var(--h, 0) * -6px));
+  text-shadow: 0 0 calc(var(--h, 0) * 22px) rgba(255, 255, 255, calc(var(--h, 0) * 0.35));
+  transition: transform 0.18s ease-out, color 0.18s ease-out, text-shadow 0.18s ease-out;
+}
+.wordmark .soft .ch { --base: #8c8c8c; }
 .tagline {
   font-size: 12px;
   font-weight: 600;
@@ -239,14 +248,14 @@ body::-webkit-scrollbar { display: none; }
   .shortcuts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .card, .card .shine { transition: none; }
+  .card, .card .shine, .wordmark .ch { transition: none; }
 }
 </style>
 </head>
 <body>
 <main class="page">
   <section class="brand" aria-label="RushBross">
-    <h1 class="wordmark">Rush<span class="soft">Bross</span></h1>
+    <h1 class="wordmark" aria-label="RushBross"><span><span class="ch" style="--i:0">R</span><span class="ch" style="--i:1">u</span><span class="ch" style="--i:2">s</span><span class="ch" style="--i:3">h</span></span><span class="soft"><span class="ch" style="--i:4">B</span><span class="ch" style="--i:5">r</span><span class="ch" style="--i:6">o</span><span class="ch" style="--i:7">s</span><span class="ch" style="--i:8">s</span></span></h1>
     <p class="tagline">Built to move. Built to be fast.</p>
   </section>
 
@@ -315,7 +324,7 @@ body::-webkit-scrollbar { display: none; }
     if (target) window.location.href = target;
   });
 
-  // Shared tilt: cards get tilt + shine, the wordmark gets tilt only.
+  // Tilt 3D dan shine hanya untuk card.
   function attachTilt(element, lift) {
     var frame = 0;
 
@@ -348,8 +357,36 @@ body::-webkit-scrollbar { display: none; }
   document.querySelectorAll(".card").forEach(function (card) {
     attachTilt(card, true);
   });
+  // Highlight per huruf: huruf dekat kursor menyala dan naik sedikit, seperti sorotan pada card.
   var wordmark = document.querySelector(".wordmark");
-  if (wordmark) attachTilt(wordmark, false);
+  if (wordmark) {
+    var letters = Array.prototype.slice.call(wordmark.querySelectorAll(".ch"));
+    var pointer = null;
+    var wordFrame = 0;
+
+    function highlight() {
+      wordFrame = 0;
+      if (!pointer) return;
+      letters.forEach(function (letter) {
+        var rect = letter.getBoundingClientRect();
+        var dx = pointer.x - (rect.left + rect.width / 2);
+        var dy = pointer.y - (rect.top + rect.height / 2);
+        var level = Math.max(0, 1 - Math.sqrt(dx * dx + dy * dy) / 150);
+        letter.style.setProperty("--h", level.toFixed(3));
+      });
+    }
+
+    wordmark.addEventListener("pointermove", function (event) {
+      pointer = { x: event.clientX, y: event.clientY };
+      if (!wordFrame) wordFrame = requestAnimationFrame(highlight);
+    });
+    wordmark.addEventListener("pointerleave", function () {
+      pointer = null;
+      cancelAnimationFrame(wordFrame);
+      wordFrame = 0;
+      letters.forEach(function (letter) { letter.style.setProperty("--h", "0"); });
+    });
+  }
 })();
 </script>
 </body>

@@ -236,4 +236,6 @@ impl Layer {
 pub struct Frame {
     pub base: Layer,
     pub overlay: Layer,
+    /// Ada popup (tooltip, menu, popover) yang harus tampil di atas WebView.
+    pub popup_open: bool,
 }

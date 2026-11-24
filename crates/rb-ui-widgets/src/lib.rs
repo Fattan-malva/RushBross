@@ -16,6 +16,8 @@ const TAB_STRIP_HEIGHT: f32 = 40.0;
 const TAB_HEIGHT: f32 = 32.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_MAX_RATIO: f32 = 0.42;
+const TAB_MAX_WIDTH: f32 = 200.0;
+const TAB_MIN_WIDTH: f32 = 64.0;
 const TAB_RADIUS: f32 = 8.0;
 /// Ukuran favicon di tab dan jarak ke judul.
 const TAB_ICON_SIZE: f32 = 16.0;
@@ -1006,7 +1008,15 @@ impl BrowserShell {
         );
         self.layout.viewport = viewport;
 
-        self.build_tabs(base, tab_strip, width, &tabs, active_id, hover);
+        self.build_tabs(
+            base,
+            &mut frame.overlay,
+            tab_strip,
+            width,
+            &tabs,
+            active_id,
+            hover,
+        );
         self.build_toolbar(
             base,
             toolbar,
@@ -1062,6 +1072,7 @@ impl BrowserShell {
                     None
                 }
             });
+        frame.popup_open = show_bookmarks || context_menu.is_some() || tooltip.is_some();
         if let Some((center_x, y, text)) = tooltip {
             let tooltip_width = (approx_text_width(&text, 12.0) + 16.0).min(width - 16.0);
             let x = (center_x - tooltip_width * 0.5)
@@ -1091,6 +1102,8 @@ impl BrowserShell {
         frame
     }
 
+    /// Menggambar satu tab. Mengembalikan warna latar dan batas kanan judul jika judul terpotong,
+    /// sehingga pemanggil bisa menambahkan bayangan pudar di layer overlay.
     fn draw_tab(
         &mut self,
         layer: &mut rb_ui::Layer,
@@ -1099,7 +1112,7 @@ impl BrowserShell {
         is_active: bool,
         is_hover: bool,
         hover: Option<Element>,
-    ) {
+    ) -> Option<(Color, f32)> {
         let theme = self.theme;
         let background = if is_active {
             theme.background
@@ -1175,11 +1188,16 @@ impl BrowserShell {
             close_color,
         ));
         self.push_hit(Element::TabClose(tab.id), close_rect);
+        (approx_text_width(&tab.title, 12.0) > title_width)
+            .then_some((background, text_x + title_width))
     }
 
+    // Layer tab biasa dan layer overlay (drag, bayangan judul) harus dipisah, jadi parameternya banyak.
+    #[allow(clippy::too_many_arguments)]
     fn build_tabs(
         &mut self,
         layer: &mut rb_ui::Layer,
+        overlay: &mut rb_ui::Layer,
         strip: Rect,
         width: f32,
         tabs: &[Tab],
@@ -1196,15 +1214,14 @@ impl BrowserShell {
             - WindowChrome::reserved_width()
             - TAB_GAP)
             .max(0.0);
-        let max_width = width * TAB_MAX_RATIO;
+        let max_width = (width * TAB_MAX_RATIO).min(TAB_MAX_WIDTH);
 
         let naturals: Vec<f32> = tabs
             .iter()
             .map(|tab| {
                 let title = approx_text_width(&tab.title, 12.0);
-                (10.0 + title + 8.0 + 20.0 + 10.0)
-                    .clamp(60.0, max_width)
-                    .min(max_width)
+                (10.0 + TAB_ICON_SIZE + TAB_ICON_GAP + title + 8.0 + 20.0 + 10.0)
+                    .clamp(TAB_MIN_WIDTH, max_width.max(TAB_MIN_WIDTH))
             })
             .collect();
         let mut widths = naturals.clone();
@@ -1215,7 +1232,7 @@ impl BrowserShell {
                 let scale = ((available - gaps).max(0.0) / sum.max(1.0)).clamp(0.0, 1.0);
                 widths = naturals
                     .iter()
-                    .map(|value| (value * scale).max(48.0).min(*value))
+                    .map(|value| (value * scale).max(TAB_MIN_WIDTH).min(*value))
                     .collect();
             }
         }
@@ -1283,13 +1300,20 @@ impl BrowserShell {
             let is_active = active_id == Some(tab.id);
             let is_hover = hover == Some(Element::Tab(tab.id));
             if dragged_id == Some(tab.id) {
-                dragged_draw = Some((tab, tab_rect, is_active, is_hover));
+                dragged_draw = Some((tab, tab_rect, is_hover));
                 continue;
             }
-            self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
+            let fade = self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
+            if let Some((color, right)) = fade {
+                push_title_fade(overlay, tab_rect, right, color);
+            }
         }
-        if let Some((tab, tab_rect, is_active, is_hover)) = dragged_draw {
-            self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
+        // Tab yang di-drag digambar di overlay (di atas teks tab lain) dengan warna gelap penuh.
+        if let Some((tab, tab_rect, is_hover)) = dragged_draw {
+            let fade = self.draw_tab(overlay, tab, tab_rect, true, is_hover, hover);
+            if let Some((color, right)) = fade {
+                push_title_fade(overlay, tab_rect, right, color);
+            }
         }
 
         let plus_rect = Rect::new(x, strip.y + 10.0, plus_size, plus_size);
@@ -2231,6 +2255,27 @@ fn text_input(text: impl Into<String>) -> TextInput {
     let mut input = TextInput::new();
     input.set_text(text);
     input
+}
+
+/// Bayangan pudar di tepi kanan judul tab yang terpotong (8 langkah, 2 px per langkah).
+fn push_title_fade(layer: &mut rb_ui::Layer, rect: Rect, title_right: f32, color: Color) {
+    const STEPS: usize = 8;
+    const STEP_WIDTH: f32 = 2.0;
+    let start = title_right - STEP_WIDTH * STEPS as f32;
+    for step in 0..STEPS {
+        let t = (step as f32 + 1.0) / STEPS as f32;
+        let alpha = (t * t * 255.0).round() as u8;
+        layer.push_rect(RectShape::filled(
+            Rect::new(
+                start + step as f32 * STEP_WIDTH,
+                rect.y + 1.0,
+                STEP_WIDTH,
+                rect.height - 2.0,
+            ),
+            Color::rgba(color.r, color.g, color.b, alpha),
+            0.0,
+        ));
+    }
 }
 
 #[cfg(test)]
