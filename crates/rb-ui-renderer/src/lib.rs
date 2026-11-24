@@ -1,3 +1,5 @@
+mod svg;
+
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -499,7 +501,7 @@ impl Renderer {
 
         if width.is_finite() && width > 0.0 {
             buffer.set_size(Some(width * scale), None);
-            if text.ellipsis {
+            if text.ellipsis && text.offset_x <= 0.0 {
                 buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
             }
         } else {
@@ -513,7 +515,7 @@ impl Renderer {
             .fold(0.0f32, f32::max);
         let lines = buffer.layout_runs().count().max(1) as f32;
 
-        let left = text.x * scale;
+        let left = (text.x - text.offset_x) * scale;
         let top = text.y * scale;
         let resolved_left = left;
 
@@ -538,19 +540,44 @@ impl Renderer {
         bounds_right = bounds_right.max(bounds_left);
         bounds_bottom = bounds_bottom.max(bounds_top);
 
-        if let Some(caret) = text.caret {
-            let caret = caret.min(text.text.len());
-            let caret = floor_char_boundary(&text.text, caret);
-            let prefix = &text.text[..caret];
+        let selection_color = self.instance_color(text.selection_color);
+        let mut prefix_width = |index: usize| {
+            let index = floor_char_boundary(&text.text, index.min(text.text.len()));
             let mut prefix_buffer = Buffer::new(&mut self.font_system, metrics);
-            prefix_buffer.set_text(prefix, &attrs, Shaping::Advanced, None);
+            prefix_buffer.set_text(&text.text[..index], &attrs, Shaping::Advanced, None);
             prefix_buffer.set_size(None, None);
             prefix_buffer.set_wrap(Wrap::None);
             prefix_buffer.shape_until_scroll(&mut self.font_system, false);
-            let prefix_width = prefix_buffer
+            prefix_buffer
                 .layout_runs()
                 .map(|run| run.line_w)
-                .fold(0.0f32, f32::max);
+                .fold(0.0f32, f32::max)
+        };
+
+        if let Some((start, end)) = text.selection {
+            let start = floor_char_boundary(&text.text, start.min(text.text.len()));
+            let end = floor_char_boundary(&text.text, end.min(text.text.len()));
+            let left_edge = left + prefix_width(start);
+            let right_edge = left + prefix_width(end);
+            if right_edge > left_edge {
+                overlay_instances.push(RectInstance {
+                    rect: [
+                        left_edge,
+                        top + font_size * 0.08,
+                        right_edge - left_edge,
+                        font_size * 1.15,
+                    ],
+                    color: selection_color,
+                    params: [2.0 * scale, 0.0, 0.0, 0.0],
+                    border_color: [0.0; 4],
+                });
+            }
+        }
+
+        if let Some(caret) = text.caret {
+            let caret = caret.min(text.text.len());
+            let caret = floor_char_boundary(&text.text, caret);
+            let prefix_width = prefix_width(caret);
 
             let max_x = if width.is_finite() && width > 0.0 {
                 left + width * scale
@@ -612,293 +639,45 @@ impl Renderer {
     }
 
     fn icon_instances(&self, icons: &[IconShape]) -> Vec<RectInstance> {
-        let mut out = Vec::with_capacity(icons.len() * 4);
+        let mut out = Vec::with_capacity(icons.len() * 8);
         for shape in icons {
             let unit = shape.rect.width.min(shape.rect.height);
             let center = shape.rect.center();
-            let point =
-                |p: (f32, f32)| (center.x + (p.0 - 0.5) * unit, center.y + (p.1 - 0.5) * unit);
-            let stroke = shape.stroke;
+            let point = |p: svg::Point| {
+                (
+                    center.x + (p.x - 12.0) / 24.0 * unit,
+                    center.y + (p.y - 12.0) / 24.0 * unit,
+                )
+            };
             let color = self.instance_color(shape.color);
-
-            match shape.icon {
-                Icon::Search => {
-                    self.push_circle(&mut out, point((0.42, 0.42)), 0.5, stroke, color);
+            let Some(lucide) = shape.icon.lucide() else {
+                continue;
+            };
+            for path in svg::parse(lucide.svg_str()) {
+                if path.len() < 2 {
+                    continue;
+                }
+                let is_dot = path.first().zip(path.last()).is_some_and(|(first, last)| {
+                    (first.x - last.x).abs() < 0.01 && (first.y - last.y).abs() < 0.01
+                });
+                if is_dot && path.len() >= 32 {
+                    let first = point(path[0]);
+                    let diameter = (path[1].x - path[0].x).abs() / 24.0 * unit * 2.0;
+                    self.push_dot(&mut out, first, diameter, color);
+                    continue;
+                }
+                for pair in path.windows(2) {
                     self.push_line(
                         &mut out,
-                        point((0.58, 0.58)),
-                        point((0.82, 0.82)),
-                        stroke,
+                        point(pair[0]),
+                        point(pair[1]),
+                        shape.stroke,
                         color,
                     );
                 }
-                Icon::Lock => {
-                    self.push_line(
-                        &mut out,
-                        point((0.34, 0.46)),
-                        point((0.34, 0.34)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.34, 0.34)),
-                        point((0.66, 0.34)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.66, 0.34)),
-                        point((0.66, 0.46)),
-                        stroke,
-                        color,
-                    );
-                    self.push_outline_rect(&mut out, point((0.3, 0.46)), 0.4, 0.32, stroke, color);
-                }
-                Icon::Star | Icon::StarFilled => {
-                    let star = [
-                        (0.5, 0.16),
-                        (0.6, 0.39),
-                        (0.84, 0.4),
-                        (0.65, 0.55),
-                        (0.72, 0.79),
-                        (0.5, 0.65),
-                        (0.28, 0.79),
-                        (0.35, 0.55),
-                        (0.16, 0.4),
-                        (0.4, 0.39),
-                    ];
-                    let weight = if shape.icon == Icon::StarFilled {
-                        stroke * 1.6
-                    } else {
-                        stroke
-                    };
-                    for index in 0..star.len() {
-                        self.push_line(
-                            &mut out,
-                            point(star[index]),
-                            point(star[(index + 1) % star.len()]),
-                            weight,
-                            color,
-                        );
-                    }
-                    if shape.icon == Icon::StarFilled {
-                        self.push_dot(&mut out, point((0.5, 0.51)), unit * 0.18, color);
-                    }
-                }
-                Icon::Reload => {
-                    let arc = [
-                        (0.78, 0.36),
-                        (0.7, 0.26),
-                        (0.54, 0.21),
-                        (0.36, 0.24),
-                        (0.24, 0.36),
-                        (0.2, 0.54),
-                    ];
-                    for index in 0..arc.len() - 1 {
-                        self.push_line(
-                            &mut out,
-                            point(arc[index]),
-                            point(arc[index + 1]),
-                            stroke,
-                            color,
-                        );
-                    }
-                    self.push_line(
-                        &mut out,
-                        point((0.2, 0.54)),
-                        point((0.29, 0.47)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.2, 0.54)),
-                        point((0.14, 0.43)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::Plus => {
-                    self.push_line(
-                        &mut out,
-                        point((0.2, 0.5)),
-                        point((0.8, 0.5)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.5, 0.2)),
-                        point((0.5, 0.8)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::Close => {
-                    self.push_line(
-                        &mut out,
-                        point((0.25, 0.25)),
-                        point((0.75, 0.75)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.75, 0.25)),
-                        point((0.25, 0.75)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::More => {
-                    for x in [0.25, 0.5, 0.75] {
-                        self.push_dot(&mut out, point((x, 0.5)), stroke * 2.6, color);
-                    }
-                }
-                Icon::Bookmark => {
-                    let path = [
-                        (0.3, 0.2),
-                        (0.7, 0.2),
-                        (0.7, 0.8),
-                        (0.5, 0.64),
-                        (0.3, 0.8),
-                        (0.3, 0.2),
-                    ];
-                    for index in 0..path.len() - 1 {
-                        self.push_line(
-                            &mut out,
-                            point(path[index]),
-                            point(path[index + 1]),
-                            stroke,
-                            color,
-                        );
-                    }
-                }
-                Icon::Edit => {
-                    self.push_line(
-                        &mut out,
-                        point((0.24, 0.76)),
-                        point((0.7, 0.3)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.62, 0.22)),
-                        point((0.78, 0.38)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.24, 0.76)),
-                        point((0.34, 0.78)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::Trash => {
-                    self.push_line(
-                        &mut out,
-                        point((0.24, 0.3)),
-                        point((0.76, 0.3)),
-                        stroke,
-                        color,
-                    );
-                    self.push_outline_rect(&mut out, point((0.3, 0.38)), 0.4, 0.42, stroke, color);
-                    self.push_line(
-                        &mut out,
-                        point((0.43, 0.3)),
-                        point((0.43, 0.22)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.57, 0.3)),
-                        point((0.57, 0.22)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.42, 0.48)),
-                        point((0.44, 0.7)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.58, 0.48)),
-                        point((0.56, 0.7)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::Minimize => {
-                    self.push_line(
-                        &mut out,
-                        point((0.24, 0.5)),
-                        point((0.76, 0.5)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::Maximize => {
-                    self.push_outline_rect(&mut out, point((0.5, 0.5)), 0.52, 0.52, stroke, color);
-                }
-                Icon::Restore => {
-                    self.push_outline_rect(
-                        &mut out,
-                        point((0.42, 0.42)),
-                        0.48,
-                        0.48,
-                        stroke,
-                        color,
-                    );
-                    self.push_outline_rect(
-                        &mut out,
-                        point((0.58, 0.58)),
-                        0.48,
-                        0.48,
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::ChevronLeft => {
-                    self.push_line(
-                        &mut out,
-                        point((0.62, 0.24)),
-                        point((0.36, 0.5)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.36, 0.5)),
-                        point((0.62, 0.76)),
-                        stroke,
-                        color,
-                    );
-                }
-                Icon::ChevronRight => {
-                    self.push_line(
-                        &mut out,
-                        point((0.38, 0.24)),
-                        point((0.64, 0.5)),
-                        stroke,
-                        color,
-                    );
-                    self.push_line(
-                        &mut out,
-                        point((0.64, 0.5)),
-                        point((0.38, 0.76)),
-                        stroke,
-                        color,
-                    );
-                }
+            }
+            if shape.icon == Icon::StarFilled {
+                self.push_dot(&mut out, (center.x, center.y), unit * 0.26, color);
             }
         }
         out
@@ -929,28 +708,6 @@ impl Renderer {
         });
     }
 
-    fn push_circle(
-        &self,
-        out: &mut Vec<RectInstance>,
-        center: (f32, f32),
-        diameter: f32,
-        stroke: f32,
-        color: [f32; 4],
-    ) {
-        let diameter = diameter * self.scale;
-        out.push(RectInstance {
-            rect: [
-                center.0 * self.scale - diameter * 0.5,
-                center.1 * self.scale - diameter * 0.5,
-                diameter,
-                diameter,
-            ],
-            color: [0.0; 4],
-            params: [diameter * 0.5, stroke * self.scale, 0.0, 0.0],
-            border_color: color,
-        });
-    }
-
     fn push_dot(
         &self,
         out: &mut Vec<RectInstance>,
@@ -969,29 +726,6 @@ impl Renderer {
             color,
             params: [diameter * 0.5, 0.0, 0.0, 0.0],
             border_color: [0.0; 4],
-        });
-    }
-
-    fn push_outline_rect(
-        &self,
-        out: &mut Vec<RectInstance>,
-        center: (f32, f32),
-        width: f32,
-        height: f32,
-        stroke: f32,
-        color: [f32; 4],
-    ) {
-        let diameter = width.min(height) * self.scale;
-        out.push(RectInstance {
-            rect: [
-                center.0 * self.scale - width * 0.5 * self.scale,
-                center.1 * self.scale - height * 0.5 * self.scale,
-                width * self.scale,
-                height * self.scale,
-            ],
-            color: [0.0; 4],
-            params: [diameter * 0.5, stroke * self.scale, 0.0, 0.0],
-            border_color: color,
         });
     }
 

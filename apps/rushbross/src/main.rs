@@ -3,18 +3,17 @@
 mod webview;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use rb_ui::Rect;
 use rb_ui_renderer::{RenderError, Renderer};
-use rb_ui_widgets::{BrowserShell, ChromeAction, ChromeElement};
+use rb_ui_widgets::{BrowserShell, ChromeAction, ChromeElement, CursorRole};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowId};
 
 use webview::{UserEvent, WebViewHost};
 
@@ -29,27 +28,20 @@ const VK_R: u32 = 0x52;
 const VK_T: u32 = 0x54;
 const VK_W: u32 = 0x57;
 const RESIZE_EDGE: f32 = 6.0;
-const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
-const DOUBLE_CLICK_DISTANCE: f32 = 8.0;
 
 struct State {
     window: Arc<Window>,
     renderer: Renderer,
     shell: BrowserShell,
-    webview: WebViewHost,
+    webview: Option<WebViewHost>,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
     modifiers: ModifiersState,
     cursor_icon: CursorIcon,
-    last_drag_click: Option<(Instant, rb_ui::Vec2)>,
 }
 
 impl State {
-    fn new(
-        window: Arc<Window>,
-        renderer: Renderer,
-        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    ) -> Result<Self, String> {
+    fn new(window: Arc<Window>, renderer: Renderer) -> Result<Self, String> {
         let scale = window.scale_factor() as f32;
         let physical = window.inner_size();
         let size = (
@@ -57,7 +49,23 @@ impl State {
             physical.height as f32 / scale,
         );
         let shell = BrowserShell::new();
-        let hwnd = match window.window_handle() {
+        Ok(Self {
+            window,
+            renderer,
+            shell,
+            webview: None,
+            cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
+            size,
+            modifiers: ModifiersState::empty(),
+            cursor_icon: CursorIcon::Default,
+        })
+    }
+
+    fn init_webview(
+        &mut self,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Result<(), String> {
+        let hwnd = match self.window.window_handle() {
             Ok(handle) => match handle.as_raw() {
                 RawWindowHandle::Win32(handle) => {
                     windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void)
@@ -67,17 +75,13 @@ impl State {
             Err(error) => return Err(error.to_string()),
         };
         let webview = WebViewHost::new(hwnd, proxy)?;
-        Ok(Self {
-            window,
-            renderer,
-            shell,
-            webview,
-            cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
-            size,
-            modifiers: ModifiersState::empty(),
-            cursor_icon: CursorIcon::Default,
-            last_drag_click: None,
-        })
+        self.webview = Some(webview);
+        self.sync_webview_bounds();
+        self.pump_navigation();
+        if let Some(webview) = &self.webview {
+            webview.set_visible(true)?;
+        }
+        Ok(())
     }
 
     fn draw(&mut self) {
@@ -109,20 +113,30 @@ impl State {
         let (width, height) = self.size;
         let rect = self.shell.content_rect(width, height);
         let scale = self.window.scale_factor() as f32;
+        let inset = if self.shell.is_fullscreen() {
+            0.0
+        } else {
+            RESIZE_EDGE
+        };
         let physical = Rect::new(
-            (rect.x + RESIZE_EDGE) * scale,
+            (rect.x + inset) * scale,
             rect.y * scale,
-            (rect.width - RESIZE_EDGE * 2.0).max(0.0) * scale,
-            (rect.height - RESIZE_EDGE).max(0.0) * scale,
+            (rect.width - inset * 2.0).max(0.0) * scale,
+            (rect.height - inset).max(0.0) * scale,
         );
-        if let Err(error) = self.webview.set_bounds(physical) {
-            eprintln!("webview bounds: {error}");
+        if let Some(webview) = &self.webview {
+            if let Err(error) = webview.set_bounds(physical) {
+                eprintln!("webview bounds: {error}");
+            }
         }
     }
 
     fn pump_navigation(&mut self) {
+        let Some(webview) = self.webview.as_ref() else {
+            return;
+        };
         while let Some(request) = self.shell.take_navigation() {
-            if let Err(error) = self.webview.load(&request.url) {
+            if let Err(error) = webview.load(&request.url) {
                 eprintln!("webview navigate {}: {error}", request.url);
             }
         }
@@ -142,16 +156,26 @@ impl State {
         }
     }
 
+    fn set_web_fullscreen(&mut self, enabled: bool) {
+        if enabled {
+            self.window
+                .set_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+        }
+        self.shell.set_fullscreen(enabled);
+        self.redraw();
+    }
+
     fn update_cursor(&mut self) {
-        let chrome = self.shell.hit_chrome(self.cursor);
         let direction = resize_direction(self.cursor, self.size);
         let cursor = if let Some(direction) = direction {
             resize_cursor(direction)
         } else {
-            match chrome {
-                Some(ChromeElement::DragStrip) => CursorIcon::Grab,
-                Some(_) => CursorIcon::Pointer,
-                None => CursorIcon::Default,
+            match self.shell.cursor_role(self.cursor) {
+                CursorRole::Text => CursorIcon::Text,
+                CursorRole::Pointer => CursorIcon::Pointer,
+                CursorRole::Default => CursorIcon::Default,
             }
         };
         if cursor != self.cursor_icon {
@@ -160,19 +184,7 @@ impl State {
         }
     }
 
-    fn start_drag(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        let double_click = self.last_drag_click.is_some_and(|(time, position)| {
-            now.duration_since(time) <= DOUBLE_CLICK_TIME
-                && (position.x - self.cursor.x).hypot(position.y - self.cursor.y)
-                    <= DOUBLE_CLICK_DISTANCE
-        });
-        if double_click {
-            self.last_drag_click = None;
-            self.apply_chrome_action(ChromeAction::MaximizeToggle, event_loop);
-            return;
-        }
-        self.last_drag_click = Some((now, self.cursor));
+    fn start_drag(&mut self, _event_loop: &ActiveEventLoop) {
         if let Err(error) = self.window.drag_window() {
             eprintln!("drag window: {error}");
         }
@@ -213,8 +225,10 @@ impl State {
                     true
                 }
                 VK_R => {
-                    if let Err(error) = self.webview.reload() {
-                        eprintln!("webview reload: {error}");
+                    if let Some(webview) = &self.webview {
+                        if let Err(error) = webview.reload() {
+                            eprintln!("webview reload: {error}");
+                        }
                     }
                     false
                 }
@@ -282,7 +296,13 @@ impl State {
             Key::Named(NamedKey::Home) => self.shell.move_home(),
             Key::Named(NamedKey::End) => self.shell.move_end(),
             Key::Named(NamedKey::Enter) => self.shell.submit(),
-            Key::Named(NamedKey::Escape) => self.shell.escape(),
+            Key::Named(NamedKey::Escape) => {
+                if self.shell.is_fullscreen() {
+                    self.set_web_fullscreen(false);
+                } else {
+                    self.shell.escape();
+                }
+            }
             Key::Named(NamedKey::Space) if !ctrl && !alt => {
                 if let Some(text) = &event.text {
                     if text.is_ascii() {
@@ -307,8 +327,10 @@ impl State {
                 "d" => self.shell.toggle_bookmark(),
                 "a" => self.shell.select_all(),
                 "r" => {
-                    if let Err(error) = self.webview.reload() {
-                        eprintln!("webview reload: {error}");
+                    if let Some(webview) = &self.webview {
+                        if let Err(error) = webview.reload() {
+                            eprintln!("webview reload: {error}");
+                        }
                     }
                 }
                 "q" => {
@@ -394,17 +416,22 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        let mut state = match State::new(window, renderer, proxy) {
+        let mut state = match State::new(window, renderer) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!("create webview: {error}");
+                eprintln!("create state: {error}");
                 event_loop.exit();
                 return;
             }
         };
-        state.pump_navigation();
-        state.redraw();
+        state.draw();
         self.state = Some(state);
+        if let Some(state) = self.state.as_mut() {
+            if let Err(error) = state.init_webview(proxy) {
+                eprintln!("create webview: {error}");
+            }
+            state.redraw();
+        }
     }
 
     fn window_event(
@@ -464,19 +491,26 @@ impl ApplicationHandler<UserEvent> for App {
                 match button {
                     MouseButton::Left => match pressed {
                         ElementState::Pressed => {
-                            if let Some(direction) = resize_direction(state.cursor, state.size) {
-                                if let Err(error) = state.window.drag_resize_window(direction) {
-                                    eprintln!("resize window: {error}");
+                            if !state.shell.is_fullscreen() {
+                                if let Some(direction) = resize_direction(state.cursor, state.size)
+                                {
+                                    if let Err(error) = state.window.drag_resize_window(direction) {
+                                        eprintln!("resize window: {error}");
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            if state.shell.hit_chrome(state.cursor)
-                                == Some(ChromeElement::DragStrip)
-                            {
-                                state.start_drag(event_loop);
-                                return;
+                                if state.shell.hit_chrome(state.cursor)
+                                    == Some(ChromeElement::DragStrip)
+                                {
+                                    state.start_drag(event_loop);
+                                    return;
+                                }
                             }
                             state.shell.left_click(state.cursor);
+                            if state.shell.take_fullscreen_exit() {
+                                state.set_web_fullscreen(false);
+                                return;
+                            }
                             if let Some(action) = state.shell.take_chrome_action() {
                                 state.apply_chrome_action(action, event_loop);
                                 return;
@@ -485,7 +519,10 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Released => state.shell.left_released(state.cursor),
                     },
                     MouseButton::Right if pressed == ElementState::Pressed => {
-                        if state.shell.hit_chrome(state.cursor) == Some(ChromeElement::DragStrip) {
+                        if !state.shell.is_fullscreen()
+                            && state.shell.hit_chrome(state.cursor)
+                                == Some(ChromeElement::DragStrip)
+                        {
                             let scale = state.window.scale_factor();
                             let point = PhysicalPosition::new(
                                 state.cursor.x as f64 * scale,
@@ -524,6 +561,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::WebView(webview::WebViewEvent::NewWindowRequested(url)) => {
                 state.shell.webview_new_window(&url)
+            }
+            UserEvent::WebView(webview::WebViewEvent::FullScreenChanged(enabled)) => {
+                state.set_web_fullscreen(enabled);
+                return;
             }
             UserEvent::WebView(webview::WebViewEvent::Accelerator {
                 key,
@@ -684,7 +725,7 @@ mod tests {
     fn icon_rgba_has_transparent_background() {
         let (rgba, width, height) = icon_rgba().expect("icon should decode");
         assert_eq!(rgba.len(), (width * height * 4) as usize);
-        assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
-        assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] > 128));
+        assert!(rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0));
+        assert!(rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 128));
     }
 }

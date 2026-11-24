@@ -9,10 +9,10 @@ use webview2_com::{
     },
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler,
+    AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    DocumentTitleChangedEventHandler, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
 };
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
@@ -25,6 +25,7 @@ pub enum WebViewEvent {
     TitleChanged(String),
     UrlChanged(String),
     NewWindowRequested(String),
+    FullScreenChanged(bool),
     Accelerator {
         key: u32,
         ctrl: bool,
@@ -43,6 +44,7 @@ struct Tokens {
     navigation_start: i64,
     navigation_completed: i64,
     new_window: i64,
+    fullscreen: i64,
     accelerator: i64,
 }
 
@@ -122,7 +124,7 @@ impl WebViewHost {
 
         unsafe {
             controller
-                .SetIsVisible(true)
+                .SetIsVisible(false)
                 .map_err(|error| error.to_string())?;
         }
 
@@ -228,6 +230,28 @@ impl WebViewHost {
                 .map_err(|error| error.to_string())?;
         }
 
+        let mut fullscreen_token = 0i64;
+        let proxy_fullscreen = proxy.clone();
+        unsafe {
+            webview
+                .add_ContainsFullScreenElementChanged(
+                    &ContainsFullScreenElementChangedEventHandler::create(Box::new(
+                        move |sender, _| {
+                            if let Some(webview) = sender {
+                                let mut contains = windows::core::BOOL(0);
+                                webview.ContainsFullScreenElement(&mut contains)?;
+                                let _ = proxy_fullscreen.send_event(UserEvent::WebView(
+                                    WebViewEvent::FullScreenChanged(contains.0 != 0),
+                                ));
+                            }
+                            Ok(())
+                        },
+                    )),
+                    &mut fullscreen_token,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         let mut accelerator_token = 0i64;
         let proxy_accelerator = proxy.clone();
         unsafe {
@@ -275,6 +299,7 @@ impl WebViewHost {
                 navigation_start: navigation_start_token,
                 navigation_completed: navigation_completed_token,
                 new_window: new_window_token,
+                fullscreen: fullscreen_token,
                 accelerator: accelerator_token,
             },
         })
@@ -293,6 +318,15 @@ impl WebViewHost {
     pub fn reload(&self) -> Result<(), String> {
         unsafe {
             self.webview.Reload().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        unsafe {
+            self.controller
+                .SetIsVisible(visible)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -325,6 +359,9 @@ impl Drop for WebViewHost {
             let _ = self
                 .webview
                 .remove_NewWindowRequested(self.tokens.new_window);
+            let _ = self
+                .webview
+                .remove_ContainsFullScreenElementChanged(self.tokens.fullscreen);
             let _ = self
                 .controller
                 .remove_AcceleratorKeyPressed(self.tokens.accelerator);

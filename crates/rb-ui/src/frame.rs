@@ -1,28 +1,10 @@
 use crate::geom::{Color, Rect};
 
+pub use crate::lucide::Icon;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFamily {
     Sans,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Icon {
-    Search,
-    Lock,
-    Star,
-    StarFilled,
-    Reload,
-    Plus,
-    Close,
-    More,
-    Bookmark,
-    Edit,
-    Trash,
-    Minimize,
-    Maximize,
-    Restore,
-    ChevronLeft,
-    ChevronRight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +65,7 @@ impl IconShape {
             icon,
             rect,
             color,
-            stroke: (rect.width.min(rect.height) * 0.11).max(1.0),
+            stroke: (rect.width.min(rect.height) * 2.0 / 24.0).max(1.0),
         }
     }
 
@@ -110,6 +92,9 @@ pub struct TextShape {
     pub clip: Option<Rect>,
     pub caret: Option<usize>,
     pub caret_color: Color,
+    pub selection: Option<(usize, usize)>,
+    pub selection_color: Color,
+    pub offset_x: f32,
 }
 
 impl TextShape {
@@ -130,6 +115,9 @@ impl TextShape {
             clip: None,
             caret: None,
             caret_color: color,
+            selection: None,
+            selection_color: Color::rgba(0x3f, 0x6f, 0xb5, 0x99),
+            offset_x: 0.0,
         }
     }
 
@@ -176,6 +164,17 @@ impl TextShape {
     pub fn caret(mut self, caret: Option<usize>, caret_color: Color) -> Self {
         self.caret = caret;
         self.caret_color = caret_color;
+        self
+    }
+
+    pub fn selection(mut self, selection: Option<(usize, usize)>, color: Color) -> Self {
+        self.selection = selection;
+        self.selection_color = color;
+        self
+    }
+
+    pub fn offset_x(mut self, offset: f32) -> Self {
+        self.offset_x = offset.max(0.0);
         self
     }
 }

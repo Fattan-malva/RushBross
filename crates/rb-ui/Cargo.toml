@@ -5,3 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lucide-static-svg = { version = "1", default-features = false, features = ["svg"] }

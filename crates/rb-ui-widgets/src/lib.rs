@@ -4,6 +4,7 @@ pub use chrome::{ChromeAction, ChromeElement, WindowChrome};
 
 use rb_bookmarks::{Bookmark, BookmarkId, BookmarkStore};
 use rb_tabs::{Tab, TabId, TabManager};
+use rb_ui::text_input::{index_at_offset, text_width};
 use rb_ui::{
     Align, Color, Frame, Icon, IconShape, Rect, RectShape, TextInput, TextShape, Theme, Vec2,
 };
@@ -20,6 +21,10 @@ const POPOVER_WIDTH: f32 = 320.0;
 const POPOVER_MAX_LIST_HEIGHT: f32 = 240.0;
 const ROW_HEIGHT: f32 = 36.0;
 const CONTEXT_WIDTH: f32 = 160.0;
+const NAV_BUTTON_SIZE: f32 = 32.0;
+const NAV_GAP: f32 = 6.0;
+const FULLSCREEN_BAR_HEIGHT: f32 = 56.0;
+const ADDRESS_FONT_SIZE: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
@@ -37,10 +42,16 @@ enum Element {
     WindowMaximizeToggle,
     WindowClose,
     WindowDrag,
+    Back,
+    Forward,
+    Reload,
+    ToolbarMenu,
+    Profile,
+    ToolbarMore,
     Address,
     AddressClear,
     BookmarkStar,
-    Reload,
+    FullscreenClose,
     BookmarkHint,
     BookmarkChip(BookmarkId),
     BookmarkManage,
@@ -108,12 +119,16 @@ struct TabDrag {
     order: Vec<TabId>,
     target: usize,
     dragging: bool,
+    slots: Vec<f32>,
+    settled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Layout {
     viewport: Rect,
     manage_button: Rect,
+    address_text_x: f32,
+    address_scroll: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -122,12 +137,21 @@ pub struct NavigationRequest {
     pub title: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorRole {
+    Default,
+    Pointer,
+    Text,
+}
+
 pub struct BrowserShell {
     theme: Theme,
     tabs: TabManager,
     bookmarks: BookmarkStore,
     address: TextInput,
     focus: Option<Focus>,
+    address_dragging: bool,
+    fullscreen: bool,
     show_bookmarks: bool,
     editing: Option<BookmarkEdit>,
     context_menu: Option<ContextMenu>,
@@ -140,6 +164,7 @@ pub struct BrowserShell {
     chrome: WindowChrome,
     maximized: bool,
     pending_chrome: Option<ChromeAction>,
+    pending_fullscreen_exit: bool,
     pending: Option<NavigationRequest>,
 }
 
@@ -159,6 +184,8 @@ impl BrowserShell {
             bookmarks: BookmarkStore::new(),
             address: TextInput::new(),
             focus: None,
+            address_dragging: false,
+            fullscreen: false,
             show_bookmarks: false,
             editing: None,
             context_menu: None,
@@ -171,8 +198,10 @@ impl BrowserShell {
             chrome: WindowChrome::layout(0.0, 0.0),
             maximized: false,
             pending_chrome: None,
+            pending_fullscreen_exit: false,
             pending: None,
         };
+        shell.sync_address_to_active();
         shell.request_active_navigation();
         shell
     }
@@ -188,7 +217,15 @@ impl BrowserShell {
 
     pub fn pointer_moved(&mut self, position: Vec2) {
         self.pointer = position;
-        let Some(drag) = self.tab_drag.as_mut() else {
+        if self.address_dragging && self.focus == Some(Focus::Address) {
+            let text = self.address.text().to_string();
+            let offset =
+                (position.x - self.layout.address_text_x + self.layout.address_scroll).max(0.0);
+            let index = index_at_offset(&text, offset, ADDRESS_FONT_SIZE);
+            self.address.extend_to(index);
+            return;
+        }
+        let Some(mut drag) = self.tab_drag.take() else {
             return;
         };
         drag.current = position;
@@ -196,33 +233,37 @@ impl BrowserShell {
         if !drag.dragging && moved > 4.0 {
             drag.dragging = true;
         }
-        if !drag.dragging {
-            return;
-        }
-        let order = drag.order.clone();
-        let dragged = drag.id;
-        let mut target = 0usize;
-        for id in order.iter() {
-            if *id == dragged {
-                continue;
-            }
-            if let Some((_, rect)) = self.tab_rects.iter().find(|(tab_id, _)| tab_id == id) {
-                if position.x < rect.center().x {
+        if drag.dragging {
+            let order = self
+                .tabs
+                .tabs()
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>();
+            let centers = drag.slots.clone();
+            let mut target = 0usize;
+            for (index, id) in order.iter().enumerate() {
+                if *id == drag.id {
+                    continue;
+                }
+                let center = centers.get(index).copied().unwrap_or(position.x);
+                if position.x < center {
                     break;
                 }
+                target += 1;
             }
-            target += 1;
-        }
-        if let Some(drag) = self.tab_drag.as_mut() {
+            drag.order = order;
             drag.target = target;
+            self.tabs.move_to(drag.id, target);
         }
-        self.tabs.move_to(dragged, target);
+        self.tab_drag = Some(drag);
     }
 
     pub fn left_click(&mut self, position: Vec2) {
         self.pointer = position;
         let hit = self.hit_at(position);
 
+        self.address_dragging = false;
         if let Some((Element::Tab(id), rect)) = hit {
             self.tab_drag = Some(TabDrag {
                 id,
@@ -233,7 +274,26 @@ impl BrowserShell {
                 order: self.tabs.tabs().iter().map(|tab| tab.id).collect(),
                 target: self.tabs.index_of(id).unwrap_or(0),
                 dragging: false,
+                slots: Vec::new(),
+                settled: true,
             });
+        }
+
+        if let Some((Element::Address, rect)) = hit {
+            self.focus = Some(Focus::Address);
+            let text = self.address.text().to_string();
+            let offset =
+                (position.x - self.layout.address_text_x + self.layout.address_scroll).max(0.0);
+            let index = index_at_offset(&text, offset, ADDRESS_FONT_SIZE);
+            self.address.set_caret(index);
+            let _ = rect;
+            self.context_menu = None;
+            if self.show_bookmarks {
+                self.show_bookmarks = false;
+                self.editing = None;
+            }
+            self.address_dragging = true;
+            return;
         }
 
         if let Some(element) = hit.map(|(element, _)| element) {
@@ -259,18 +319,14 @@ impl BrowserShell {
     pub fn left_released(&mut self, position: Vec2) {
         self.pointer = position;
         self.tab_drag = None;
+        self.address_dragging = false;
     }
 
     pub fn animate_tabs(&mut self) -> bool {
-        let Some(drag) = self.tab_drag.as_mut() else {
-            return false;
-        };
-        if !drag.dragging {
-            return false;
-        }
-        let target = drag.current.x - drag.grab_offset;
-        drag.visual_x += (target - drag.visual_x) * 0.35;
-        (target - drag.visual_x).abs() > 0.4
+        self.tab_drag
+            .as_ref()
+            .filter(|drag| drag.dragging && !drag.settled)
+            .is_some()
     }
 
     pub fn right_click(&mut self, position: Vec2) {
@@ -301,12 +357,58 @@ impl BrowserShell {
         self.maximized = maximized;
     }
 
+    pub fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.fullscreen = fullscreen;
+        self.pending_fullscreen_exit = false;
+        if fullscreen {
+            self.show_bookmarks = false;
+            self.context_menu = None;
+            self.blur();
+        }
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    pub fn cursor_role(&self, position: Vec2) -> CursorRole {
+        if self.fullscreen {
+            return if self
+                .hits
+                .iter()
+                .rev()
+                .find(|(_, rect)| rect.contains(position))
+                .is_some_and(|(element, _)| *element == Element::FullscreenClose)
+            {
+                CursorRole::Pointer
+            } else {
+                CursorRole::Default
+            };
+        }
+        match self
+            .hits
+            .iter()
+            .rev()
+            .find(|(_, rect)| rect.contains(position))
+            .map(|(element, _)| *element)
+        {
+            Some(Element::Address | Element::EditTitle | Element::EditUrl) => CursorRole::Text,
+            Some(Element::WindowDrag) => CursorRole::Default,
+            Some(_) => CursorRole::Pointer,
+            None => CursorRole::Default,
+        }
+    }
+
     pub fn hit_chrome(&self, position: Vec2) -> Option<ChromeElement> {
         self.chrome.hit(position)
     }
 
     pub fn take_chrome_action(&mut self) -> Option<ChromeAction> {
         self.pending_chrome.take()
+    }
+
+    pub fn take_fullscreen_exit(&mut self) -> bool {
+        std::mem::take(&mut self.pending_fullscreen_exit)
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -484,8 +586,28 @@ impl BrowserShell {
 
     pub fn content_rect(&self, width: f32, height: f32) -> Rect {
         let (width, height) = (width.max(0.0), height.max(0.0));
-        let top = TAB_STRIP_HEIGHT + TOOLBAR_HEIGHT + BOOKMARK_BAR_HEIGHT;
+        if self.fullscreen {
+            return Rect::new(0.0, 0.0, width, height);
+        }
+        let top = TAB_STRIP_HEIGHT
+            + TOOLBAR_HEIGHT
+            + if self.bookmark_bar_visible() {
+                BOOKMARK_BAR_HEIGHT
+            } else {
+                0.0
+            };
         Rect::new(0.0, top, width, (height - top).max(0.0))
+    }
+
+    fn bookmark_bar_visible(&self) -> bool {
+        if self.fullscreen || self.bookmarks.is_empty() {
+            return false;
+        }
+        self.tabs
+            .active()
+            .and_then(|tab| tab.url.as_deref())
+            .map(|url| url.is_empty() || url == "about:blank")
+            .unwrap_or(true)
     }
 
     pub fn webview_title_changed(&mut self, title: &str) {
@@ -594,6 +716,20 @@ impl BrowserShell {
                 self.pending_chrome = Some(ChromeAction::Close);
             }
             Element::WindowDrag => {}
+            Element::Back => self.go_back(),
+            Element::Forward => self.go_forward(),
+            Element::ToolbarMenu | Element::Profile => {}
+            Element::ToolbarMore => {
+                self.show_bookmarks = !self.show_bookmarks;
+                self.editing = None;
+                self.context_menu = None;
+                if !self.show_bookmarks {
+                    self.blur();
+                }
+            }
+            Element::FullscreenClose => {
+                self.pending_fullscreen_exit = true;
+            }
             Element::Tab(id) => {
                 let changed = self.tabs.active_id() != Some(id);
                 self.tabs.activate(id);
@@ -607,7 +743,6 @@ impl BrowserShell {
             Element::NewTabButton => self.new_tab(),
             Element::Address => {
                 self.focus = Some(Focus::Address);
-                self.address.select_all();
             }
             Element::AddressClear => {
                 self.address.clear();
@@ -812,11 +947,24 @@ impl BrowserShell {
             0.0,
         ));
 
+        if self.fullscreen {
+            let viewport = Rect::new(0.0, 0.0, width, height);
+            self.layout.viewport = viewport;
+            self.build_viewport(base, viewport);
+            self.build_fullscreen(&mut frame, width, hover);
+            return frame;
+        }
+
         let tab_strip = Rect::new(0.0, 0.0, width, TAB_STRIP_HEIGHT);
         base.push_rect(RectShape::filled(tab_strip, theme.tab_strip, 0.0));
 
         let toolbar = Rect::new(0.0, TAB_STRIP_HEIGHT, width, TOOLBAR_HEIGHT);
-        let bookmark_bar = Rect::new(0.0, toolbar.bottom(), width, BOOKMARK_BAR_HEIGHT);
+        let bar_height = if self.bookmark_bar_visible() {
+            BOOKMARK_BAR_HEIGHT
+        } else {
+            0.0
+        };
+        let bookmark_bar = Rect::new(0.0, toolbar.bottom(), width, bar_height);
         let viewport = Rect::new(
             0.0,
             bookmark_bar.bottom(),
@@ -836,7 +984,9 @@ impl BrowserShell {
             focus,
             hover,
         );
-        self.build_bookmark_bar(base, bookmark_bar, width, &bookmarks, active_id, hover);
+        if bar_height > 0.0 {
+            self.build_bookmark_bar(base, bookmark_bar, width, &bookmarks, hover);
+        }
         self.build_viewport(base, viewport);
 
         if show_bookmarks {
@@ -849,10 +999,56 @@ impl BrowserShell {
             self.build_context_menu(&mut frame, width, height, &bookmarks, menu, hover);
         }
 
+        let tooltip = hover
+            .and_then(|element| match element {
+                Element::Tab(id) => Some(id),
+                _ => None,
+            })
+            .and_then(|id| {
+                self.tab_rects
+                    .iter()
+                    .find(|(tab_id, _)| *tab_id == id)
+                    .map(|(_, rect)| (id, *rect))
+            })
+            .and_then(|(id, rect)| {
+                let tab = self.tabs.tab(id)?;
+                let close_x = rect.right() - 10.0 - 20.0;
+                let title_width = (close_x - 8.0 - (rect.x + 10.0)).max(0.0);
+                if approx_text_width(&tab.title, 12.0) > title_width {
+                    Some((rect.center().x, rect.bottom() + 6.0, tab.title.clone()))
+                } else {
+                    None
+                }
+            });
+        if let Some((center_x, y, text)) = tooltip {
+            let tooltip_width = (approx_text_width(&text, 12.0) + 16.0).min(width - 16.0);
+            let x = (center_x - tooltip_width * 0.5)
+                .max(8.0)
+                .min((width - tooltip_width - 8.0).max(8.0));
+            let rect = Rect::new(x, y, tooltip_width, 26.0);
+            frame.overlay.push_rect(RectShape::bordered(
+                rect,
+                theme.popover,
+                4.0,
+                1.0,
+                theme.border,
+            ));
+            frame.overlay.push_text(
+                TextShape::new(
+                    text,
+                    rect.x + 8.0,
+                    rect.y + 5.0,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width(rect.width - 16.0)
+                .ellipsis(),
+            );
+        }
+
         frame
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn draw_tab(
         &mut self,
         layer: &mut rb_ui::Layer,
@@ -861,12 +1057,9 @@ impl BrowserShell {
         is_active: bool,
         is_hover: bool,
         hover: Option<Element>,
-        floating: bool,
     ) {
         let theme = self.theme;
-        let background = if floating {
-            theme.accent.with_alpha(0.92)
-        } else if is_active {
+        let background = if is_active {
             theme.background
         } else if is_hover {
             theme.tab_hover
@@ -874,13 +1067,11 @@ impl BrowserShell {
             theme.tab_inactive
         };
         layer.push_rect(RectShape::filled(rect, background, 6.0));
-        if !floating {
-            self.push_hit(Element::Tab(tab.id), rect);
-        }
+        self.push_hit(Element::Tab(tab.id), rect);
 
         let close_rect = Rect::new(rect.right() - 10.0 - 20.0, rect.y + 6.0, 20.0, 20.0);
         let title_width = (close_rect.x - 8.0 - (rect.x + 10.0)).max(0.0);
-        let title_color = if is_active || floating {
+        let title_color = if is_active {
             theme.foreground
         } else {
             theme.muted_foreground
@@ -899,9 +1090,6 @@ impl BrowserShell {
         }
         layer.push_text(title);
 
-        if floating {
-            return;
-        }
         let close_hover = hover == Some(Element::TabClose(tab.id));
         if close_hover {
             layer.push_rect(RectShape::filled(close_rect, theme.accent, 10.0));
@@ -919,7 +1107,6 @@ impl BrowserShell {
         self.push_hit(Element::TabClose(tab.id), close_rect);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_tabs(
         &mut self,
         layer: &mut rb_ui::Layer,
@@ -940,11 +1127,6 @@ impl BrowserShell {
             - TAB_GAP)
             .max(0.0);
         let max_width = width * TAB_MAX_RATIO;
-        let dragged = self
-            .tab_drag
-            .as_ref()
-            .filter(|drag| drag.dragging)
-            .map(|drag| (drag.id, drag.visual_x));
 
         let naturals: Vec<f32> = tabs
             .iter()
@@ -968,18 +1150,66 @@ impl BrowserShell {
             }
         }
 
-        self.tab_rects.clear();
+        let mut target_xs = Vec::with_capacity(widths.len());
         let mut x = padding;
+        for tab_width in &widths {
+            target_xs.push(x);
+            x += *tab_width + TAB_GAP;
+        }
+        let target_centers: Vec<f32> = target_xs
+            .iter()
+            .zip(widths.iter())
+            .map(|(tab_x, tab_width)| tab_x + tab_width * 0.5)
+            .collect();
+
+        let mut dragged_state = None;
+        if let Some(drag) = self.tab_drag.as_mut() {
+            if drag.dragging {
+                if drag.slots.len() != target_centers.len() {
+                    drag.slots = target_centers.clone();
+                }
+                let mut settled = true;
+                for (slot, target) in drag.slots.iter_mut().zip(target_centers.iter()) {
+                    *slot += (target - *slot) * 0.35;
+                    if (target - *slot).abs() > 0.4 {
+                        settled = false;
+                    }
+                }
+                let target_visual = (drag.current.x - drag.grab_offset)
+                    .clamp(padding, (padding + available).max(padding));
+                drag.visual_x += (target_visual - drag.visual_x) * 0.35;
+                if (target_visual - drag.visual_x).abs() > 0.4 {
+                    settled = false;
+                }
+                drag.settled = settled;
+                dragged_state = Some((drag.id, drag.visual_x));
+            }
+        }
+
+        let slot_centers = self
+            .tab_drag
+            .as_ref()
+            .filter(|drag| drag.dragging)
+            .map(|drag| drag.slots.clone())
+            .unwrap_or_else(|| target_centers.clone());
+
+        self.tab_rects.clear();
         for (index, tab) in tabs.iter().enumerate() {
             let tab_width = widths[index];
-            let tab_rect = Rect::new(x, strip.y + 8.0, tab_width, TAB_HEIGHT);
+            let tab_x = if dragged_state.is_some_and(|(id, _)| id == tab.id) {
+                dragged_state.map(|(_, x)| x).unwrap_or(target_xs[index])
+            } else {
+                slot_centers
+                    .get(index)
+                    .copied()
+                    .unwrap_or(target_centers[index])
+                    - tab_width * 0.5
+            };
+            let tab_rect = Rect::new(tab_x, strip.y + 8.0, tab_width, TAB_HEIGHT);
             self.tab_rects.push((tab.id, tab_rect));
             let is_active = active_id == Some(tab.id);
             let is_hover = hover == Some(Element::Tab(tab.id));
-            if dragged.map(|(id, _)| id) != Some(tab.id) {
-                self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover, false);
-            }
-            x += tab_width + TAB_GAP;
+            self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
         }
 
         let plus_rect = Rect::new(x, strip.y + 10.0, plus_size, plus_size);
@@ -1013,21 +1243,6 @@ impl BrowserShell {
                 rect,
             );
         }
-
-        if let Some((dragged_id, visual_x)) = dragged {
-            if let Some(index) = tabs.iter().position(|tab| tab.id == dragged_id) {
-                let rect = Rect::new(visual_x, strip.y + 4.0, widths[index], TAB_HEIGHT);
-                self.draw_tab(
-                    layer,
-                    &tabs[index],
-                    rect,
-                    active_id == Some(dragged_id),
-                    true,
-                    hover,
-                    true,
-                );
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1043,28 +1258,96 @@ impl BrowserShell {
         hover: Option<Element>,
     ) {
         let theme = self.theme;
-        let left = 8.0;
-        let right = 8.0;
-        let reload_size = 32.0;
-        let gap = 8.0;
+        let side = 8.0;
+        let gap = NAV_GAP;
+        let button_y = toolbar.y + (TOOLBAR_HEIGHT - NAV_BUTTON_SIZE) * 0.5;
 
-        let form = Rect::new(
-            left,
-            toolbar.y + 6.0,
-            (width - left - right - reload_size - gap).max(1.0),
-            ADDRESS_HEIGHT,
+        let back_rect = Rect::new(side, button_y, NAV_BUTTON_SIZE, NAV_BUTTON_SIZE);
+        let forward_rect = Rect::new(
+            back_rect.right() + gap,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
         );
         let reload_rect = Rect::new(
-            form.right() + gap,
-            toolbar.y + 8.0,
-            reload_size,
-            reload_size,
+            forward_rect.right() + gap,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
+        let more_rect = Rect::new(
+            width - side - NAV_BUTTON_SIZE,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
+        let profile_rect = Rect::new(
+            more_rect.x - gap - NAV_BUTTON_SIZE,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
+        let menu_rect = Rect::new(
+            profile_rect.x - gap - NAV_BUTTON_SIZE,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
+        self.layout.manage_button = more_rect;
+
+        let form = Rect::new(
+            reload_rect.right() + gap,
+            toolbar.y + 6.0,
+            (menu_rect.x - gap - reload_rect.right() - gap).max(1.0),
+            ADDRESS_HEIGHT,
         );
 
-        let has_url = active_id
+        let (can_back, can_forward, has_url, active_url) = active_id
             .and_then(|id| self.tabs.tab(id))
-            .and_then(|tab| tab.url.as_ref())
-            .is_some();
+            .map(|tab| {
+                (
+                    tab.can_go_back(),
+                    tab.can_go_forward(),
+                    tab.url.is_some(),
+                    tab.url.clone(),
+                )
+            })
+            .unwrap_or((false, false, false, None));
+
+        let nav_button =
+            |layer: &mut rb_ui::Layer, rect: Rect, icon: Icon, element: Element, enabled: bool| {
+                let is_hover = hover == Some(element) && enabled;
+                if is_hover {
+                    layer.push_rect(RectShape::filled(rect, theme.accent, NAV_BUTTON_SIZE * 0.5));
+                }
+                let color = if !enabled {
+                    theme.muted_foreground.with_alpha(0.35)
+                } else if is_hover {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                };
+                layer.push_icon(IconShape::new(icon, icon_rect(rect.center(), 18.0), color));
+            };
+        nav_button(layer, back_rect, Icon::ArrowLeft, Element::Back, can_back);
+        nav_button(
+            layer,
+            forward_rect,
+            Icon::ArrowRight,
+            Element::Forward,
+            can_forward,
+        );
+        nav_button(layer, reload_rect, Icon::Reload, Element::Reload, has_url);
+        nav_button(layer, menu_rect, Icon::Menu, Element::ToolbarMenu, true);
+        nav_button(layer, profile_rect, Icon::Profile, Element::Profile, true);
+        nav_button(layer, more_rect, Icon::More, Element::ToolbarMore, true);
+        self.push_hit(Element::Back, back_rect);
+        self.push_hit(Element::Forward, forward_rect);
+        self.push_hit(Element::Reload, reload_rect);
+        self.push_hit(Element::ToolbarMenu, menu_rect);
+        self.push_hit(Element::Profile, profile_rect);
+        self.push_hit(Element::ToolbarMore, more_rect);
+
         let form_focused = focus == Some(Focus::Address);
         let is_url = normalize_url(address).is_some();
 
@@ -1096,8 +1379,7 @@ impl BrowserShell {
         }
         self.push_hit(Element::Address, form);
 
-        let icon_x = form.x + 12.0;
-        let icon_center = Vec2::new(icon_x + 8.0, form.center().y);
+        let icon_center = Vec2::new(form.x + 20.0, form.center().y);
         let leading_icon = if is_url { Icon::Lock } else { Icon::Search };
         layer.push_icon(IconShape::new(
             leading_icon,
@@ -1118,40 +1400,72 @@ impl BrowserShell {
         };
         let text_x = icon_center.x + 8.0 + 8.0;
         let text_end = clear_rect.map(|rect| rect.x).unwrap_or(star_rect.x);
-        let text_width = (text_end - 8.0 - text_x).max(0.0);
+        let available_width = (text_end - 8.0 - text_x).max(0.0);
 
-        let active_bookmark = self
-            .tabs
-            .active()
-            .and_then(|tab| tab.url.as_deref())
-            .and_then(|url| self.bookmarks.find_by_url(url).map(|item| item.id));
-        let bookmarked = active_bookmark.is_some();
+        let bookmarked = active_url
+            .as_deref()
+            .and_then(|url| self.bookmarks.find_by_url(url).map(|item| item.id))
+            .is_some();
+        let selection = self.address.selection();
+        let has_selection = self.address.has_selection();
         let caret = if form_focused { Some(cursor) } else { None };
+        let sel_start = text_width(
+            &address[..char_boundary(address, selection.0)],
+            ADDRESS_FONT_SIZE,
+        );
+        let caret_width = text_width(
+            &address[..char_boundary(address, cursor)],
+            ADDRESS_FONT_SIZE,
+        );
+        let focus_position = if has_selection {
+            sel_start.min(caret_width)
+        } else {
+            caret_width
+        };
+        let max_visible = (available_width - 24.0).max(0.0);
+        let scroll = if form_focused && focus_position > max_visible {
+            focus_position - max_visible + 24.0
+        } else {
+            0.0
+        };
+        self.layout.address_text_x = text_x;
+        self.layout.address_scroll = scroll;
 
+        let text_y = form.y + (ADDRESS_HEIGHT - ADDRESS_FONT_SIZE * 1.3) * 0.5;
         if address.is_empty() {
             layer.push_text(
                 TextShape::new(
                     "Cari atau ketik URL",
                     text_x,
-                    form.y + (ADDRESS_HEIGHT - 14.0 * 1.3) * 0.5,
-                    14.0,
+                    text_y,
+                    ADDRESS_FONT_SIZE,
                     theme.muted_foreground,
                 )
-                .width(text_width)
-                .ellipsis(),
+                .width(available_width)
+                .ellipsis()
+                .caret(caret, theme.foreground),
             );
         } else {
             layer.push_text(
                 TextShape::new(
                     address.to_string(),
                     text_x,
-                    form.y + (ADDRESS_HEIGHT - 14.0 * 1.3) * 0.5,
-                    14.0,
+                    text_y,
+                    ADDRESS_FONT_SIZE,
                     theme.foreground,
                 )
-                .width(text_width)
+                .width(available_width)
                 .ellipsis()
-                .caret(caret, theme.foreground),
+                .selection(
+                    if form_focused && has_selection {
+                        Some(selection)
+                    } else {
+                        None
+                    },
+                    Color::rgba(0x3f, 0x6f, 0xb5, 0x99),
+                )
+                .caret(caret, theme.foreground)
+                .offset_x(scroll),
             );
         }
 
@@ -1197,24 +1511,6 @@ impl BrowserShell {
             star_color,
         ));
         self.push_hit(Element::BookmarkStar, star_rect);
-
-        let reload_hover = hover == Some(Element::Reload) && has_url;
-        if reload_hover {
-            layer.push_rect(RectShape::filled(reload_rect, theme.accent, 16.0));
-        }
-        let reload_color = if !has_url {
-            theme.muted_foreground.with_alpha(0.4)
-        } else if reload_hover {
-            theme.foreground
-        } else {
-            theme.muted_foreground
-        };
-        layer.push_icon(IconShape::new(
-            Icon::Reload,
-            icon_rect(reload_rect.center(), 16.0),
-            reload_color,
-        ));
-        self.push_hit(Element::Reload, reload_rect);
     }
 
     fn build_bookmark_bar(
@@ -1223,7 +1519,6 @@ impl BrowserShell {
         bar: Rect,
         width: f32,
         bookmarks: &[Bookmark],
-        _active_id: Option<TabId>,
         hover: Option<Element>,
     ) {
         let theme = self.theme;
@@ -1241,7 +1536,6 @@ impl BrowserShell {
         ));
 
         let manage_rect = Rect::new(width - 12.0 - 24.0, bar.y + 4.0, 24.0, 24.0);
-        self.layout.manage_button = manage_rect;
 
         let strip_left = leading_rect.right() + 8.0;
         let strip_right = manage_rect.x - 8.0;
@@ -1356,6 +1650,45 @@ impl BrowserShell {
             manage_color,
         ));
         self.push_hit(Element::BookmarkManage, manage_rect);
+    }
+
+    fn build_fullscreen(&mut self, frame: &mut Frame, width: f32, hover: Option<Element>) {
+        if self.pointer.y > FULLSCREEN_BAR_HEIGHT && hover != Some(Element::FullscreenClose) {
+            return;
+        }
+        let theme = self.theme;
+        let layer = &mut frame.overlay;
+        layer.push_rect(RectShape::filled(
+            Rect::new(0.0, 0.0, width, FULLSCREEN_BAR_HEIGHT),
+            Color::rgba(0x00, 0x00, 0x00, 0x99),
+            0.0,
+        ));
+        let close_rect = Rect::new(
+            width - 12.0 - 36.0,
+            (FULLSCREEN_BAR_HEIGHT - 36.0) * 0.5,
+            36.0,
+            36.0,
+        );
+        let is_hover = hover == Some(Element::FullscreenClose);
+        if is_hover {
+            layer.push_rect(RectShape::filled(close_rect, theme.accent, 18.0));
+        }
+        layer.push_icon(IconShape::new(
+            Icon::Close,
+            icon_rect(close_rect.center(), 18.0),
+            theme.foreground,
+        ));
+        layer.push_text(
+            TextShape::new(
+                "Keluar fullscreen",
+                16.0,
+                (FULLSCREEN_BAR_HEIGHT - 12.0 * 1.3) * 0.5,
+                12.0,
+                theme.foreground,
+            )
+            .weight(500),
+        );
+        self.push_hit(Element::FullscreenClose, close_rect);
     }
 
     fn build_viewport(&mut self, layer: &mut rb_ui::Layer, viewport: Rect) {
@@ -1715,6 +2048,14 @@ fn chrome_hover(hover: Option<Element>) -> Option<ChromeElement> {
         Some(Element::WindowClose) => Some(ChromeElement::Close),
         _ => None,
     }
+}
+
+fn char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn approx_text_width(text: &str, size: f32) -> f32 {

@@ -1,5 +1,6 @@
 pub mod frame;
 pub mod geom;
+pub mod lucide;
 pub mod text_input;
 pub mod theme;
 

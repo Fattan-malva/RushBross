@@ -28,6 +28,16 @@ impl TextInput {
         self.anchor = self.cursor;
     }
 
+    pub fn set_caret(&mut self, index: usize) {
+        let index = floor_char_boundary(&self.text, index.min(self.text.len()));
+        self.cursor = index;
+        self.anchor = index;
+    }
+
+    pub fn extend_to(&mut self, index: usize) {
+        self.cursor = floor_char_boundary(&self.text, index.min(self.text.len()));
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -196,5 +206,68 @@ impl TextInput {
             position = next;
         }
         position
+    }
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+pub fn char_width(ch: char, size: f32) -> f32 {
+    let factor = match ch {
+        'i' | 'l' | 'I' | 'j' | 't' | 'f' | '.' | ',' | ':' | ';' | '\'' | '!' => 0.28,
+        'm' | 'w' | 'M' | 'W' => 0.86,
+        ' ' => 0.28,
+        'A'..='Z' => 0.68,
+        '0'..='9' => 0.56,
+        _ if ch.is_ascii() => 0.53,
+        _ => 1.0,
+    };
+    factor * size
+}
+
+pub fn text_width(text: &str, size: f32) -> f32 {
+    text.chars().map(|ch| char_width(ch, size)).sum()
+}
+
+pub fn index_at_offset(text: &str, offset: f32, size: f32) -> usize {
+    let mut index = 0usize;
+    let mut x = 0.0f32;
+    for (byte_index, ch) in text.char_indices() {
+        let width = char_width(ch, size);
+        if x + width * 0.5 > offset {
+            return byte_index;
+        }
+        x += width;
+        index = byte_index + ch.len_utf8();
+    }
+    index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caret_can_be_placed_and_selection_extended() {
+        let mut input = TextInput::new();
+        input.set_text("hello world");
+        input.set_caret(3);
+        assert_eq!(input.cursor(), 3);
+        assert!(!input.has_selection());
+        input.extend_to(8);
+        assert_eq!(input.selection(), (3, 8));
+        input.backspace();
+        assert_eq!(input.text(), "helrld");
+    }
+
+    #[test]
+    fn offset_maps_to_char_boundary() {
+        assert_eq!(index_at_offset("hello", 0.0, 10.0), 0);
+        assert_eq!(index_at_offset("hello", 100.0, 10.0), 5);
     }
 }
