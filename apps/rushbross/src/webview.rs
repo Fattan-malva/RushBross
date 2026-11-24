@@ -7,24 +7,30 @@ use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Controller2,
-        COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
-        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        COREWEBVIEW2_COLOR, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, COREWEBVIEW2_KEY_EVENT_KIND,
+        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
     },
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    DocumentTitleChangedEventHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    DocumentTitleChangedEventHandler, FaviconChangedEventHandler, GetFaviconCompletedHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler,
 };
 use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use winit::event_loop::EventLoopProxy;
 
 #[derive(Debug)]
 pub enum WebViewEvent {
+    /// Navigasi selesai. Host menampilkan WebView setelah ini, supaya tidak ada
+    /// kotak putih saat halaman pertama belum siap.
+    Loaded,
+    /// Favicon PNG untuk halaman yang sedang tampil. `None` menghapus favicon lama.
+    Favicon(Option<Vec<u8>>),
     TitleChanged(String),
     UrlChanged(String),
     NewWindowRequested(String),
@@ -196,6 +202,8 @@ impl WebViewHost {
             webview
                 .add_NavigationStarting(
                     &NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                        let _ =
+                            proxy_url.send_event(UserEvent::WebView(WebViewEvent::Favicon(None)));
                         if let Some(args) = args {
                             let mut uri = PWSTR::null();
                             args.Uri(&mut uri)?;
@@ -206,6 +214,32 @@ impl WebViewHost {
                         Ok(())
                     })),
                     &mut navigation_start_token,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        let mut favicon_token = 0i64;
+        let proxy_favicon = proxy.clone();
+        unsafe {
+            webview
+                .add_FaviconChanged(
+                    &FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+                        if let Some(webview) = sender {
+                            let proxy = proxy_favicon.clone();
+                            let completed =
+                                GetFaviconCompletedHandler::create(Box::new(move |_, stream| {
+                                    let bytes = stream.as_ref().and_then(read_stream);
+                                    let _ = proxy.send_event(UserEvent::WebView(
+                                        WebViewEvent::Favicon(bytes),
+                                    ));
+                                    Ok(())
+                                }));
+                            webview
+                                .GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &completed)?;
+                        }
+                        Ok(())
+                    })),
+                    &mut favicon_token,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -225,6 +259,8 @@ impl WebViewHost {
                                     .send_event(UserEvent::WebView(WebViewEvent::UrlChanged(url)));
                             }
                         }
+                        let _ =
+                            proxy_final_url.send_event(UserEvent::WebView(WebViewEvent::Loaded));
                         Ok(())
                     })),
                     &mut navigation_completed_token,
@@ -363,8 +399,11 @@ impl WebViewHost {
     pub fn reload(&self) -> Result<(), String> {
         // Halaman tab baru tidak punya URL asli, jadi reload memuat ulang HTML-nya.
         // Setelah pengguna pindah ke situs lain, sumber tidak lagi about:blank.
-        if self.showing_new_tab.get() && self.current_source()?.starts_with(ABOUT_BLANK) {
-            return self.load_new_tab();
+        if self.showing_new_tab.get() {
+            let source = self.current_source()?;
+            if source.starts_with(ABOUT_BLANK) || source.starts_with("data:") {
+                return self.load_new_tab();
+            }
         }
         unsafe {
             self.webview.Reload().map_err(|error| error.to_string())?;
@@ -428,4 +467,28 @@ impl Drop for WebViewHost {
             let _ = self.controller.Close();
         }
     }
+}
+
+/// Membaca seluruh isi stream favicon (PNG) dari WebView2.
+fn read_stream(stream: &IStream) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let mut read = 0u32;
+        let result = unsafe {
+            stream.Read(
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                Some(&mut read as *mut u32),
+            )
+        };
+        if result.is_err() {
+            return None;
+        }
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+    }
+    (!bytes.is_empty()).then_some(bytes)
 }

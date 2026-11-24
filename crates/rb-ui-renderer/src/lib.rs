@@ -1,5 +1,10 @@
 mod icons;
 
+mod images;
+
+use std::collections::HashMap;
+
+use images::ImageRegistry;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -12,13 +17,17 @@ use glyphon::{
     TextBounds, TextRenderer, Viewport,
 };
 use icons::IconRegistry;
-use rb_ui::frame::{Align, FontFamily, Frame, IconShape, RectShape, TextShape};
+use rb_ui::frame::{Align, FontFamily, Frame, IconShape, ImageShape, RectShape, TextShape};
 use rb_ui::Color;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 const SHADER: &str = include_str!("shader.wgsl");
 const INITIAL_INSTANCES: u64 = 512;
+/// Batas jumlah buffer teks yang di-cache. Cache dikosongkan di awal frame jika terlampaui.
+const TEXT_CACHE_LIMIT: usize = 512;
+/// Batas cache lebar prefix (untuk caret dan seleksi).
+const WIDTH_CACHE_LIMIT: usize = 4096;
 
 /// Font UI dibundel ke dalam binary agar tampilan sama di semua mesin Windows.
 const UI_FAMILY: &str = "Manrope";
@@ -49,6 +58,34 @@ struct RectInstance {
 struct Uniforms {
     screen: [f32; 2],
     _pad: [f32; 2],
+}
+
+/// Buffer teks yang sudah di-shape beserta ukurannya.
+struct TextSlot {
+    buffer: Buffer,
+    measured: f32,
+    lines: f32,
+}
+
+/// Kunci cache shaping: semua input yang memengaruhi hasil shape.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextKey {
+    text: String,
+    font_size: u32,
+    line_height: u32,
+    weight: u16,
+    align: u8,
+    wraps: bool,
+    ellipsis: bool,
+    width: u32,
+}
+
+fn align_key(align: Align) -> u8 {
+    match align {
+        Align::Left => 0,
+        Align::Center => 1,
+        Align::Right => 2,
+    }
 }
 
 struct PreparedText {
@@ -88,6 +125,10 @@ pub struct Renderer {
     overlay_text: TextRenderer,
     ui_family: &'static str,
     icons: IconRegistry,
+    images: ImageRegistry,
+    text_slots: Vec<TextSlot>,
+    text_index: HashMap<TextKey, usize>,
+    width_cache: HashMap<(String, u32, u16), f32>,
     /// Buffer kosong sebagai pembawa glyph ikon di jalur teks glyphon.
     empty_text: Buffer,
 }
@@ -280,6 +321,10 @@ impl Renderer {
             overlay_text,
             ui_family,
             icons: IconRegistry::default(),
+            images: ImageRegistry::default(),
+            text_slots: Vec::new(),
+            text_index: HashMap::new(),
+            width_cache: HashMap::new(),
             empty_text,
         })
     }
@@ -333,20 +378,32 @@ impl Renderer {
 
         let mut base_instances = self.shape_instances(&frame.base.shapes);
         let mut overlay_instances = self.shape_instances(&frame.overlay.shapes);
-        let base_glyphs = self.icon_glyphs(&frame.base.icons);
-        let overlay_glyphs = self.icon_glyphs(&frame.overlay.icons);
+        let mut base_glyphs = self.icon_glyphs(&frame.base.icons);
+        base_glyphs.extend(self.image_glyphs(&frame.base.images));
+        let mut overlay_glyphs = self.icon_glyphs(&frame.overlay.icons);
+        overlay_glyphs.extend(self.image_glyphs(&frame.overlay.images));
 
-        let mut base_buffers: Vec<Buffer> = Vec::with_capacity(frame.base.texts.len());
-        let mut base_prepared: Vec<PreparedText> = Vec::with_capacity(frame.base.texts.len());
-        let mut overlay_buffers: Vec<Buffer> = Vec::with_capacity(frame.overlay.texts.len());
-        let mut overlay_prepared: Vec<PreparedText> = Vec::with_capacity(frame.overlay.texts.len());
+        // Cache dikosongkan hanya di awal frame, supaya indeks slot yang dipakai
+        // frame ini tetap valid sampai selesai di-prepare.
+        if self.text_slots.len() > TEXT_CACHE_LIMIT {
+            self.text_slots.clear();
+            self.text_index.clear();
+        }
+        if self.width_cache.len() > WIDTH_CACHE_LIMIT {
+            self.width_cache.clear();
+        }
+
+        let mut base_prepared: Vec<(usize, PreparedText)> =
+            Vec::with_capacity(frame.base.texts.len());
+        let mut overlay_prepared: Vec<(usize, PreparedText)> =
+            Vec::with_capacity(frame.overlay.texts.len());
 
         for text in &frame.base.texts {
-            let prepared = self.build_text(text, &mut base_buffers, &mut overlay_instances);
+            let prepared = self.build_text(text, &mut overlay_instances);
             base_prepared.push(prepared);
         }
         for text in &frame.overlay.texts {
-            let prepared = self.build_text(text, &mut overlay_buffers, &mut overlay_instances);
+            let prepared = self.build_text(text, &mut overlay_instances);
             overlay_prepared.push(prepared);
         }
 
@@ -386,11 +443,11 @@ impl Renderer {
             right: self.size.0 as i32,
             bottom: self.size.1 as i32,
         };
-        let base_areas = base_buffers
+        let slots = &self.text_slots;
+        let base_areas = base_prepared
             .iter()
-            .zip(base_prepared.iter())
-            .map(|(buffer, prepared)| TextArea {
-                buffer,
+            .map(|(slot, prepared)| TextArea {
+                buffer: &slots[*slot].buffer,
                 left: prepared.left,
                 top: prepared.top,
                 scale: 1.0,
@@ -406,11 +463,10 @@ impl Renderer {
             )))
             .collect::<Vec<_>>();
 
-        let overlay_areas = overlay_buffers
+        let overlay_areas = overlay_prepared
             .iter()
-            .zip(overlay_prepared.iter())
-            .map(|(buffer, prepared)| TextArea {
-                buffer,
+            .map(|(slot, prepared)| TextArea {
+                buffer: &slots[*slot].buffer,
                 left: prepared.left,
                 top: prepared.top,
                 scale: 1.0,
@@ -427,6 +483,7 @@ impl Renderer {
             .collect::<Vec<_>>();
 
         let icons = &self.icons;
+        let images = &self.images;
         self.base_text
             .prepare_with_custom(
                 &self.device,
@@ -437,6 +494,13 @@ impl Renderer {
                 base_areas,
                 &mut self.swash_cache,
                 |request| {
+                    if let Some(data) = images.rasterize(request.id, request.width, request.height)
+                    {
+                        return Some(RasterizedCustomGlyph {
+                            data,
+                            content_type: ContentType::Color,
+                        });
+                    }
                     let data = icons.rasterize(request.id, request.width, request.height)?;
                     Some(RasterizedCustomGlyph {
                         data,
@@ -459,6 +523,13 @@ impl Renderer {
                 overlay_areas,
                 &mut self.swash_cache,
                 |request| {
+                    if let Some(data) = images.rasterize(request.id, request.width, request.height)
+                    {
+                        return Some(RasterizedCustomGlyph {
+                            data,
+                            content_type: ContentType::Color,
+                        });
+                    }
                     let data = icons.rasterize(request.id, request.width, request.height)?;
                     Some(RasterizedCustomGlyph {
                         data,
@@ -528,21 +599,35 @@ impl Renderer {
         Ok(true)
     }
 
-    fn build_text(
-        &mut self,
-        text: &TextShape,
-        buffers: &mut Vec<Buffer>,
-        overlay_instances: &mut Vec<RectInstance>,
-    ) -> PreparedText {
+    /// Mengembalikan indeks slot buffer teks yang sudah di-shape. Shaping hanya
+    /// dilakukan saat isi, ukuran, bobot, atau lebar berubah.
+    fn text_slot(&mut self, text: &TextShape) -> usize {
         let scale = self.scale;
         let font_size = (text.size * scale).max(1.0);
         let line_height = font_size * text.line_height;
+        let width = text.width;
+        let sized = width.is_finite() && width > 0.0;
+        let wraps = text.wrap && sized;
+        let ellipsis = sized && text.ellipsis && text.offset_x <= 0.0;
+        let key = TextKey {
+            text: text.text.clone(),
+            font_size: font_size.to_bits(),
+            line_height: line_height.to_bits(),
+            weight: text.weight,
+            align: align_key(text.align),
+            wraps,
+            ellipsis,
+            width: if sized { (width * scale).to_bits() } else { 0 },
+        };
+        if let Some(slot) = self.text_index.get(&key) {
+            return *slot;
+        }
+
         let metrics = Metrics::new(font_size, line_height);
         let family = match text.family {
             FontFamily::Sans => Family::Name(self.ui_family),
         };
         let attrs = Attrs::new().family(family).weight(Weight(text.weight));
-
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_text(
             &text.text,
@@ -550,36 +635,77 @@ impl Renderer {
             Shaping::Advanced,
             Some(text_align(text.align)),
         );
-        let width = text.width;
-        let wraps = text.wrap && width.is_finite() && width > 0.0;
         buffer.set_wrap(if wraps { Wrap::Word } else { Wrap::None });
-
-        if width.is_finite() && width > 0.0 {
+        if sized {
             buffer.set_size(Some(width * scale), None);
-            if text.ellipsis && text.offset_x <= 0.0 {
+            if ellipsis {
                 buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
             }
         } else {
             buffer.set_size(None, None);
         }
         buffer.shape_until_scroll(&mut self.font_system, false);
-
         let measured = buffer
             .layout_runs()
             .map(|run| run.line_w)
             .fold(0.0f32, f32::max);
         let lines = buffer.layout_runs().count().max(1) as f32;
 
+        let slot = self.text_slots.len();
+        self.text_slots.push(TextSlot {
+            buffer,
+            measured,
+            lines,
+        });
+        self.text_index.insert(key, slot);
+        slot
+    }
+
+    /// Lebar prefix teks, dipakai untuk posisi caret dan seleksi. Hasilnya di-cache.
+    fn prefix_width(&mut self, text: &str, font_size: f32, weight: u16) -> f32 {
+        let key = (text.to_string(), font_size.to_bits(), weight);
+        if let Some(width) = self.width_cache.get(&key) {
+            return *width;
+        }
+        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let attrs = Attrs::new()
+            .family(Family::Name(self.ui_family))
+            .weight(Weight(weight));
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.set_size(None, None);
+        buffer.set_wrap(Wrap::None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let width = buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0f32, f32::max);
+        self.width_cache.insert(key, width);
+        width
+    }
+
+    fn build_text(
+        &mut self,
+        text: &TextShape,
+        overlay_instances: &mut Vec<RectInstance>,
+    ) -> (usize, PreparedText) {
+        let scale = self.scale;
+        let slot = self.text_slot(text);
+        let (measured, lines) = {
+            let entry = &self.text_slots[slot];
+            (entry.measured, entry.lines)
+        };
+        let font_size = (text.size * scale).max(1.0);
+        let line_height = font_size * text.line_height;
+        let width = text.width;
+        let sized = width.is_finite() && width > 0.0;
+
         let left = (text.x - text.offset_x) * scale;
         let top = text.y * scale;
         let resolved_left = left;
 
-        let mut bounds_left = if width.is_finite() && width > 0.0 {
-            left.floor() as i32
-        } else {
-            0
-        };
-        let mut bounds_right = if width.is_finite() && width > 0.0 {
+        let mut bounds_left = if sized { left.floor() as i32 } else { 0 };
+        let mut bounds_right = if sized {
             (left + width * scale).ceil() as i32
         } else {
             self.size.0 as i32
@@ -596,24 +722,11 @@ impl Renderer {
         bounds_bottom = bounds_bottom.max(bounds_top);
 
         let selection_color = self.instance_color(text.selection_color);
-        let mut prefix_width = |index: usize| {
-            let index = floor_char_boundary(&text.text, index.min(text.text.len()));
-            let mut prefix_buffer = Buffer::new(&mut self.font_system, metrics);
-            prefix_buffer.set_text(&text.text[..index], &attrs, Shaping::Advanced, None);
-            prefix_buffer.set_size(None, None);
-            prefix_buffer.set_wrap(Wrap::None);
-            prefix_buffer.shape_until_scroll(&mut self.font_system, false);
-            prefix_buffer
-                .layout_runs()
-                .map(|run| run.line_w)
-                .fold(0.0f32, f32::max)
-        };
-
         if let Some((start, end)) = text.selection {
             let start = floor_char_boundary(&text.text, start.min(text.text.len()));
             let end = floor_char_boundary(&text.text, end.min(text.text.len()));
-            let left_edge = left + prefix_width(start);
-            let right_edge = left + prefix_width(end);
+            let left_edge = left + self.prefix_width(&text.text[..start], font_size, text.weight);
+            let right_edge = left + self.prefix_width(&text.text[..end], font_size, text.weight);
             if right_edge > left_edge {
                 overlay_instances.push(RectInstance {
                     rect: [
@@ -632,9 +745,9 @@ impl Renderer {
         if let Some(caret) = text.caret {
             let caret = caret.min(text.text.len());
             let caret = floor_char_boundary(&text.text, caret);
-            let prefix_width = prefix_width(caret);
+            let prefix_width = self.prefix_width(&text.text[..caret], font_size, text.weight);
 
-            let max_x = if width.is_finite() && width > 0.0 {
+            let max_x = if sized {
                 left + width * scale
             } else {
                 resolved_left + measured
@@ -656,9 +769,7 @@ impl Renderer {
             });
         }
 
-        buffers.push(buffer);
-
-        PreparedText {
+        let prepared = PreparedText {
             left: resolved_left,
             top,
             bounds: TextBounds {
@@ -668,7 +779,8 @@ impl Renderer {
                 bottom: bounds_bottom.max(0),
             },
             color: cosmic_text::Color::rgba(text.color.r, text.color.g, text.color.b, text.color.a),
-        }
+        };
+        (slot, prepared)
     }
 
     fn shape_instances(&self, shapes: &[RectShape]) -> Vec<RectInstance> {
@@ -691,6 +803,30 @@ impl Renderer {
                 border_color: self.instance_color(shape.border_color),
             })
             .collect()
+    }
+
+    /// Gambar PNG (favicon) ikut lewat jalur custom glyph dengan `ContentType::Color`.
+    fn image_glyphs(&mut self, images: &[ImageShape]) -> Vec<CustomGlyph> {
+        let mut glyphs = Vec::with_capacity(images.len());
+        for shape in images {
+            if shape.rect.width <= 0.0 || shape.rect.height <= 0.0 {
+                continue;
+            }
+            let Some(id) = self.images.id(&shape.source, shape.muted) else {
+                continue;
+            };
+            glyphs.push(CustomGlyph {
+                id,
+                left: shape.rect.x,
+                top: shape.rect.y,
+                width: shape.rect.width,
+                height: shape.rect.height,
+                color: None,
+                snap_to_physical_pixel: true,
+                metadata: 0,
+            });
+        }
+        glyphs
     }
 
     /// Mengubah ikon menjadi custom glyph glyphon. Posisi dan ukuran tetap dalam

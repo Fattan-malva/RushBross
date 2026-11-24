@@ -40,6 +40,8 @@ struct State {
     renderer: Renderer,
     shell: BrowserShell,
     webview: Option<WebViewHost>,
+    /// Bounds WebView terakhir yang dikirim, supaya SetBounds tidak dipanggil tiap frame.
+    last_webview_bounds: Option<(i32, i32, i32, i32)>,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
     modifiers: ModifiersState,
@@ -60,6 +62,7 @@ impl State {
             renderer,
             shell,
             webview: None,
+            last_webview_bounds: None,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
             size,
             modifiers: ModifiersState::empty(),
@@ -84,9 +87,7 @@ impl State {
         self.webview = Some(webview);
         self.sync_webview_bounds();
         self.pump_navigation();
-        if let Some(webview) = &self.webview {
-            webview.set_visible(true)?;
-        }
+        // WebView tetap tersembunyi sampai event Loaded, lihat user_event.
         Ok(())
     }
 
@@ -115,7 +116,10 @@ impl State {
         self.sync_webview_bounds();
     }
 
-    fn sync_webview_bounds(&self) {
+    fn sync_webview_bounds(&mut self) {
+        if self.webview.is_none() {
+            return;
+        }
         let (width, height) = self.size;
         let rect = self.shell.content_rect(width, height);
         let scale = self.window.scale_factor() as f32;
@@ -131,6 +135,16 @@ impl State {
             (rect.width - inset * 2.0).max(0.0) * scale,
             (rect.height - inset).max(0.0) * scale,
         );
+        let key = (
+            physical.x.round() as i32,
+            physical.y.round() as i32,
+            physical.width.round() as i32,
+            physical.height.round() as i32,
+        );
+        if self.last_webview_bounds == Some(key) {
+            return;
+        }
+        self.last_webview_bounds = Some(key);
         if let Some(webview) = &self.webview {
             if let Err(error) = webview.set_bounds(physical) {
                 eprintln!("webview bounds: {error}");
@@ -482,9 +496,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = state.window.scale_factor() as f32;
                 let point = rb_ui::Vec2::new(position.x as f32 / scale, position.y as f32 / scale);
                 state.cursor = point;
-                state.shell.pointer_moved(point);
+                let dirty = state.shell.pointer_moved(point);
                 state.update_cursor();
-                state.redraw();
+                if dirty {
+                    state.redraw();
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 state.cursor = rb_ui::Vec2::new(-1000.0, -1000.0);
@@ -562,6 +578,17 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
+            UserEvent::WebView(webview::WebViewEvent::Loaded) => {
+                if let Some(webview) = &state.webview {
+                    if let Err(error) = webview.set_visible(true) {
+                        eprintln!("webview visible: {error}");
+                    }
+                }
+                return;
+            }
+            UserEvent::WebView(webview::WebViewEvent::Favicon(favicon)) => {
+                state.shell.webview_favicon(favicon)
+            }
             UserEvent::WebView(webview::WebViewEvent::TitleChanged(title)) => {
                 state.shell.webview_title_changed(&title)
             }

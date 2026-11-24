@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 mod chrome;
 
 pub use chrome::{ChromeAction, ChromeElement, WindowChrome};
@@ -6,13 +8,25 @@ use rb_bookmarks::{Bookmark, BookmarkId, BookmarkStore};
 use rb_tabs::{Tab, TabId, TabManager};
 use rb_ui::text_input::{index_at_offset, text_width};
 use rb_ui::{
-    Align, Color, Frame, Icon, IconShape, Rect, RectShape, TextInput, TextShape, Theme, Vec2,
+    Align, Color, Frame, Icon, IconShape, ImageShape, Rect, RectShape, TextInput, TextShape, Theme,
+    Vec2,
 };
 
 const TAB_STRIP_HEIGHT: f32 = 40.0;
 const TAB_HEIGHT: f32 = 32.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_MAX_RATIO: f32 = 0.42;
+const TAB_RADIUS: f32 = 8.0;
+/// Ukuran favicon di tab dan jarak ke judul.
+const TAB_ICON_SIZE: f32 = 16.0;
+const TAB_ICON_GAP: f32 = 8.0;
+
+/// Ikon halaman baru (`assets/icons.png`), dibagi antar tab.
+fn new_tab_icon() -> Arc<[u8]> {
+    static ICON: OnceLock<Arc<[u8]>> = OnceLock::new();
+    ICON.get_or_init(|| Arc::from(&include_bytes!("../../../assets/icons.png")[..]))
+        .clone()
+}
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const ADDRESS_HEIGHT: f32 = 36.0;
 const BOOKMARK_BAR_HEIGHT: f32 = 32.0;
@@ -212,27 +226,30 @@ impl BrowserShell {
     }
 
     pub fn render(&mut self, width: f32, height: f32) -> Frame {
-        let _ = self.build(width, height);
-        let hover = self.hit_at(self.pointer).map(|(element, _)| element);
-        if hover != self.hover {
-            self.hover = hover;
-        }
         self.build(width, height)
     }
 
-    pub fn pointer_moved(&mut self, position: Vec2) {
+    /// Memperbarui posisi pointer. Mengembalikan `true` jika tampilan perlu digambar
+    /// ulang, yaitu saat hover berubah atau sedang ada seleksi/drag.
+    pub fn pointer_moved(&mut self, position: Vec2) -> bool {
+        let previous_hover = self.hover;
         self.pointer = position;
+        // Hit area dari frame terakhir masih berlaku, jadi hover bisa langsung diperbarui
+        // tanpa membangun frame dua kali.
+        self.hover = self.hit_at(position).map(|(element, _)| element);
+        let mut dirty = self.hover != previous_hover;
         if self.address_dragging && self.focus == Some(Focus::Address) {
             let text = self.address.text().to_string();
             let offset =
                 (position.x - self.layout.address_text_x + self.layout.address_scroll).max(0.0);
             let index = index_at_offset(&text, offset, ADDRESS_FONT_SIZE);
             self.address.extend_to(index);
-            return;
+            return true;
         }
         let Some(mut drag) = self.tab_drag.take() else {
-            return;
+            return dirty;
         };
+        dirty = true;
         drag.current = position;
         let moved = (position.x - drag.start.x).hypot(position.y - drag.start.y);
         if !drag.dragging && moved > 4.0 {
@@ -262,6 +279,7 @@ impl BrowserShell {
             self.tabs.move_to(drag.id, target);
         }
         self.tab_drag = Some(drag);
+        dirty
     }
 
     pub fn left_click(&mut self, position: Vec2) {
@@ -616,6 +634,13 @@ impl BrowserShell {
             .and_then(|tab| tab.url.as_deref())
             .map(is_blank_url)
             .unwrap_or(true)
+    }
+
+    /// Favicon dari WebView2 untuk tab aktif. `None` menghapus favicon lama.
+    pub fn webview_favicon(&mut self, favicon: Option<Vec<u8>>) {
+        if let Some(tab) = self.tabs.active_mut() {
+            tab.favicon = favicon.map(Arc::from);
+        }
     }
 
     pub fn webview_title_changed(&mut self, title: &str) {
@@ -1083,11 +1108,39 @@ impl BrowserShell {
         } else {
             theme.tab_inactive
         };
-        layer.push_rect(RectShape::filled(rect, background, 6.0));
+        layer.push_rect(RectShape::filled(rect, background, TAB_RADIUS));
+        // Sudut bawah dibuat tajam agar tab menyatu dengan address bar di bawahnya.
+        layer.push_rect(RectShape::filled(
+            Rect::new(rect.x, rect.bottom() - TAB_RADIUS, rect.width, TAB_RADIUS),
+            background,
+            0.0,
+        ));
         self.push_hit(Element::Tab(tab.id), rect);
 
         let close_rect = Rect::new(rect.right() - 10.0 - 20.0, rect.y + 6.0, 20.0, 20.0);
-        let title_width = (close_rect.x - 8.0 - (rect.x + 10.0)).max(0.0);
+
+        // Tab halaman baru memakai icons.png yang dimuted; halaman web memakai favicon asli.
+        let blank = tab.url.as_deref().is_none_or(is_blank_url);
+        let icon_source = if blank {
+            Some((new_tab_icon(), true))
+        } else {
+            tab.favicon.clone().map(|source| (source, false))
+        };
+        let icon_offset = match icon_source {
+            Some((source, muted)) => {
+                let icon_rect = Rect::new(
+                    rect.x + 10.0,
+                    rect.y + (TAB_HEIGHT - TAB_ICON_SIZE) * 0.5,
+                    TAB_ICON_SIZE,
+                    TAB_ICON_SIZE,
+                );
+                layer.push_image(ImageShape::new(source, icon_rect).muted(muted));
+                TAB_ICON_SIZE + TAB_ICON_GAP
+            }
+            None => 0.0,
+        };
+        let text_x = rect.x + 10.0 + icon_offset;
+        let title_width = (close_rect.x - 8.0 - text_x).max(0.0);
         let title_color = if is_active {
             theme.foreground
         } else {
@@ -1095,7 +1148,7 @@ impl BrowserShell {
         };
         let mut title = TextShape::new(
             tab.title.clone(),
-            rect.x + 10.0,
+            text_x,
             rect.y + (TAB_HEIGHT - 12.0 * 1.3) * 0.5,
             12.0,
             title_color,
@@ -1211,6 +1264,9 @@ impl BrowserShell {
             .unwrap_or_else(|| target_centers.clone());
 
         self.tab_rects.clear();
+        // Tab yang sedang di-drag digambar paling akhir agar selalu di atas tab lain.
+        let dragged_id = dragged_state.map(|(id, _)| id);
+        let mut dragged_draw = None;
         for (index, tab) in tabs.iter().enumerate() {
             let tab_width = widths[index];
             let tab_x = if dragged_state.is_some_and(|(id, _)| id == tab.id) {
@@ -1226,6 +1282,13 @@ impl BrowserShell {
             self.tab_rects.push((tab.id, tab_rect));
             let is_active = active_id == Some(tab.id);
             let is_hover = hover == Some(Element::Tab(tab.id));
+            if dragged_id == Some(tab.id) {
+                dragged_draw = Some((tab, tab_rect, is_active, is_hover));
+                continue;
+            }
+            self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
+        }
+        if let Some((tab, tab_rect, is_active, is_hover)) = dragged_draw {
             self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
         }
 
@@ -2055,7 +2118,10 @@ impl BrowserShell {
 }
 
 fn is_blank_url(url: &str) -> bool {
-    url.is_empty() || url == "about:blank" || url == NEW_TAB_URL
+    url.is_empty()
+        || url.starts_with("about:blank")
+        || url.starts_with("data:")
+        || url == NEW_TAB_URL
 }
 
 fn icon_rect(center: Vec2, size: f32) -> Rect {

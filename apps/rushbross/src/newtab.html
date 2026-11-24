@@ -79,6 +79,7 @@ body::-webkit-scrollbar { display: none; }
   gap: 12px;
 }
 .wordmark {
+  transition: transform 0.18s ease-out;
   font-size: clamp(46px, 9vw, 80px);
   font-weight: 700;
   line-height: 1;
@@ -314,32 +315,41 @@ body::-webkit-scrollbar { display: none; }
     if (target) window.location.href = target;
   });
 
-  document.querySelectorAll(".card").forEach(function (card) {
+  // Shared tilt: cards get tilt + shine, the wordmark gets tilt only.
+  function attachTilt(element, lift) {
     var frame = 0;
 
-    card.addEventListener("pointermove", function (event) {
-      var rect = card.getBoundingClientRect();
+    element.addEventListener("pointermove", function (event) {
+      var rect = element.getBoundingClientRect();
       var px = (event.clientX - rect.left) / rect.width;
       var py = (event.clientY - rect.top) / rect.height;
       var tiltX = (py - 0.5) * 2 * MAX_TILT;
       var tiltY = (0.5 - px) * 2 * MAX_TILT;
 
-      card.style.setProperty("--mx", (px * 100).toFixed(1) + "%");
-      card.style.setProperty("--my", (py * 100).toFixed(1) + "%");
+      if (lift) {
+        element.style.setProperty("--mx", (px * 100).toFixed(1) + "%");
+        element.style.setProperty("--my", (py * 100).toFixed(1) + "%");
+      }
 
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(function () {
-        card.style.transform =
+        element.style.transform =
           "perspective(900px) rotateX(" + tiltX.toFixed(2) + "deg) rotateY(" +
-          tiltY.toFixed(2) + "deg) translateY(-3px) scale(1.015)";
+          tiltY.toFixed(2) + "deg)" + (lift ? " translateY(-3px) scale(1.015)" : "");
       });
     });
 
-    card.addEventListener("pointerleave", function () {
+    element.addEventListener("pointerleave", function () {
       cancelAnimationFrame(frame);
-      card.style.transform = "";
+      element.style.transform = "";
     });
+  }
+
+  document.querySelectorAll(".card").forEach(function (card) {
+    attachTilt(card, true);
   });
+  var wordmark = document.querySelector(".wordmark");
+  if (wordmark) attachTilt(wordmark, false);
 })();
 </script>
 </body>

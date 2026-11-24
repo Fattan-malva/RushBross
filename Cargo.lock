@@ -1789,6 +1789,7 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "glyphon",
+ "png 0.17.16",
  "rb-ui",
  "resvg",
  "wgpu",

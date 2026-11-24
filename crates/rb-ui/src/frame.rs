@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::geom::{Color, Rect};
 
 pub use crate::lucide::Icon;
@@ -71,6 +73,31 @@ impl IconShape {
 
     pub fn stroke(mut self, stroke: f32) -> Self {
         self.stroke = stroke.max(0.5);
+        self
+    }
+}
+
+/// Gambar PNG yang ditampilkan di dalam `rect` (mis. favicon situs).
+#[derive(Clone, Debug)]
+pub struct ImageShape {
+    /// Byte PNG. Disimpan sebagai `Arc` supaya bisa dibagi antar frame tanpa disalin.
+    pub source: Arc<[u8]>,
+    pub rect: Rect,
+    /// Abu-abu dan agak transparan (dipakai untuk ikon halaman baru).
+    pub muted: bool,
+}
+
+impl ImageShape {
+    pub fn new(source: Arc<[u8]>, rect: Rect) -> Self {
+        Self {
+            source,
+            rect,
+            muted: false,
+        }
+    }
+
+    pub fn muted(mut self, muted: bool) -> Self {
+        self.muted = muted;
         self
     }
 }
@@ -183,6 +210,7 @@ impl TextShape {
 pub struct Layer {
     pub shapes: Vec<RectShape>,
     pub icons: Vec<IconShape>,
+    pub images: Vec<ImageShape>,
     pub texts: Vec<TextShape>,
 }
 
@@ -193,6 +221,10 @@ impl Layer {
 
     pub fn push_icon(&mut self, icon: IconShape) {
         self.icons.push(icon);
+    }
+
+    pub fn push_image(&mut self, image: ImageShape) {
+        self.images.push(image);
     }
 
     pub fn push_text(&mut self, text: TextShape) {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
 
@@ -6,6 +8,8 @@ pub struct Tab {
     pub id: TabId,
     pub title: String,
     pub url: Option<String>,
+    /// Favicon PNG dari situs, `None` jika belum ada atau halaman kosong.
+    pub favicon: Option<Arc<[u8]>>,
     history: Vec<String>,
     history_index: usize,
 }
@@ -129,6 +133,7 @@ impl TabManager {
             id,
             title: title.into(),
             url: None,
+            favicon: None,
             history: Vec::new(),
             history_index: 0,
         };
