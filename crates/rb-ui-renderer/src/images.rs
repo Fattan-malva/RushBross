@@ -111,6 +111,9 @@ fn resample(entry: &Entry, width: u32, height: u32) -> Vec<u8> {
         return out;
     }
     let (sw, sh) = (entry.width, entry.height);
+    if width >= sw && height >= sh {
+        return upscale_bilinear(entry, width, height);
+    }
     for dy in 0..height {
         let y0 = dy * sh / height;
         let y1 = ((dy + 1) * sh / height).max(y0 + 1).min(sh);
@@ -139,6 +142,51 @@ fn resample(entry: &Entry, width: u32, height: u32) -> Vec<u8> {
             out[o + 1] = (g / a).round().clamp(0.0, 255.0) as u8;
             out[o + 2] = (b / a).round().clamp(0.0, 255.0) as u8;
             out[o + 3] = (a / count * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Perbesaran dengan interpolasi bilinear dalam ruang premultiplied. Tepi favicon kecil
+/// (mis. 16 px yang tampil 24 px) tetap halus, tidak bergerigi seperti nearest-neighbor.
+fn upscale_bilinear(entry: &Entry, width: u32, height: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
+    let (sw, sh) = (entry.width as f32, entry.height as f32);
+    let max_x = entry.width as usize - 1;
+    let max_y = entry.height as usize - 1;
+    for dy in 0..height {
+        let fy = ((dy as f32 + 0.5) * sh / height as f32 - 0.5).clamp(0.0, sh - 1.0);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(max_y);
+        let ty = fy - y0 as f32;
+        for dx in 0..width {
+            let fx = ((dx as f32 + 0.5) * sw / width as f32 - 0.5).clamp(0.0, sw - 1.0);
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(max_x);
+            let tx = fx - x0 as f32;
+            let taps = [
+                (x0, y0, (1.0 - tx) * (1.0 - ty)),
+                (x1, y0, tx * (1.0 - ty)),
+                (x0, y1, (1.0 - tx) * ty),
+                (x1, y1, tx * ty),
+            ];
+            let (mut r, mut g, mut b, mut a) = (0f32, 0f32, 0f32, 0f32);
+            for (x, y, weight) in taps {
+                let i = (y * entry.width as usize + x) * 4;
+                let alpha = f32::from(entry.rgba[i + 3]) / 255.0 * weight;
+                r += f32::from(entry.rgba[i]) * alpha;
+                g += f32::from(entry.rgba[i + 1]) * alpha;
+                b += f32::from(entry.rgba[i + 2]) * alpha;
+                a += alpha;
+            }
+            if a <= 0.0 {
+                continue;
+            }
+            let o = ((dy * width + dx) * 4) as usize;
+            out[o] = (r / a).round().clamp(0.0, 255.0) as u8;
+            out[o + 1] = (g / a).round().clamp(0.0, 255.0) as u8;
+            out[o + 2] = (b / a).round().clamp(0.0, 255.0) as u8;
+            out[o + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
     out
