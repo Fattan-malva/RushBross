@@ -7,8 +7,9 @@ use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Controller2,
-        COREWEBVIEW2_COLOR, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, COREWEBVIEW2_KEY_EVENT_KIND,
-        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        ICoreWebView2_15, COREWEBVIEW2_COLOR, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+        COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
     },
 };
 use webview2_com::{
@@ -218,13 +219,21 @@ impl WebViewHost {
                 .map_err(|error| error.to_string())?;
         }
 
+        // Favicon API ada di ICoreWebView2_15. Jika runtime WebView2 lebih lama,
+        // fitur favicon dilewati dan tab tetap memakai ikon cadangan.
         let mut favicon_token = 0i64;
         let proxy_favicon = proxy.clone();
-        unsafe {
-            webview
-                .add_FaviconChanged(
-                    &FaviconChangedEventHandler::create(Box::new(move |sender, _| {
-                        if let Some(webview) = sender {
+        if let Ok(webview15) = webview.cast::<ICoreWebView2_15>() {
+            unsafe {
+                webview15
+                    .add_FaviconChanged(
+                        &FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+                            let Some(webview) = sender else {
+                                return Ok(());
+                            };
+                            let Ok(webview15) = webview.cast::<ICoreWebView2_15>() else {
+                                return Ok(());
+                            };
                             let proxy = proxy_favicon.clone();
                             let completed =
                                 GetFaviconCompletedHandler::create(Box::new(move |_, stream| {
@@ -234,14 +243,18 @@ impl WebViewHost {
                                     ));
                                     Ok(())
                                 }));
-                            webview
-                                .GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &completed)?;
-                        }
-                        Ok(())
-                    })),
-                    &mut favicon_token,
-                )
-                .map_err(|error| error.to_string())?;
+                            unsafe {
+                                webview15.GetFavicon(
+                                    COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+                                    &completed,
+                                )?;
+                            }
+                            Ok(())
+                        })),
+                        &mut favicon_token,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
         let mut navigation_completed_token = 0i64;
