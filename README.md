@@ -85,11 +85,13 @@ cargo fmt --all -- --check
 
 ```text
 apps/rushbross/          binary Windows GUI + WebView2 host
+apps/rushbross/src/newtab.html   halaman tab baru (HTML lokal, ikon Lucide, font ter-embed)
+assets/fonts/            font Manrope (dibundel ke binary, dipakai semua teks UI)
 crates/rb-tabs/          tab state, history, reorder
 crates/rb-bookmarks/     bookmark store
 crates/rb-ui/            geometri, theme, text input, frame model
 crates/rb-ui-widgets/    shell UI, hit testing, drag tab
-crates/rb-ui-renderer/   wgpu + glyphon renderer
+crates/rb-ui-renderer/   wgpu + glyphon renderer; ikon Lucide dirender lewat resvg
 ```
 
 `.gitignore` sudah mengecualikan `target/`, profil data WebView2, binary, log, cache editor, dan file build lain yang tidak perlu masuk GitHub.

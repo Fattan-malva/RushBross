@@ -11,3 +11,4 @@ winit.workspace = true
 glyphon.workspace = true
 cosmic-text.workspace = true
 bytemuck.workspace = true
+resvg = { version = "0.50", default-features = false }

@@ -2,6 +2,7 @@
 
 mod webview;
 
+use std::ffi::c_void;
 use std::sync::Arc;
 
 use rb_ui::Rect;
@@ -12,10 +13,15 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowId};
 
 use webview::{UserEvent, WebViewHost};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWM_WINDOW_CORNER_PREFERENCE,
+};
 
 const VK_TAB: u32 = 0x09;
 const VK_LEFT: u32 = 0x25;
@@ -113,7 +119,8 @@ impl State {
         let (width, height) = self.size;
         let rect = self.shell.content_rect(width, height);
         let scale = self.window.scale_factor() as f32;
-        let inset = if self.shell.is_fullscreen() {
+        // Saat fullscreen atau maximized, konten menempel ke tepi layar tanpa celah.
+        let inset = if self.shell.is_fullscreen() || self.window.is_maximized() {
             0.0
         } else {
             RESIZE_EDGE
@@ -384,7 +391,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title("RushBross")
             .with_inner_size(LogicalSize::new(width, height))
             .with_min_inner_size(LogicalSize::new(720.0, 480.0))
-            .with_decorations(false);
+            .with_decorations(false)
+            .with_undecorated_shadow(true);
         if let Some(icon) = window_icon() {
             attributes = attributes.with_window_icon(Some(icon));
         }
@@ -398,6 +406,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         window.set_ime_allowed(true);
+        round_window_corners(&window);
 
         let renderer = match pollster::block_on(Renderer::new(window.clone())) {
             Ok(renderer) => renderer,
@@ -491,7 +500,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match button {
                     MouseButton::Left => match pressed {
                         ElementState::Pressed => {
-                            if !state.shell.is_fullscreen() {
+                            if !state.shell.is_fullscreen() && !state.window.is_maximized() {
                                 if let Some(direction) = resize_direction(state.cursor, state.size)
                                 {
                                     if let Err(error) = state.window.drag_resize_window(direction) {
@@ -597,6 +606,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Membulatkan sudut jendela tanpa dekorasi di Windows 11. Di Windows 10 atau
+/// saat DWM menolak atribut ini, jendela tetap persegi tanpa error.
+fn round_window_corners(window: &Window) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut c_void);
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
 }
 
 fn resize_direction(point: rb_ui::Vec2, size: (f32, f32)) -> Option<ResizeDirection> {

@@ -25,6 +25,11 @@ const NAV_BUTTON_SIZE: f32 = 32.0;
 const NAV_GAP: f32 = 6.0;
 const FULLSCREEN_BAR_HEIGHT: f32 = 56.0;
 const ADDRESS_FONT_SIZE: f32 = 14.0;
+const WINDOW_BORDER_RADIUS: f32 = 10.0;
+
+/// Alamat internal untuk halaman tab baru. Shell tidak pernah menampilkannya di
+/// address bar, dan host WebView memuat halaman beranda lokal untuknya.
+pub const NEW_TAB_URL: &str = "rushbross://newtab";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
@@ -177,7 +182,7 @@ impl Default for BrowserShell {
 impl BrowserShell {
     pub fn new() -> Self {
         let mut tabs = TabManager::new();
-        tabs.open("Tab baru", Some("about:blank".to_string()));
+        tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
         let mut shell = Self {
             theme: Theme::dark(),
             tabs,
@@ -538,7 +543,7 @@ impl BrowserShell {
     }
 
     pub fn new_tab(&mut self) {
-        self.tabs.open("Tab baru", Some("about:blank".to_string()));
+        self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
         self.request_active_navigation();
         self.address.clear();
         self.focus = None;
@@ -568,6 +573,9 @@ impl BrowserShell {
         let Some(url) = tab.url.clone() else {
             return;
         };
+        if is_blank_url(&url) {
+            return;
+        }
         let normalized = normalize_url(&url).unwrap_or(url);
         if let Some(existing) = self.bookmarks.find_by_url(&normalized) {
             let id = existing.id;
@@ -606,7 +614,7 @@ impl BrowserShell {
         self.tabs
             .active()
             .and_then(|tab| tab.url.as_deref())
-            .map(|url| url.is_empty() || url == "about:blank")
+            .map(is_blank_url)
             .unwrap_or(true)
     }
 
@@ -620,7 +628,7 @@ impl BrowserShell {
     }
 
     pub fn webview_url_changed(&mut self, url: &str) {
-        if url.is_empty() || url == "about:blank" {
+        if is_blank_url(url) {
             return;
         }
         let Some(tab) = self.tabs.active_mut() else {
@@ -883,7 +891,7 @@ impl BrowserShell {
             .active()
             .and_then(|tab| tab.url.clone())
             .unwrap_or_default();
-        if value.is_empty() {
+        if is_blank_url(&value) {
             self.address.clear();
         } else {
             self.address.set_text(value);
@@ -907,7 +915,7 @@ impl BrowserShell {
         let Some(tab) = self.tabs.active() else {
             return;
         };
-        let url = tab.url.clone().unwrap_or_else(|| "about:blank".to_string());
+        let url = tab.url.clone().unwrap_or_else(|| NEW_TAB_URL.to_string());
         let title = tab.title.clone();
         self.pending = Some(NavigationRequest { url, title });
     }
@@ -988,6 +996,15 @@ impl BrowserShell {
             self.build_bookmark_bar(base, bookmark_bar, width, &bookmarks, hover);
         }
         self.build_viewport(base, viewport);
+        if !self.maximized {
+            base.push_rect(RectShape::bordered(
+                Rect::new(0.5, 0.5, (width - 1.0).max(0.0), (height - 1.0).max(0.0)),
+                Color::TRANSPARENT,
+                WINDOW_BORDER_RADIUS,
+                1.0,
+                theme.border,
+            ));
+        }
 
         if show_bookmarks {
             self.build_bookmark_popover(
@@ -1435,7 +1452,7 @@ impl BrowserShell {
         if address.is_empty() {
             layer.push_text(
                 TextShape::new(
-                    "Cari atau ketik URL",
+                    "Cari atau ketik alamat",
                     text_x,
                     text_y,
                     ADDRESS_FONT_SIZE,
@@ -2037,6 +2054,10 @@ impl BrowserShell {
     }
 }
 
+fn is_blank_url(url: &str) -> bool {
+    url.is_empty() || url == "about:blank" || url == NEW_TAB_URL
+}
+
 fn icon_rect(center: Vec2, size: f32) -> Rect {
     Rect::new(center.x - size * 0.5, center.y - size * 0.5, size, size)
 }
@@ -2059,20 +2080,7 @@ fn char_boundary(text: &str, index: usize) -> usize {
 }
 
 fn approx_text_width(text: &str, size: f32) -> f32 {
-    text.chars()
-        .map(|ch| {
-            let factor = match ch {
-                'i' | 'l' | 'I' | 'j' | 't' | 'f' | '.' | ',' | ':' | ';' | '\'' | '!' => 0.28,
-                'm' | 'w' | 'M' | 'W' => 0.86,
-                ' ' => 0.28,
-                'A'..='Z' => 0.68,
-                '0'..='9' => 0.56,
-                _ if ch.is_ascii() => 0.53,
-                _ => 1.0,
-            };
-            factor * size
-        })
-        .sum()
+    rb_ui::text_input::text_width(text, size)
 }
 
 fn normalize_url(value: &str) -> Option<String> {
@@ -2157,4 +2165,70 @@ fn text_input(text: impl Into<String>) -> TextInput {
     let mut input = TextInput::new();
     input.set_text(text);
     input
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_tab_never_exposes_about_blank_in_the_address_bar() {
+        let mut shell = BrowserShell::new();
+        assert_eq!(
+            shell.tabs.active().unwrap().url.as_deref(),
+            Some(NEW_TAB_URL)
+        );
+        assert!(shell.address.text().is_empty());
+
+        shell.new_tab();
+        let request = shell.take_navigation().expect("new tab navigation");
+        assert_eq!(request.url, NEW_TAB_URL);
+        assert!(shell.address.text().is_empty());
+    }
+
+    #[test]
+    fn webview_blank_urls_do_not_replace_the_new_tab() {
+        let mut shell = BrowserShell::new();
+        shell.webview_url_changed("about:blank");
+        shell.webview_url_changed("");
+        assert_eq!(
+            shell.tabs.active().unwrap().url.as_deref(),
+            Some(NEW_TAB_URL)
+        );
+        assert!(shell.address.text().is_empty());
+    }
+
+    #[test]
+    fn real_urls_still_update_the_address_bar() {
+        let mut shell = BrowserShell::new();
+        shell.webview_url_changed("https://example.com/a");
+        assert_eq!(shell.address.text(), "https://example.com/a");
+    }
+
+    #[test]
+    fn new_tab_cannot_be_bookmarked() {
+        let mut shell = BrowserShell::new();
+        shell.toggle_bookmark();
+        assert!(shell.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn windowed_frame_has_border_and_maximized_does_not() {
+        let mut shell = BrowserShell::new();
+        shell.set_maximized(false);
+        let windowed = shell.render(900.0, 600.0);
+        assert!(windowed
+            .base
+            .shapes
+            .iter()
+            .any(|shape| shape.border_width > 0.0 && shape.rect.width >= 899.0));
+
+        shell.set_maximized(true);
+        let maximized = shell.render(900.0, 600.0);
+        assert!(!maximized
+            .base
+            .shapes
+            .iter()
+            .any(|shape| shape.border_width > 0.0 && shape.rect.width >= 899.0));
+    }
 }

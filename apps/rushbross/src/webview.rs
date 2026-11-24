@@ -1,11 +1,14 @@
+use std::cell::Cell;
 use std::sync::mpsc;
 
 use rb_ui::Rect;
+use rb_ui_widgets::NEW_TAB_URL;
 use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
-        CreateCoreWebView2Environment, ICoreWebView2Controller, COREWEBVIEW2_KEY_EVENT_KIND,
-        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Controller2,
+        COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
     },
 };
 use webview2_com::{
@@ -14,7 +17,7 @@ use webview2_com::{
     DocumentTitleChangedEventHandler, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
@@ -48,6 +51,18 @@ struct Tokens {
     accelerator: i64,
 }
 
+/// Halaman tab baru: beranda lokal yang dimuat langsung ke WebView2.
+const NEW_TAB_HTML: &str = include_str!("newtab.html");
+/// Warna latar sebelum halaman pertama tampil. Mengganti putih default WebView2.
+const PAGE_BACKGROUND: COREWEBVIEW2_COLOR = COREWEBVIEW2_COLOR {
+    A: 255,
+    R: 0x0a,
+    G: 0x0a,
+    B: 0x0a,
+};
+/// Alamat yang dilaporkan WebView2 untuk konten yang dimuat dengan NavigateToString.
+const ABOUT_BLANK: &str = "about:blank";
+
 const VK_TAB: u32 = 0x09;
 const VK_LEFT: u32 = 0x25;
 const VK_RIGHT: u32 = 0x27;
@@ -73,6 +88,7 @@ pub struct WebViewHost {
     controller: ICoreWebView2Controller,
     webview: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
     tokens: Tokens,
+    showing_new_tab: Cell<bool>,
 }
 
 impl WebViewHost {
@@ -126,6 +142,16 @@ impl WebViewHost {
             controller
                 .SetIsVisible(false)
                 .map_err(|error| error.to_string())?;
+        }
+
+        // Latar WebView2 default putih. Set ke gelap agar tidak ada kotak putih
+        // saat startup atau saat halaman belum selesai dimuat.
+        if let Ok(controller2) = controller.cast::<ICoreWebView2Controller2>() {
+            unsafe {
+                controller2
+                    .SetDefaultBackgroundColor(PAGE_BACKGROUND)
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
         let webview = unsafe {
@@ -302,10 +328,15 @@ impl WebViewHost {
                 fullscreen: fullscreen_token,
                 accelerator: accelerator_token,
             },
+            showing_new_tab: Cell::new(false),
         })
     }
 
     pub fn load(&self, url: &str) -> Result<(), String> {
+        if url == NEW_TAB_URL {
+            return self.load_new_tab();
+        }
+        self.showing_new_tab.set(false);
         let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             self.webview
@@ -315,11 +346,40 @@ impl WebViewHost {
         Ok(())
     }
 
+    fn load_new_tab(&self) -> Result<(), String> {
+        let wide: Vec<u16> = NEW_TAB_HTML
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            self.webview
+                .NavigateToString(PCWSTR(wide.as_ptr()))
+                .map_err(|error| error.to_string())?;
+        }
+        self.showing_new_tab.set(true);
+        Ok(())
+    }
+
     pub fn reload(&self) -> Result<(), String> {
+        // Halaman tab baru tidak punya URL asli, jadi reload memuat ulang HTML-nya.
+        // Setelah pengguna pindah ke situs lain, sumber tidak lagi about:blank.
+        if self.showing_new_tab.get() && self.current_source()?.starts_with(ABOUT_BLANK) {
+            return self.load_new_tab();
+        }
         unsafe {
             self.webview.Reload().map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    fn current_source(&self) -> Result<String, String> {
+        let mut uri = PWSTR::null();
+        unsafe {
+            self.webview
+                .Source(&mut uri)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(take_pwstr(uri))
     }
 
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {

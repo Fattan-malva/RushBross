@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 lucide-static-svg = { version = "1", default-features = false, features = ["svg"] }
+ttf-parser = "0.25"

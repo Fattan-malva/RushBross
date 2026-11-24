@@ -217,8 +217,28 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
-pub fn char_width(ch: char, size: f32) -> f32 {
-    let factor = match ch {
+/// Font UI yang dipakai untuk mengukur lebar teks. Harus sama dengan font yang
+/// dirender oleh `rb-ui-renderer`, supaya caret, seleksi, dan klik sejajar dengan huruf.
+static MEASURE_FONT: &[u8] = include_bytes!("../../../assets/fonts/Manrope-400.ttf");
+
+fn measure_face() -> Option<&'static ttf_parser::Face<'static>> {
+    static FACE: std::sync::OnceLock<Option<ttf_parser::Face<'static>>> =
+        std::sync::OnceLock::new();
+    FACE.get_or_init(|| ttf_parser::Face::parse(MEASURE_FONT, 0).ok())
+        .as_ref()
+}
+
+/// Lebar satu karakter dalam satuan em (0..1). Dibaca dari metrik font yang dibundel,
+/// dan memakai perkiraan kasar hanya jika glyph atau font tidak tersedia.
+fn advance_em(ch: char) -> f32 {
+    if let Some(face) = measure_face() {
+        if let Some(glyph) = face.glyph_index(ch) {
+            if let Some(advance) = face.glyph_hor_advance(glyph) {
+                return f32::from(advance) / f32::from(face.units_per_em());
+            }
+        }
+    }
+    match ch {
         'i' | 'l' | 'I' | 'j' | 't' | 'f' | '.' | ',' | ':' | ';' | '\'' | '!' => 0.28,
         'm' | 'w' | 'M' | 'W' => 0.86,
         ' ' => 0.28,
@@ -226,8 +246,11 @@ pub fn char_width(ch: char, size: f32) -> f32 {
         '0'..='9' => 0.56,
         _ if ch.is_ascii() => 0.53,
         _ => 1.0,
-    };
-    factor * size
+    }
+}
+
+pub fn char_width(ch: char, size: f32) -> f32 {
+    advance_em(ch) * size
 }
 
 pub fn text_width(text: &str, size: f32) -> f32 {
@@ -263,6 +286,16 @@ mod tests {
         assert_eq!(input.selection(), (3, 8));
         input.backspace();
         assert_eq!(input.text(), "helrld");
+    }
+
+    #[test]
+    fn measured_widths_come_from_the_bundled_font() {
+        let space = char_width(' ', 100.0);
+        let wide = char_width('m', 100.0);
+        let narrow = char_width('i', 100.0);
+        assert!(space > 0.0);
+        assert!(wide > narrow);
+        assert!(text_width("hello", 14.0) > 0.0);
     }
 
     #[test]

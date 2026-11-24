@@ -1,4 +1,4 @@
-mod svg;
+mod icons;
 
 use std::sync::Arc;
 
@@ -7,14 +7,27 @@ use cosmic_text::{
     Attrs, Buffer, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Metrics, Shaping,
     SwashCache, Weight, Wrap,
 };
-use glyphon::{ColorMode, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
-use rb_ui::frame::{Align, FontFamily, Frame, Icon, IconShape, RectShape, TextShape};
+use glyphon::{
+    ColorMode, ContentType, CustomGlyph, RasterizedCustomGlyph, Resolution, TextArea, TextAtlas,
+    TextBounds, TextRenderer, Viewport,
+};
+use icons::IconRegistry;
+use rb_ui::frame::{Align, FontFamily, Frame, IconShape, RectShape, TextShape};
 use rb_ui::Color;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 const SHADER: &str = include_str!("shader.wgsl");
 const INITIAL_INSTANCES: u64 = 512;
+
+/// Font UI dibundel ke dalam binary agar tampilan sama di semua mesin Windows.
+const UI_FAMILY: &str = "Manrope";
+const UI_FONTS: [&[u8]; 4] = [
+    include_bytes!("../../../assets/fonts/Manrope-400.ttf"),
+    include_bytes!("../../../assets/fonts/Manrope-500.ttf"),
+    include_bytes!("../../../assets/fonts/Manrope-600.ttf"),
+    include_bytes!("../../../assets/fonts/Manrope-700.ttf"),
+];
 const BACKGROUND: wgpu::Color = wgpu::Color {
     r: 0.024,
     g: 0.024,
@@ -74,6 +87,9 @@ pub struct Renderer {
     base_text: TextRenderer,
     overlay_text: TextRenderer,
     ui_family: &'static str,
+    icons: IconRegistry,
+    /// Buffer kosong sebagai pembawa glyph ikon di jalur teks glyphon.
+    empty_text: Buffer,
 }
 
 impl Renderer {
@@ -224,8 +240,12 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let font_system = FontSystem::new();
-        let ui_family = pick_family(&font_system);
+        let mut font_system = FontSystem::new();
+        for font in UI_FONTS {
+            font_system.db_mut().load_font_data(font.to_vec());
+        }
+        let ui_family = UI_FAMILY;
+        let empty_text = Buffer::new(&mut font_system, Metrics::new(1.0, 1.0));
 
         let color_mode = if linearize {
             ColorMode::Accurate
@@ -259,6 +279,8 @@ impl Renderer {
             base_text,
             overlay_text,
             ui_family,
+            icons: IconRegistry::default(),
+            empty_text,
         })
     }
 
@@ -310,9 +332,9 @@ impl Renderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut base_instances = self.shape_instances(&frame.base.shapes);
-        base_instances.extend(self.icon_instances(&frame.base.icons));
         let mut overlay_instances = self.shape_instances(&frame.overlay.shapes);
-        overlay_instances.extend(self.icon_instances(&frame.overlay.icons));
+        let base_glyphs = self.icon_glyphs(&frame.base.icons);
+        let overlay_glyphs = self.icon_glyphs(&frame.overlay.icons);
 
         let mut base_buffers: Vec<Buffer> = Vec::with_capacity(frame.base.texts.len());
         let mut base_prepared: Vec<PreparedText> = Vec::with_capacity(frame.base.texts.len());
@@ -358,6 +380,12 @@ impl Renderer {
             },
         );
 
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.size.0 as i32,
+            bottom: self.size.1 as i32,
+        };
         let base_areas = base_buffers
             .iter()
             .zip(base_prepared.iter())
@@ -370,6 +398,12 @@ impl Renderer {
                 default_color: prepared.color,
                 custom_glyphs: &[],
             })
+            .chain(std::iter::once(icon_area(
+                &self.empty_text,
+                &base_glyphs,
+                self.scale,
+                bounds,
+            )))
             .collect::<Vec<_>>();
 
         let overlay_areas = overlay_buffers
@@ -384,10 +418,17 @@ impl Renderer {
                 default_color: prepared.color,
                 custom_glyphs: &[],
             })
+            .chain(std::iter::once(icon_area(
+                &self.empty_text,
+                &overlay_glyphs,
+                self.scale,
+                bounds,
+            )))
             .collect::<Vec<_>>();
 
+        let icons = &self.icons;
         self.base_text
-            .prepare(
+            .prepare_with_custom(
                 &self.device,
                 &self.queue,
                 &mut self.font_system,
@@ -395,6 +436,13 @@ impl Renderer {
                 &self.viewport,
                 base_areas,
                 &mut self.swash_cache,
+                |request| {
+                    let data = icons.rasterize(request.id, request.width, request.height)?;
+                    Some(RasterizedCustomGlyph {
+                        data,
+                        content_type: ContentType::Mask,
+                    })
+                },
             )
             .map_err(|error| {
                 eprintln!("prepare base text: {error}");
@@ -402,7 +450,7 @@ impl Renderer {
             })?;
 
         self.overlay_text
-            .prepare(
+            .prepare_with_custom(
                 &self.device,
                 &self.queue,
                 &mut self.font_system,
@@ -410,6 +458,13 @@ impl Renderer {
                 &self.viewport,
                 overlay_areas,
                 &mut self.swash_cache,
+                |request| {
+                    let data = icons.rasterize(request.id, request.width, request.height)?;
+                    Some(RasterizedCustomGlyph {
+                        data,
+                        content_type: ContentType::Mask,
+                    })
+                },
             )
             .map_err(|error| {
                 eprintln!("prepare overlay text: {error}");
@@ -638,95 +693,32 @@ impl Renderer {
             .collect()
     }
 
-    fn icon_instances(&self, icons: &[IconShape]) -> Vec<RectInstance> {
-        let mut out = Vec::with_capacity(icons.len() * 8);
+    /// Mengubah ikon menjadi custom glyph glyphon. Posisi dan ukuran tetap dalam
+    /// piksel logis; skala ke piksel fisik dilakukan lewat `TextArea::scale`.
+    fn icon_glyphs(&mut self, icons: &[IconShape]) -> Vec<CustomGlyph> {
+        let mut glyphs = Vec::with_capacity(icons.len());
         for shape in icons {
             let unit = shape.rect.width.min(shape.rect.height);
-            let center = shape.rect.center();
-            let point = |p: svg::Point| {
-                (
-                    center.x + (p.x - 12.0) / 24.0 * unit,
-                    center.y + (p.y - 12.0) / 24.0 * unit,
-                )
-            };
-            let color = self.instance_color(shape.color);
-            let Some(lucide) = shape.icon.lucide() else {
+            if unit <= 0.0 {
+                continue;
+            }
+            let stroke = icons::stroke_units(shape.stroke, unit);
+            let Some(id) = self.icons.id(shape.icon, stroke) else {
                 continue;
             };
-            for path in svg::parse(lucide.svg_str()) {
-                if path.len() < 2 {
-                    continue;
-                }
-                let is_dot = path.first().zip(path.last()).is_some_and(|(first, last)| {
-                    (first.x - last.x).abs() < 0.01 && (first.y - last.y).abs() < 0.01
-                });
-                if is_dot && path.len() >= 32 {
-                    let first = point(path[0]);
-                    let diameter = (path[1].x - path[0].x).abs() / 24.0 * unit * 2.0;
-                    self.push_dot(&mut out, first, diameter, color);
-                    continue;
-                }
-                for pair in path.windows(2) {
-                    self.push_line(
-                        &mut out,
-                        point(pair[0]),
-                        point(pair[1]),
-                        shape.stroke,
-                        color,
-                    );
-                }
-            }
-            if shape.icon == Icon::StarFilled {
-                self.push_dot(&mut out, (center.x, center.y), unit * 0.26, color);
-            }
+            let color = shape.color;
+            glyphs.push(CustomGlyph {
+                id,
+                left: shape.rect.x,
+                top: shape.rect.y,
+                width: shape.rect.width,
+                height: shape.rect.height,
+                color: Some(cosmic_text::Color::rgba(color.r, color.g, color.b, color.a)),
+                snap_to_physical_pixel: true,
+                metadata: 0,
+            });
         }
-        out
-    }
-
-    fn push_line(
-        &self,
-        out: &mut Vec<RectInstance>,
-        start: (f32, f32),
-        end: (f32, f32),
-        width: f32,
-        color: [f32; 4],
-    ) {
-        let dx = end.0 - start.0;
-        let dy = end.1 - start.1;
-        let length = dx.hypot(dy).max(0.001);
-        let angle = dy.atan2(dx);
-        out.push(RectInstance {
-            rect: [
-                (start.0 + end.0) * 0.5 * self.scale,
-                (start.1 + end.1) * 0.5 * self.scale,
-                length * self.scale,
-                width * self.scale,
-            ],
-            color,
-            params: [width * 0.5 * self.scale, 0.0, angle, 0.0],
-            border_color: [0.0; 4],
-        });
-    }
-
-    fn push_dot(
-        &self,
-        out: &mut Vec<RectInstance>,
-        center: (f32, f32),
-        diameter: f32,
-        color: [f32; 4],
-    ) {
-        let diameter = diameter * self.scale;
-        out.push(RectInstance {
-            rect: [
-                center.0 * self.scale - diameter * 0.5,
-                center.1 * self.scale - diameter * 0.5,
-                diameter,
-                diameter,
-            ],
-            color,
-            params: [diameter * 0.5, 0.0, 0.0, 0.0],
-            border_color: [0.0; 4],
-        });
+        glyphs
     }
 
     fn instance_color(&self, color: Color) -> [f32; 4] {
@@ -740,6 +732,23 @@ impl Renderer {
                 color.a as f32 / 255.0,
             ]
         }
+    }
+}
+
+fn icon_area<'a>(
+    buffer: &'a Buffer,
+    glyphs: &'a [CustomGlyph],
+    scale: f32,
+    bounds: TextBounds,
+) -> TextArea<'a> {
+    TextArea {
+        buffer,
+        left: 0.0,
+        top: 0.0,
+        scale,
+        bounds,
+        default_color: cosmic_text::Color::rgba(255, 255, 255, 255),
+        custom_glyphs: glyphs,
     }
 }
 
@@ -761,19 +770,37 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn pick_family(font_system: &FontSystem) -> &'static str {
-    let db = font_system.db();
-    let has = |name: &str| {
-        db.faces().any(|face| {
-            face.families
-                .iter()
-                .any(|(family, _)| family.eq_ignore_ascii_case(name))
-        })
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if has("Segoe UI") {
-        "Segoe UI"
-    } else {
-        "sans-serif"
+    #[test]
+    fn bundled_manrope_weights_are_registered_and_shape_text() {
+        let mut font_system = FontSystem::new();
+        for font in UI_FONTS {
+            font_system.db_mut().load_font_data(font.to_vec());
+        }
+        let manrope_faces = font_system
+            .db()
+            .faces()
+            .filter(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(UI_FAMILY))
+            })
+            .count();
+        assert!(manrope_faces >= UI_FONTS.len());
+
+        let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        let attrs = Attrs::new()
+            .family(Family::Name(UI_FAMILY))
+            .weight(Weight(600));
+        buffer.set_text("RushBross", &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut font_system, false);
+        let width = buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0f32, f32::max);
+        assert!(width > 40.0, "shaped width was {width}");
     }
 }

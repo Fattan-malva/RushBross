@@ -126,7 +126,7 @@ impl WindowChrome {
                 theme.muted_foreground
             };
             let icon_rect = Rect::new(rect.x + 9.0, rect.y + 9.0, 14.0, 14.0);
-            layer.push_icon(IconShape::new(icons[index], icon_rect, color).stroke(1.6));
+            layer.push_icon(IconShape::new(icons[index], icon_rect, color));
         }
     }
 }
