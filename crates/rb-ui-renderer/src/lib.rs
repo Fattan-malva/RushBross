@@ -6,7 +6,7 @@ use cosmic_text::{
     SwashCache, Weight, Wrap,
 };
 use glyphon::{ColorMode, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
-use rb_ui::frame::{Align, FontFamily, Frame, RectShape, TextShape};
+use rb_ui::frame::{Align, FontFamily, Frame, Icon, IconShape, RectShape, TextShape};
 use rb_ui::Color;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -72,7 +72,6 @@ pub struct Renderer {
     base_text: TextRenderer,
     overlay_text: TextRenderer,
     ui_family: &'static str,
-    icon_family: &'static str,
 }
 
 impl Renderer {
@@ -224,7 +223,7 @@ impl Renderer {
         });
 
         let font_system = FontSystem::new();
-        let (ui_family, icon_family) = pick_families(&font_system);
+        let ui_family = pick_family(&font_system);
 
         let color_mode = if linearize {
             ColorMode::Accurate
@@ -258,7 +257,6 @@ impl Renderer {
             base_text,
             overlay_text,
             ui_family,
-            icon_family,
         })
     }
 
@@ -310,7 +308,9 @@ impl Renderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut base_instances = self.shape_instances(&frame.base.shapes);
+        base_instances.extend(self.icon_instances(&frame.base.icons));
         let mut overlay_instances = self.shape_instances(&frame.overlay.shapes);
+        overlay_instances.extend(self.icon_instances(&frame.overlay.icons));
 
         let mut base_buffers: Vec<Buffer> = Vec::with_capacity(frame.base.texts.len());
         let mut base_prepared: Vec<PreparedText> = Vec::with_capacity(frame.base.texts.len());
@@ -483,7 +483,6 @@ impl Renderer {
         let metrics = Metrics::new(font_size, line_height);
         let family = match text.family {
             FontFamily::Sans => Family::Name(self.ui_family),
-            FontFamily::Icons => Family::Name(self.icon_family),
         };
         let attrs = Attrs::new().family(family).weight(Weight(text.weight));
 
@@ -612,6 +611,390 @@ impl Renderer {
             .collect()
     }
 
+    fn icon_instances(&self, icons: &[IconShape]) -> Vec<RectInstance> {
+        let mut out = Vec::with_capacity(icons.len() * 4);
+        for shape in icons {
+            let unit = shape.rect.width.min(shape.rect.height);
+            let center = shape.rect.center();
+            let point =
+                |p: (f32, f32)| (center.x + (p.0 - 0.5) * unit, center.y + (p.1 - 0.5) * unit);
+            let stroke = shape.stroke;
+            let color = self.instance_color(shape.color);
+
+            match shape.icon {
+                Icon::Search => {
+                    self.push_circle(&mut out, point((0.42, 0.42)), 0.5, stroke, color);
+                    self.push_line(
+                        &mut out,
+                        point((0.58, 0.58)),
+                        point((0.82, 0.82)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Lock => {
+                    self.push_line(
+                        &mut out,
+                        point((0.34, 0.46)),
+                        point((0.34, 0.34)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.34, 0.34)),
+                        point((0.66, 0.34)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.66, 0.34)),
+                        point((0.66, 0.46)),
+                        stroke,
+                        color,
+                    );
+                    self.push_outline_rect(&mut out, point((0.3, 0.46)), 0.4, 0.32, stroke, color);
+                }
+                Icon::Star | Icon::StarFilled => {
+                    let star = [
+                        (0.5, 0.16),
+                        (0.6, 0.39),
+                        (0.84, 0.4),
+                        (0.65, 0.55),
+                        (0.72, 0.79),
+                        (0.5, 0.65),
+                        (0.28, 0.79),
+                        (0.35, 0.55),
+                        (0.16, 0.4),
+                        (0.4, 0.39),
+                    ];
+                    let weight = if shape.icon == Icon::StarFilled {
+                        stroke * 1.6
+                    } else {
+                        stroke
+                    };
+                    for index in 0..star.len() {
+                        self.push_line(
+                            &mut out,
+                            point(star[index]),
+                            point(star[(index + 1) % star.len()]),
+                            weight,
+                            color,
+                        );
+                    }
+                    if shape.icon == Icon::StarFilled {
+                        self.push_dot(&mut out, point((0.5, 0.51)), unit * 0.18, color);
+                    }
+                }
+                Icon::Reload => {
+                    let arc = [
+                        (0.78, 0.36),
+                        (0.7, 0.26),
+                        (0.54, 0.21),
+                        (0.36, 0.24),
+                        (0.24, 0.36),
+                        (0.2, 0.54),
+                    ];
+                    for index in 0..arc.len() - 1 {
+                        self.push_line(
+                            &mut out,
+                            point(arc[index]),
+                            point(arc[index + 1]),
+                            stroke,
+                            color,
+                        );
+                    }
+                    self.push_line(
+                        &mut out,
+                        point((0.2, 0.54)),
+                        point((0.29, 0.47)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.2, 0.54)),
+                        point((0.14, 0.43)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Plus => {
+                    self.push_line(
+                        &mut out,
+                        point((0.2, 0.5)),
+                        point((0.8, 0.5)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.5, 0.2)),
+                        point((0.5, 0.8)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Close => {
+                    self.push_line(
+                        &mut out,
+                        point((0.25, 0.25)),
+                        point((0.75, 0.75)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.75, 0.25)),
+                        point((0.25, 0.75)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::More => {
+                    for x in [0.25, 0.5, 0.75] {
+                        self.push_dot(&mut out, point((x, 0.5)), stroke * 2.6, color);
+                    }
+                }
+                Icon::Bookmark => {
+                    let path = [
+                        (0.3, 0.2),
+                        (0.7, 0.2),
+                        (0.7, 0.8),
+                        (0.5, 0.64),
+                        (0.3, 0.8),
+                        (0.3, 0.2),
+                    ];
+                    for index in 0..path.len() - 1 {
+                        self.push_line(
+                            &mut out,
+                            point(path[index]),
+                            point(path[index + 1]),
+                            stroke,
+                            color,
+                        );
+                    }
+                }
+                Icon::Edit => {
+                    self.push_line(
+                        &mut out,
+                        point((0.24, 0.76)),
+                        point((0.7, 0.3)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.62, 0.22)),
+                        point((0.78, 0.38)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.24, 0.76)),
+                        point((0.34, 0.78)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Trash => {
+                    self.push_line(
+                        &mut out,
+                        point((0.24, 0.3)),
+                        point((0.76, 0.3)),
+                        stroke,
+                        color,
+                    );
+                    self.push_outline_rect(&mut out, point((0.3, 0.38)), 0.4, 0.42, stroke, color);
+                    self.push_line(
+                        &mut out,
+                        point((0.43, 0.3)),
+                        point((0.43, 0.22)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.57, 0.3)),
+                        point((0.57, 0.22)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.42, 0.48)),
+                        point((0.44, 0.7)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.58, 0.48)),
+                        point((0.56, 0.7)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Minimize => {
+                    self.push_line(
+                        &mut out,
+                        point((0.24, 0.5)),
+                        point((0.76, 0.5)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::Maximize => {
+                    self.push_outline_rect(&mut out, point((0.5, 0.5)), 0.52, 0.52, stroke, color);
+                }
+                Icon::Restore => {
+                    self.push_outline_rect(
+                        &mut out,
+                        point((0.42, 0.42)),
+                        0.48,
+                        0.48,
+                        stroke,
+                        color,
+                    );
+                    self.push_outline_rect(
+                        &mut out,
+                        point((0.58, 0.58)),
+                        0.48,
+                        0.48,
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::ChevronLeft => {
+                    self.push_line(
+                        &mut out,
+                        point((0.62, 0.24)),
+                        point((0.36, 0.5)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.36, 0.5)),
+                        point((0.62, 0.76)),
+                        stroke,
+                        color,
+                    );
+                }
+                Icon::ChevronRight => {
+                    self.push_line(
+                        &mut out,
+                        point((0.38, 0.24)),
+                        point((0.64, 0.5)),
+                        stroke,
+                        color,
+                    );
+                    self.push_line(
+                        &mut out,
+                        point((0.64, 0.5)),
+                        point((0.38, 0.76)),
+                        stroke,
+                        color,
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn push_line(
+        &self,
+        out: &mut Vec<RectInstance>,
+        start: (f32, f32),
+        end: (f32, f32),
+        width: f32,
+        color: [f32; 4],
+    ) {
+        let dx = end.0 - start.0;
+        let dy = end.1 - start.1;
+        let length = dx.hypot(dy).max(0.001);
+        let angle = dy.atan2(dx);
+        out.push(RectInstance {
+            rect: [
+                (start.0 + end.0) * 0.5 * self.scale,
+                (start.1 + end.1) * 0.5 * self.scale,
+                length * self.scale,
+                width * self.scale,
+            ],
+            color,
+            params: [width * 0.5 * self.scale, 0.0, angle, 0.0],
+            border_color: [0.0; 4],
+        });
+    }
+
+    fn push_circle(
+        &self,
+        out: &mut Vec<RectInstance>,
+        center: (f32, f32),
+        diameter: f32,
+        stroke: f32,
+        color: [f32; 4],
+    ) {
+        let diameter = diameter * self.scale;
+        out.push(RectInstance {
+            rect: [
+                center.0 * self.scale - diameter * 0.5,
+                center.1 * self.scale - diameter * 0.5,
+                diameter,
+                diameter,
+            ],
+            color: [0.0; 4],
+            params: [diameter * 0.5, stroke * self.scale, 0.0, 0.0],
+            border_color: color,
+        });
+    }
+
+    fn push_dot(
+        &self,
+        out: &mut Vec<RectInstance>,
+        center: (f32, f32),
+        diameter: f32,
+        color: [f32; 4],
+    ) {
+        let diameter = diameter * self.scale;
+        out.push(RectInstance {
+            rect: [
+                center.0 * self.scale - diameter * 0.5,
+                center.1 * self.scale - diameter * 0.5,
+                diameter,
+                diameter,
+            ],
+            color,
+            params: [diameter * 0.5, 0.0, 0.0, 0.0],
+            border_color: [0.0; 4],
+        });
+    }
+
+    fn push_outline_rect(
+        &self,
+        out: &mut Vec<RectInstance>,
+        center: (f32, f32),
+        width: f32,
+        height: f32,
+        stroke: f32,
+        color: [f32; 4],
+    ) {
+        let diameter = width.min(height) * self.scale;
+        out.push(RectInstance {
+            rect: [
+                center.0 * self.scale - width * 0.5 * self.scale,
+                center.1 * self.scale - height * 0.5 * self.scale,
+                width * self.scale,
+                height * self.scale,
+            ],
+            color: [0.0; 4],
+            params: [diameter * 0.5, stroke * self.scale, 0.0, 0.0],
+            border_color: color,
+        });
+    }
+
     fn instance_color(&self, color: Color) -> [f32; 4] {
         if self.linearize {
             color.to_linear()
@@ -644,7 +1027,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn pick_families(font_system: &FontSystem) -> (&'static str, &'static str) {
+fn pick_family(font_system: &FontSystem) -> &'static str {
     let db = font_system.db();
     let has = |name: &str| {
         db.faces().any(|face| {
@@ -654,18 +1037,9 @@ fn pick_families(font_system: &FontSystem) -> (&'static str, &'static str) {
         })
     };
 
-    let ui = if has("Segoe UI") {
+    if has("Segoe UI") {
         "Segoe UI"
     } else {
         "sans-serif"
-    };
-    let icons = if has("Segoe Fluent Icons") {
-        "Segoe Fluent Icons"
-    } else if has("Segoe MDL2 Assets") {
-        "Segoe MDL2 Assets"
-    } else {
-        "Segoe UI Symbol"
-    };
-
-    (ui, icons)
+    }
 }

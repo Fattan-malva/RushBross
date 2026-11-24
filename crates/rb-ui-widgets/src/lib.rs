@@ -1,6 +1,12 @@
+mod chrome;
+
+pub use chrome::{ChromeAction, ChromeElement, WindowChrome};
+
 use rb_bookmarks::{Bookmark, BookmarkId, BookmarkStore};
 use rb_tabs::{Tab, TabId, TabManager};
-use rb_ui::{Align, Color, FontFamily, Frame, Rect, RectShape, TextInput, TextShape, Theme, Vec2};
+use rb_ui::{
+    Align, Color, Frame, Icon, IconShape, Rect, RectShape, TextInput, TextShape, Theme, Vec2,
+};
 
 const TAB_STRIP_HEIGHT: f32 = 40.0;
 const TAB_HEIGHT: f32 = 32.0;
@@ -15,18 +21,6 @@ const POPOVER_MAX_LIST_HEIGHT: f32 = 240.0;
 const ROW_HEIGHT: f32 = 36.0;
 const CONTEXT_WIDTH: f32 = 160.0;
 
-const ICON_SEARCH: &str = "\u{e721}";
-const ICON_LOCK: &str = "\u{e72e}";
-const ICON_STAR: &str = "\u{e734}";
-const ICON_STAR_FILLED: &str = "\u{e735}";
-const ICON_RELOAD: &str = "\u{e72c}";
-const ICON_ADD: &str = "\u{e710}";
-const ICON_CLOSE: &str = "\u{e711}";
-const ICON_MORE: &str = "\u{e712}";
-const ICON_BOOKMARK: &str = "\u{e8a4}";
-const ICON_EDIT: &str = "\u{e70f}";
-const ICON_DELETE: &str = "\u{e74d}";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Address,
@@ -39,6 +33,10 @@ enum Element {
     Tab(TabId),
     TabClose(TabId),
     NewTabButton,
+    WindowMinimize,
+    WindowMaximizeToggle,
+    WindowClose,
+    WindowDrag,
     Address,
     AddressClear,
     BookmarkStar,
@@ -139,6 +137,9 @@ pub struct BrowserShell {
     layout: Layout,
     tab_rects: Vec<(TabId, Rect)>,
     tab_drag: Option<TabDrag>,
+    chrome: WindowChrome,
+    maximized: bool,
+    pending_chrome: Option<ChromeAction>,
     pending: Option<NavigationRequest>,
 }
 
@@ -167,6 +168,9 @@ impl BrowserShell {
             layout: Layout::default(),
             tab_rects: Vec::new(),
             tab_drag: None,
+            chrome: WindowChrome::layout(0.0, 0.0),
+            maximized: false,
+            pending_chrome: None,
             pending: None,
         };
         shell.request_active_navigation();
@@ -291,6 +295,18 @@ impl BrowserShell {
 
     pub fn is_editing(&self) -> bool {
         self.focus.is_some()
+    }
+
+    pub fn set_maximized(&mut self, maximized: bool) {
+        self.maximized = maximized;
+    }
+
+    pub fn hit_chrome(&self, position: Vec2) -> Option<ChromeElement> {
+        self.chrome.hit(position)
+    }
+
+    pub fn take_chrome_action(&mut self) -> Option<ChromeAction> {
+        self.pending_chrome.take()
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -568,6 +584,16 @@ impl BrowserShell {
 
     fn activate(&mut self, element: Element) {
         match element {
+            Element::WindowMinimize => {
+                self.pending_chrome = Some(ChromeAction::Minimize);
+            }
+            Element::WindowMaximizeToggle => {
+                self.pending_chrome = Some(ChromeAction::MaximizeToggle);
+            }
+            Element::WindowClose => {
+                self.pending_chrome = Some(ChromeAction::Close);
+            }
+            Element::WindowDrag => {}
             Element::Tab(id) => {
                 let changed = self.tabs.active_id() != Some(id);
                 self.tabs.activate(id);
@@ -878,14 +904,18 @@ impl BrowserShell {
         }
         let close_hover = hover == Some(Element::TabClose(tab.id));
         if close_hover {
-            layer.push_rect(RectShape::filled(close_rect, theme.accent, 4.0));
+            layer.push_rect(RectShape::filled(close_rect, theme.accent, 10.0));
         }
         let close_color = if close_hover {
             theme.foreground
         } else {
             theme.muted_foreground
         };
-        layer.push_text(icon(ICON_CLOSE, close_rect.center(), 12.0, close_color));
+        layer.push_icon(IconShape::new(
+            Icon::Close,
+            icon_rect(close_rect.center(), 12.0),
+            close_color,
+        ));
         self.push_hit(Element::TabClose(tab.id), close_rect);
     }
 
@@ -902,7 +932,13 @@ impl BrowserShell {
         let theme = self.theme;
         let padding = 8.0;
         let plus_size = 28.0;
-        let available = (width - padding * 2.0 - plus_size - TAB_GAP).max(0.0);
+        let available = (width
+            - padding * 2.0
+            - plus_size
+            - TAB_GAP
+            - WindowChrome::reserved_width()
+            - TAB_GAP)
+            .max(0.0);
         let max_width = width * TAB_MAX_RATIO;
         let dragged = self
             .tab_drag
@@ -949,15 +985,34 @@ impl BrowserShell {
         let plus_rect = Rect::new(x, strip.y + 10.0, plus_size, plus_size);
         let plus_hover = hover == Some(Element::NewTabButton);
         if plus_hover {
-            layer.push_rect(RectShape::filled(plus_rect, theme.accent, 6.0));
+            layer.push_rect(RectShape::filled(plus_rect, theme.accent, 14.0));
         }
         let plus_color = if plus_hover {
             theme.foreground
         } else {
             theme.muted_foreground
         };
-        layer.push_text(icon(ICON_ADD, plus_rect.center(), 16.0, plus_color));
+        layer.push_icon(IconShape::new(
+            Icon::Plus,
+            icon_rect(plus_rect.center(), 16.0),
+            plus_color,
+        ));
         self.push_hit(Element::NewTabButton, plus_rect);
+
+        self.chrome = WindowChrome::layout(width, plus_rect.right() + TAB_GAP);
+        self.chrome
+            .draw(layer, theme, chrome_hover(hover), self.maximized);
+        for (rect, element) in self.chrome.hit_regions() {
+            self.push_hit(
+                match element {
+                    ChromeElement::Minimize => Element::WindowMinimize,
+                    ChromeElement::MaximizeToggle => Element::WindowMaximizeToggle,
+                    ChromeElement::Close => Element::WindowClose,
+                    ChromeElement::DragStrip => Element::WindowDrag,
+                },
+                rect,
+            );
+        }
 
         if let Some((dragged_id, visual_x)) = dragged {
             if let Some(index) = tabs.iter().position(|tab| tab.id == dragged_id) {
@@ -1043,8 +1098,12 @@ impl BrowserShell {
 
         let icon_x = form.x + 12.0;
         let icon_center = Vec2::new(icon_x + 8.0, form.center().y);
-        let icon_glyph = if is_url { ICON_LOCK } else { ICON_SEARCH };
-        layer.push_text(icon(icon_glyph, icon_center, 16.0, theme.muted_foreground));
+        let leading_icon = if is_url { Icon::Lock } else { Icon::Search };
+        layer.push_icon(IconShape::new(
+            leading_icon,
+            icon_rect(icon_center, 16.0),
+            theme.muted_foreground,
+        ));
 
         let star_rect = Rect::new(form.right() - 10.0 - 20.0, form.y + 8.0, 20.0, 20.0);
         let clear_rect = if address.is_empty() {
@@ -1106,7 +1165,11 @@ impl BrowserShell {
             } else {
                 theme.muted_foreground
             };
-            layer.push_text(icon(ICON_CLOSE, clear_rect.center(), 12.0, color));
+            layer.push_icon(IconShape::new(
+                Icon::Close,
+                icon_rect(clear_rect.center(), 12.0),
+                color,
+            ));
             self.push_hit(Element::AddressClear, clear_rect);
         }
 
@@ -1123,17 +1186,21 @@ impl BrowserShell {
         } else {
             theme.muted_foreground
         };
-        let star_glyph = if bookmarked {
-            ICON_STAR_FILLED
+        let star_icon = if bookmarked {
+            Icon::StarFilled
         } else {
-            ICON_STAR
+            Icon::Star
         };
-        layer.push_text(icon(star_glyph, star_rect.center(), 16.0, star_color));
+        layer.push_icon(IconShape::new(
+            star_icon,
+            icon_rect(star_rect.center(), 16.0),
+            star_color,
+        ));
         self.push_hit(Element::BookmarkStar, star_rect);
 
         let reload_hover = hover == Some(Element::Reload) && has_url;
         if reload_hover {
-            layer.push_rect(RectShape::filled(reload_rect, theme.accent, 6.0));
+            layer.push_rect(RectShape::filled(reload_rect, theme.accent, 16.0));
         }
         let reload_color = if !has_url {
             theme.muted_foreground.with_alpha(0.4)
@@ -1142,7 +1209,11 @@ impl BrowserShell {
         } else {
             theme.muted_foreground
         };
-        layer.push_text(icon(ICON_RELOAD, reload_rect.center(), 16.0, reload_color));
+        layer.push_icon(IconShape::new(
+            Icon::Reload,
+            icon_rect(reload_rect.center(), 16.0),
+            reload_color,
+        ));
         self.push_hit(Element::Reload, reload_rect);
     }
 
@@ -1162,18 +1233,17 @@ impl BrowserShell {
             0.0,
         ));
 
-        let icon_rect = Rect::new(bar.x + 12.0, bar.y + 9.0, 14.0, 14.0);
-        layer.push_text(icon(
-            ICON_BOOKMARK,
-            icon_rect.center(),
-            14.0,
+        let leading_rect = Rect::new(bar.x + 12.0, bar.y + 9.0, 14.0, 14.0);
+        layer.push_icon(IconShape::new(
+            Icon::Bookmark,
+            icon_rect(leading_rect.center(), 14.0),
             theme.muted_foreground,
         ));
 
         let manage_rect = Rect::new(width - 12.0 - 24.0, bar.y + 4.0, 24.0, 24.0);
         self.layout.manage_button = manage_rect;
 
-        let strip_left = icon_rect.right() + 8.0;
+        let strip_left = leading_rect.right() + 8.0;
         let strip_right = manage_rect.x - 8.0;
 
         if bookmarks.is_empty() {
@@ -1273,14 +1343,18 @@ impl BrowserShell {
 
         let manage_hover = hover == Some(Element::BookmarkManage);
         if manage_hover {
-            layer.push_rect(RectShape::filled(manage_rect, theme.accent, 4.0));
+            layer.push_rect(RectShape::filled(manage_rect, theme.accent, 12.0));
         }
         let manage_color = if manage_hover {
             theme.foreground
         } else {
             theme.muted_foreground
         };
-        layer.push_text(icon(ICON_MORE, manage_rect.center(), 14.0, manage_color));
+        layer.push_icon(IconShape::new(
+            Icon::More,
+            icon_rect(manage_rect.center(), 14.0),
+            manage_color,
+        ));
         self.push_hit(Element::BookmarkManage, manage_rect);
     }
 
@@ -1404,12 +1478,11 @@ impl BrowserShell {
 
                 let edit_hover = hover == Some(Element::PopoverEdit(bookmark.id));
                 if edit_hover {
-                    layer.push_rect(RectShape::filled(edit_rect, theme.accent, 4.0));
+                    layer.push_rect(RectShape::filled(edit_rect, theme.accent, 12.0));
                 }
-                layer.push_text(icon(
-                    ICON_EDIT,
-                    edit_rect.center(),
-                    12.0,
+                layer.push_icon(IconShape::new(
+                    Icon::Edit,
+                    icon_rect(edit_rect.center(), 12.0),
                     if edit_hover {
                         theme.foreground
                     } else {
@@ -1423,13 +1496,12 @@ impl BrowserShell {
                     layer.push_rect(RectShape::filled(
                         delete_rect,
                         theme.destructive.with_alpha(0.1),
-                        4.0,
+                        12.0,
                     ));
                 }
-                layer.push_text(icon(
-                    ICON_DELETE,
-                    delete_rect.center(),
-                    12.0,
+                layer.push_icon(IconShape::new(
+                    Icon::Trash,
+                    icon_rect(delete_rect.center(), 12.0),
                     if delete_hover {
                         theme.destructive
                     } else {
@@ -1632,17 +1704,17 @@ impl BrowserShell {
     }
 }
 
-fn icon(glyph: &str, center: Vec2, size: f32, color: Color) -> TextShape {
-    TextShape::new(
-        glyph,
-        center.x - size * 0.5,
-        center.y - size * 0.62,
-        size,
-        color,
-    )
-    .family(FontFamily::Icons)
-    .width(size)
-    .align(Align::Center)
+fn icon_rect(center: Vec2, size: f32) -> Rect {
+    Rect::new(center.x - size * 0.5, center.y - size * 0.5, size, size)
+}
+
+fn chrome_hover(hover: Option<Element>) -> Option<ChromeElement> {
+    match hover {
+        Some(Element::WindowMinimize) => Some(ChromeElement::Minimize),
+        Some(Element::WindowMaximizeToggle) => Some(ChromeElement::MaximizeToggle),
+        Some(Element::WindowClose) => Some(ChromeElement::Close),
+        _ => None,
+    }
 }
 
 fn approx_text_width(text: &str, size: f32) -> f32 {

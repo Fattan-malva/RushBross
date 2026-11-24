@@ -35,8 +35,19 @@ fn vs_main(@builtin(vertex_index) index: u32, instance: Instance) -> VertexOutpu
 
     let padding = 1.0;
     let corner = corners[index];
-    let pos = instance.rect.xy - vec2<f32>(padding, padding)
-        + corner * (instance.rect.zw + vec2<f32>(padding * 2.0, padding * 2.0));
+    let size = instance.rect.zw;
+    let center = instance.rect.xy + size * 0.5;
+    let angle = instance.params.z;
+    let cosine = cos(angle);
+    let sine = sin(angle);
+    let offset = corner * (size + vec2<f32>(padding * 2.0, padding * 2.0))
+        - vec2<f32>(padding, padding)
+        - size * 0.5;
+    let rotated = vec2<f32>(
+        cosine * offset.x - sine * offset.y,
+        sine * offset.x + cosine * offset.y,
+    );
+    let pos = center + rotated;
 
     var out: VertexOutput;
     out.position = vec4<f32>(
@@ -45,9 +56,8 @@ fn vs_main(@builtin(vertex_index) index: u32, instance: Instance) -> VertexOutpu
         1.0,
     );
     out.position.y = -out.position.y;
-    out.local = corner * (instance.rect.zw + vec2<f32>(padding * 2.0, padding * 2.0))
-        - vec2<f32>(padding, padding);
-    out.size = instance.rect.zw;
+    out.local = rotated + size * 0.5;
+    out.size = size;
     out.color = instance.color;
     out.params = instance.params;
     out.border_color = instance.border_color;

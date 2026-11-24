@@ -3,7 +3,26 @@ use crate::geom::{Color, Rect};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFamily {
     Sans,
-    Icons,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icon {
+    Search,
+    Lock,
+    Star,
+    StarFilled,
+    Reload,
+    Plus,
+    Close,
+    More,
+    Bookmark,
+    Edit,
+    Trash,
+    Minimize,
+    Maximize,
+    Restore,
+    ChevronLeft,
+    ChevronRight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +66,30 @@ impl RectShape {
             border_width,
             border_color,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IconShape {
+    pub icon: Icon,
+    pub rect: Rect,
+    pub color: Color,
+    pub stroke: f32,
+}
+
+impl IconShape {
+    pub fn new(icon: Icon, rect: Rect, color: Color) -> Self {
+        Self {
+            icon,
+            rect,
+            color,
+            stroke: (rect.width.min(rect.height) * 0.11).max(1.0),
+        }
+    }
+
+    pub fn stroke(mut self, stroke: f32) -> Self {
+        self.stroke = stroke.max(0.5);
+        self
     }
 }
 
@@ -140,12 +183,17 @@ impl TextShape {
 #[derive(Clone, Debug, Default)]
 pub struct Layer {
     pub shapes: Vec<RectShape>,
+    pub icons: Vec<IconShape>,
     pub texts: Vec<TextShape>,
 }
 
 impl Layer {
     pub fn push_rect(&mut self, shape: RectShape) {
         self.shapes.push(shape);
+    }
+
+    pub fn push_icon(&mut self, icon: IconShape) {
+        self.icons.push(icon);
     }
 
     pub fn push_text(&mut self, text: TextShape) {

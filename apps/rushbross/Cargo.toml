@@ -14,6 +14,7 @@ rb-ui-widgets.workspace = true
 rb-ui-renderer.workspace = true
 winit.workspace = true
 pollster.workspace = true
+png.workspace = true
 webview2-com = "0.39.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
