@@ -10,6 +10,10 @@ pub struct Tab {
     pub url: Option<String>,
     /// Favicon PNG dari situs, `None` jika belum ada atau halaman kosong.
     pub favicon: Option<Arc<[u8]>>,
+    /// Halaman sedang dimuat; dipakai untuk spinner di ikon tab dan tombol refresh.
+    pub loading: bool,
+    /// WebView tab sedang memutar audio (YouTube, Discord, dll).
+    pub playing_audio: bool,
     history: Vec<String>,
     history_index: usize,
 }
@@ -120,6 +124,18 @@ impl TabManager {
         }
     }
 
+    pub fn set_loading(&mut self, id: TabId, loading: bool) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.loading = loading;
+        }
+    }
+
+    pub fn set_playing_audio(&mut self, id: TabId, playing: bool) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.playing_audio = playing;
+        }
+    }
+
     pub fn activate(&mut self, id: TabId) {
         if self.tab(id).is_some() {
             self.active = Some(id);
@@ -134,6 +150,8 @@ impl TabManager {
             title: title.into(),
             url: None,
             favicon: None,
+            loading: false,
+            playing_audio: false,
             history: Vec::new(),
             history_index: 0,
         };

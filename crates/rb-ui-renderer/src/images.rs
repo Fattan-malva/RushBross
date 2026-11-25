@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 /// Bit tinggi pada id glyph untuk membedakan gambar dari ikon Lucide.
 pub const IMAGE_ID_FLAG: u16 = 0x8000;
+/// Ikon UI ditampilkan kecil (16 px). Menyimpan sheet besar sebagai RGBA penuh
+/// hanya memboroskan memori, jadi gambar sumber dibatasi saat decode.
+const MAX_SOURCE_SIZE: u32 = 96;
 
 #[derive(Default)]
 pub struct ImageRegistry {
@@ -33,7 +36,7 @@ impl ImageRegistry {
         if let Some(id) = self.lookup.get(&key) {
             return Some(*id);
         }
-        let (width, height, mut rgba) = decode_png(source)?;
+        let (width, height, mut rgba) = shrink_source(decode_png(source)?, source);
         if muted {
             mute(&mut rgba);
         }
@@ -88,6 +91,24 @@ fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         png::ColorType::Indexed => return None,
     };
     Some((info.width, info.height, rgba))
+}
+
+fn shrink_source(decoded: (u32, u32, Vec<u8>), source: &Arc<[u8]>) -> (u32, u32, Vec<u8>) {
+    let (width, height, rgba) = decoded;
+    if width <= MAX_SOURCE_SIZE && height <= MAX_SOURCE_SIZE {
+        return (width, height, rgba);
+    }
+    let scale = MAX_SOURCE_SIZE as f32 / width.max(height) as f32;
+    let target_w = (width as f32 * scale).round().max(1.0) as u32;
+    let target_h = (height as f32 * scale).round().max(1.0) as u32;
+    let entry = Entry {
+        _source: Arc::clone(source),
+        width,
+        height,
+        rgba,
+    };
+    let rgba = resample(&entry, target_w, target_h);
+    (target_w, target_h, rgba)
 }
 
 /// Abu-abu dan transparan sebagian. Dipakai untuk ikon halaman baru agar tidak mencolok.

@@ -1,4 +1,5 @@
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 mod chrome;
 
@@ -152,10 +153,18 @@ struct Layout {
     address_scroll: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationKind {
+    Load,
+    Reload,
+}
+
 #[derive(Clone, Debug)]
 pub struct NavigationRequest {
+    pub tab_id: TabId,
     pub url: String,
     pub title: String,
+    pub kind: NavigationKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +196,8 @@ pub struct BrowserShell {
     pending_chrome: Option<ChromeAction>,
     pending_fullscreen_exit: bool,
     pending: Option<NavigationRequest>,
+    closed_tabs: Vec<TabId>,
+    spin_start: Option<Instant>,
 }
 
 impl Default for BrowserShell {
@@ -221,6 +232,8 @@ impl BrowserShell {
             pending_chrome: None,
             pending_fullscreen_exit: false,
             pending: None,
+            closed_tabs: Vec::new(),
+            spin_start: None,
         };
         shell.sync_address_to_active();
         shell.request_active_navigation();
@@ -563,8 +576,13 @@ impl BrowserShell {
     }
 
     pub fn new_tab(&mut self) {
-        self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
-        self.request_active_navigation();
+        let id = self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
+        self.begin_load(
+            id,
+            NEW_TAB_URL.to_string(),
+            "Tab baru".to_string(),
+            NavigationKind::Load,
+        );
         self.address.clear();
         self.focus = None;
         self.show_bookmarks = false;
@@ -581,7 +599,6 @@ impl BrowserShell {
             return;
         }
         self.tabs.cycle(delta);
-        self.request_active_navigation();
         self.sync_address_to_active();
         self.focus = None;
     }
@@ -612,6 +629,36 @@ impl BrowserShell {
         self.pending.take()
     }
 
+    pub fn take_closed_tabs(&mut self) -> Vec<TabId> {
+        std::mem::take(&mut self.closed_tabs)
+    }
+
+    pub fn active_tab_id(&self) -> Option<TabId> {
+        self.tabs.active_id()
+    }
+
+    /// Spinner harus terus beranimasi selama halaman dimuat dan sesaat setelahnya.
+    pub fn has_animation(&self) -> bool {
+        self.spin_start
+            .is_some_and(|start| start.elapsed() < Duration::from_millis(900))
+            || self.tabs.tabs().iter().any(|tab| tab.loading)
+            || self
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| drag.dragging && !drag.settled)
+    }
+
+    fn spin_rotation(&self) -> f32 {
+        let Some(start) = self.spin_start else {
+            return 0.0;
+        };
+        let elapsed = start.elapsed().as_secs_f32();
+        if elapsed > 1.2 && !self.tabs.active().is_some_and(|tab| tab.loading) {
+            return 0.0;
+        }
+        elapsed * 7.0
+    }
+
     pub fn content_rect(&self, width: f32, height: f32) -> Rect {
         let (width, height) = (width.max(0.0), height.max(0.0));
         if self.fullscreen {
@@ -638,48 +685,66 @@ impl BrowserShell {
             .unwrap_or(true)
     }
 
-    /// Favicon dari WebView2 untuk tab aktif. `None` menghapus favicon lama.
-    pub fn webview_favicon(&mut self, favicon: Option<Vec<u8>>) {
-        if let Some(tab) = self.tabs.active_mut() {
-            tab.favicon = favicon.map(Arc::from);
+    /// Favicon dari WebView2. `None` diabaikan supaya ikon tab tidak hilang saat
+    /// halaman mulai dimuat; ikon lama dipakai sampai favicon baru tersedia.
+    pub fn webview_favicon(&mut self, tab_id: TabId, favicon: Option<Vec<u8>>) {
+        if let Some(bytes) = favicon {
+            if let Some(tab) = self.tabs.tab_mut(tab_id) {
+                tab.favicon = Some(Arc::from(bytes));
+            }
         }
     }
 
-    pub fn webview_title_changed(&mut self, title: &str) {
+    pub fn webview_title_changed(&mut self, tab_id: TabId, title: &str) {
         if title.trim().is_empty() {
             return;
         }
-        if let Some(tab) = self.tabs.active_mut() {
+        if let Some(tab) = self.tabs.tab_mut(tab_id) {
             tab.title = title.to_string();
         }
     }
 
-    pub fn webview_url_changed(&mut self, url: &str) {
+    pub fn webview_url_changed(&mut self, tab_id: TabId, url: &str) {
         if is_blank_url(url) {
             return;
         }
-        let Some(tab) = self.tabs.active_mut() else {
+        let Some(tab) = self.tabs.tab_mut(tab_id) else {
             return;
         };
         if tab.url.as_deref() == Some(url) {
             return;
         }
         tab.push_navigation(url.to_string());
-        if self.focus != Some(Focus::Address) {
+        if self.tabs.active_id() == Some(tab_id) && self.focus != Some(Focus::Address) {
             self.address.set_text(url);
         }
+    }
+
+    pub fn webview_loaded(&mut self, tab_id: TabId) {
+        self.tabs.set_loading(tab_id, false);
+    }
+
+    pub fn webview_playing_audio(&mut self, tab_id: TabId, playing: bool) {
+        self.tabs.set_playing_audio(tab_id, playing);
     }
 
     pub fn webview_new_window(&mut self, url: &str) {
         if url.is_empty() {
             return;
         }
-        self.tabs.open(host_from_url(url), Some(url.to_string()));
-        self.request_active_navigation();
+        let title = host_from_url(url);
+        let id = self.tabs.open(title.clone(), Some(url.to_string()));
+        self.begin_load(id, url.to_string(), title, NavigationKind::Load);
     }
 
     pub fn reload(&mut self) {
-        self.request_active_navigation();
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let url = tab.url.clone().unwrap_or_else(|| NEW_TAB_URL.to_string());
+        let title = tab.title.clone();
+        self.begin_load(tab_id, url, title, NavigationKind::Reload);
     }
 
     pub fn go_back(&mut self) {
@@ -687,15 +752,10 @@ impl BrowserShell {
             return;
         };
         if let Some(url) = tab.back() {
+            let tab_id = tab.id;
+            let title = tab.title.clone();
             self.address.set_text(&url);
-            self.pending = Some(NavigationRequest {
-                url,
-                title: self
-                    .tabs
-                    .active()
-                    .map(|tab| tab.title.clone())
-                    .unwrap_or_default(),
-            });
+            self.begin_load(tab_id, url, title, NavigationKind::Load);
             self.focus = None;
         }
     }
@@ -705,15 +765,10 @@ impl BrowserShell {
             return;
         };
         if let Some(url) = tab.forward() {
+            let tab_id = tab.id;
+            let title = tab.title.clone();
             self.address.set_text(&url);
-            self.pending = Some(NavigationRequest {
-                url,
-                title: self
-                    .tabs
-                    .active()
-                    .map(|tab| tab.title.clone())
-                    .unwrap_or_default(),
-            });
+            self.begin_load(tab_id, url, title, NavigationKind::Load);
             self.focus = None;
         }
     }
@@ -766,11 +821,7 @@ impl BrowserShell {
                 self.pending_fullscreen_exit = true;
             }
             Element::Tab(id) => {
-                let changed = self.tabs.active_id() != Some(id);
                 self.tabs.activate(id);
-                if changed {
-                    self.request_active_navigation();
-                }
                 self.sync_address_to_active();
                 self.focus = None;
             }
@@ -902,11 +953,11 @@ impl BrowserShell {
     fn close_tab(&mut self, id: TabId) {
         let was_active = self.tabs.active_id() == Some(id);
         self.tabs.close(id);
+        self.closed_tabs.push(id);
         if self.tab_drag.as_ref().map(|drag| drag.id) == Some(id) {
             self.tab_drag = None;
         }
         if was_active {
-            self.request_active_navigation();
             self.sync_address_to_active();
             self.focus = None;
         }
@@ -926,16 +977,28 @@ impl BrowserShell {
     }
 
     fn navigate(&mut self, url: String, title: String) {
-        if let Some(tab) = self.tabs.active_mut() {
+        let tab_id = if let Some(tab) = self.tabs.active_mut() {
             tab.push_navigation(url.clone());
             tab.title = title.clone();
+            tab.id
         } else {
-            self.tabs.open(title.clone(), Some(url.clone()));
-        }
+            self.tabs.open(title.clone(), Some(url.clone()))
+        };
         self.address.set_text(url.clone());
-        self.pending = Some(NavigationRequest { url, title });
+        self.begin_load(tab_id, url, title, NavigationKind::Load);
         self.show_bookmarks = false;
         self.context_menu = None;
+    }
+
+    fn begin_load(&mut self, tab_id: TabId, url: String, title: String, kind: NavigationKind) {
+        self.tabs.set_loading(tab_id, true);
+        self.spin_start = Some(Instant::now());
+        self.pending = Some(NavigationRequest {
+            tab_id,
+            url,
+            title,
+            kind,
+        });
     }
 
     fn request_active_navigation(&mut self) {
@@ -944,7 +1007,7 @@ impl BrowserShell {
         };
         let url = tab.url.clone().unwrap_or_else(|| NEW_TAB_URL.to_string());
         let title = tab.title.clone();
-        self.pending = Some(NavigationRequest { url, title });
+        self.begin_load(tab.id, url, title, NavigationKind::Load);
     }
 
     fn hit_at(&self, position: Vec2) -> Option<(Element, Rect)> {
@@ -1132,28 +1195,37 @@ impl BrowserShell {
 
         let close_rect = Rect::new(rect.right() - 10.0 - 20.0, rect.y + 6.0, 20.0, 20.0);
 
-        // Tab halaman baru memakai icons.png yang dimuted; halaman web memakai favicon asli.
-        let blank = tab.url.as_deref().is_none_or(is_blank_url);
-        let icon_source = if blank {
-            Some((new_tab_icon(), true))
+        let favicon_rect = Rect::new(
+            rect.x + 10.0,
+            rect.y + (TAB_HEIGHT - TAB_ICON_SIZE) * 0.5,
+            TAB_ICON_SIZE,
+            TAB_ICON_SIZE,
+        );
+        // Saat memuat, ikon tab diganti spinner. Favicon lama tetap disimpan dan
+        // tampil lagi begitu halaman selesai, jadi ikon tidak ikut hilang.
+        if tab.loading {
+            layer.push_icon(
+                IconShape::new(Icon::Loader, favicon_rect, theme.accent)
+                    .rotation(self.spin_rotation()),
+            );
         } else {
-            tab.favicon.clone().map(|source| (source, false))
-        };
-        let icon_offset = match icon_source {
-            Some((source, muted)) => {
-                let icon_rect = Rect::new(
-                    rect.x + 10.0,
-                    rect.y + (TAB_HEIGHT - TAB_ICON_SIZE) * 0.5,
-                    TAB_ICON_SIZE,
-                    TAB_ICON_SIZE,
-                );
-                layer.push_image(ImageShape::new(source, icon_rect).muted(muted));
-                TAB_ICON_SIZE + TAB_ICON_GAP
+            let blank = tab.url.as_deref().is_none_or(is_blank_url);
+            let icon_source = if blank {
+                Some((new_tab_icon(), true))
+            } else {
+                tab.favicon.clone().map(|source| (source, false))
+            };
+            if let Some((source, muted)) = icon_source {
+                layer.push_image(ImageShape::new(source, favicon_rect).muted(muted));
             }
-            None => 0.0,
-        };
-        let text_x = rect.x + 10.0 + icon_offset;
-        let title_width = (close_rect.x - 8.0 - text_x).max(0.0);
+        }
+
+        let audio_rect = tab
+            .playing_audio
+            .then(|| Rect::new(close_rect.x - 17.0, close_rect.y + 3.0, 14.0, 14.0));
+        let text_x = favicon_rect.right() + TAB_ICON_GAP;
+        let title_end = audio_rect.map(|rect| rect.x).unwrap_or(close_rect.x);
+        let title_width = (title_end - 8.0 - text_x).max(0.0);
         let title_color = if is_active {
             theme.foreground
         } else {
@@ -1172,6 +1244,15 @@ impl BrowserShell {
             title.text.clear();
         }
         layer.push_text(title);
+
+        if let Some(audio_rect) = audio_rect {
+            layer.push_rect(RectShape::filled(audio_rect, theme.accent, 7.0));
+            layer.push_icon(IconShape::new(
+                Icon::Volume,
+                icon_rect(audio_rect.center(), 9.0),
+                theme.background,
+            ));
+        }
 
         let close_hover = hover == Some(Element::TabClose(tab.id));
         if close_hover {
@@ -1418,33 +1499,75 @@ impl BrowserShell {
             })
             .unwrap_or((false, false, false, None));
 
-        let nav_button =
-            |layer: &mut rb_ui::Layer, rect: Rect, icon: Icon, element: Element, enabled: bool| {
-                let is_hover = hover == Some(element) && enabled;
-                if is_hover {
-                    layer.push_rect(RectShape::filled(rect, theme.accent, NAV_BUTTON_SIZE * 0.5));
-                }
-                let color = if !enabled {
-                    theme.muted_foreground.with_alpha(0.35)
-                } else if is_hover {
-                    theme.foreground
-                } else {
-                    theme.muted_foreground
-                };
-                layer.push_icon(IconShape::new(icon, icon_rect(rect.center(), 18.0), color));
+        let nav_button = |layer: &mut rb_ui::Layer,
+                          rect: Rect,
+                          icon: Icon,
+                          element: Element,
+                          enabled: bool,
+                          rotation: f32| {
+            let is_hover = hover == Some(element) && enabled;
+            if is_hover {
+                layer.push_rect(RectShape::filled(rect, theme.accent, NAV_BUTTON_SIZE * 0.5));
+            }
+            let color = if !enabled {
+                theme.muted_foreground.with_alpha(0.35)
+            } else if is_hover {
+                theme.foreground
+            } else {
+                theme.muted_foreground
             };
-        nav_button(layer, back_rect, Icon::ArrowLeft, Element::Back, can_back);
+            layer.push_icon(
+                IconShape::new(icon, icon_rect(rect.center(), 18.0), color).rotation(rotation),
+            );
+        };
+        nav_button(
+            layer,
+            back_rect,
+            Icon::ArrowLeft,
+            Element::Back,
+            can_back,
+            0.0,
+        );
         nav_button(
             layer,
             forward_rect,
             Icon::ArrowRight,
             Element::Forward,
             can_forward,
+            0.0,
         );
-        nav_button(layer, reload_rect, Icon::Reload, Element::Reload, has_url);
-        nav_button(layer, menu_rect, Icon::Menu, Element::ToolbarMenu, true);
-        nav_button(layer, profile_rect, Icon::Profile, Element::Profile, true);
-        nav_button(layer, more_rect, Icon::More, Element::ToolbarMore, true);
+        nav_button(
+            layer,
+            reload_rect,
+            Icon::Reload,
+            Element::Reload,
+            has_url,
+            self.spin_rotation(),
+        );
+        nav_button(
+            layer,
+            menu_rect,
+            Icon::Menu,
+            Element::ToolbarMenu,
+            true,
+            0.0,
+        );
+        nav_button(
+            layer,
+            profile_rect,
+            Icon::Profile,
+            Element::Profile,
+            true,
+            0.0,
+        );
+        nav_button(
+            layer,
+            more_rect,
+            Icon::More,
+            Element::ToolbarMore,
+            true,
+            0.0,
+        );
         self.push_hit(Element::Back, back_rect);
         self.push_hit(Element::Forward, forward_rect);
         self.push_hit(Element::Reload, reload_rect);
@@ -2300,8 +2423,9 @@ mod tests {
     #[test]
     fn webview_blank_urls_do_not_replace_the_new_tab() {
         let mut shell = BrowserShell::new();
-        shell.webview_url_changed("about:blank");
-        shell.webview_url_changed("");
+        let tab_id = shell.active_tab_id().unwrap();
+        shell.webview_url_changed(tab_id, "about:blank");
+        shell.webview_url_changed(tab_id, "");
         assert_eq!(
             shell.tabs.active().unwrap().url.as_deref(),
             Some(NEW_TAB_URL)
@@ -2312,7 +2436,8 @@ mod tests {
     #[test]
     fn real_urls_still_update_the_address_bar() {
         let mut shell = BrowserShell::new();
-        shell.webview_url_changed("https://example.com/a");
+        let tab_id = shell.active_tab_id().unwrap();
+        shell.webview_url_changed(tab_id, "https://example.com/a");
         assert_eq!(shell.address.text(), "https://example.com/a");
     }
 

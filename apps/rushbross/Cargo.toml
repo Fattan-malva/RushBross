@@ -9,6 +9,7 @@ name = "rushbross"
 path = "src/main.rs"
 
 [dependencies]
+rb-tabs.workspace = true
 rb-ui.workspace = true
 rb-ui-widgets.workspace = true
 rb-ui-renderer.workspace = true

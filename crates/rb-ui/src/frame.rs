@@ -59,6 +59,8 @@ pub struct IconShape {
     pub rect: Rect,
     pub color: Color,
     pub stroke: f32,
+    /// Rotasi dalam radian, dipakai untuk animasi spinner.
+    pub rotation: f32,
 }
 
 impl IconShape {
@@ -68,11 +70,17 @@ impl IconShape {
             rect,
             color,
             stroke: (rect.width.min(rect.height) * 2.0 / 24.0).max(1.0),
+            rotation: 0.0,
         }
     }
 
     pub fn stroke(mut self, stroke: f32) -> Self {
         self.stroke = stroke.max(0.5);
+        self
+    }
+
+    pub fn rotation(mut self, radians: f32) -> Self {
+        self.rotation = radians;
         self
     }
 }

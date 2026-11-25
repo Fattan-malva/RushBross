@@ -23,11 +23,11 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 const SHADER: &str = include_str!("shader.wgsl");
-const INITIAL_INSTANCES: u64 = 512;
+const INITIAL_INSTANCES: u64 = 128;
 /// Batas jumlah buffer teks yang di-cache. Cache dikosongkan di awal frame jika terlampaui.
-const TEXT_CACHE_LIMIT: usize = 512;
+const TEXT_CACHE_LIMIT: usize = 192;
 /// Batas cache lebar prefix (untuk caret dan seleksi).
-const WIDTH_CACHE_LIMIT: usize = 4096;
+const WIDTH_CACHE_LIMIT: usize = 1024;
 
 /// Font UI dibundel ke dalam binary agar tampilan sama di semua mesin Windows.
 const UI_FAMILY: &str = "Manrope";
@@ -839,7 +839,7 @@ impl Renderer {
                 continue;
             }
             let stroke = icons::stroke_units(shape.stroke, unit);
-            let Some(id) = self.icons.id(shape.icon, stroke) else {
+            let Some(id) = self.icons.id(shape.icon, stroke, shape.rotation) else {
                 continue;
             };
             let color = shape.color;

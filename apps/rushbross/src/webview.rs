@@ -1,23 +1,25 @@
 use std::cell::Cell;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
+use rb_tabs::TabId;
 use rb_ui::Rect;
 use rb_ui_widgets::NEW_TAB_URL;
 use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Controller2,
-        ICoreWebView2_15, COREWEBVIEW2_COLOR, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
-        COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
-        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        ICoreWebView2Environment, ICoreWebView2_15, ICoreWebView2_8, COREWEBVIEW2_COLOR,
+        COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, COREWEBVIEW2_KEY_EVENT_KIND,
+        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
     },
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     DocumentTitleChangedEventHandler, FaviconChangedEventHandler, GetFaviconCompletedHandler,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler,
+    IsDocumentPlayingAudioChangedEventHandler, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
 };
 use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
@@ -27,16 +29,18 @@ use winit::event_loop::EventLoopProxy;
 
 #[derive(Debug)]
 pub enum WebViewEvent {
-    /// Navigasi selesai. Host menampilkan WebView setelah ini, supaya tidak ada
-    /// kotak putih saat halaman pertama belum siap.
-    Loaded,
-    /// Favicon PNG untuk halaman yang sedang tampil. `None` menghapus favicon lama.
-    Favicon(Option<Vec<u8>>),
-    TitleChanged(String),
-    UrlChanged(String),
+    /// Halaman untuk tab ini selesai dimuat.
+    Loaded(TabId),
+    /// Favicon PNG untuk tab ini. `None` dikirim saat navigasi mulai.
+    Favicon(TabId, Option<Vec<u8>>),
+    TitleChanged(TabId, String),
+    UrlChanged(TabId, String),
+    /// Tab sedang memutar audio; dipakai untuk ikon speaker di tab.
+    PlayingAudio(TabId, bool),
     NewWindowRequested(String),
-    FullScreenChanged(bool),
+    FullScreenChanged(TabId, bool),
     Accelerator {
+        tab_id: TabId,
         key: u32,
         ctrl: bool,
         alt: bool,
@@ -53,6 +57,8 @@ struct Tokens {
     title: i64,
     navigation_start: i64,
     navigation_completed: i64,
+    favicon: i64,
+    audio: i64,
     new_window: i64,
     fullscreen: i64,
     accelerator: i64,
@@ -91,15 +97,15 @@ fn is_shell_accelerator(key: u32, ctrl: bool, alt: bool) -> bool {
     }
 }
 
-pub struct WebViewHost {
-    controller: ICoreWebView2Controller,
-    webview: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
-    tokens: Tokens,
-    showing_new_tab: Cell<bool>,
+/// Environment WebView2 dibuat sekali dan dipakai bersama semua tab. Membuat
+/// environment per tab memboroskan memori dan proses browser tambahan.
+pub struct WebViewRuntime {
+    environment: ICoreWebView2Environment,
+    active_tab: Arc<AtomicU64>,
 }
 
-impl WebViewHost {
-    pub fn new(parent: HWND, proxy: EventLoopProxy<UserEvent>) -> Result<Self, String> {
+impl WebViewRuntime {
+    pub fn new() -> Result<Self, String> {
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
         let environment = {
@@ -123,8 +129,25 @@ impl WebViewHost {
                 .map_err(|_| "WebView2 environment creation was cancelled".to_string())?
         };
 
+        Ok(Self {
+            environment,
+            active_tab: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub fn set_active_tab(&self, id: TabId) {
+        self.active_tab.store(id.0, Ordering::Relaxed);
+    }
+
+    pub fn create_host(
+        &self,
+        parent: HWND,
+        tab_id: TabId,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<WebViewHost, String> {
         let controller = {
             let (tx, rx) = mpsc::channel();
+            let environment = self.environment.clone();
             let operation = CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
                 Box::new(move |handler| unsafe {
                     environment
@@ -187,8 +210,9 @@ impl WebViewHost {
                             let mut title = PWSTR::null();
                             webview.DocumentTitle(&mut title)?;
                             let title = take_pwstr(title);
-                            let _ = proxy_title
-                                .send_event(UserEvent::WebView(WebViewEvent::TitleChanged(title)));
+                            let _ = proxy_title.send_event(UserEvent::WebView(
+                                WebViewEvent::TitleChanged(tab_id, title),
+                            ));
                         }
                         Ok(())
                     })),
@@ -203,14 +227,15 @@ impl WebViewHost {
             webview
                 .add_NavigationStarting(
                     &NavigationStartingEventHandler::create(Box::new(move |_, args| {
-                        let _ =
-                            proxy_url.send_event(UserEvent::WebView(WebViewEvent::Favicon(None)));
+                        let _ = proxy_url
+                            .send_event(UserEvent::WebView(WebViewEvent::Favicon(tab_id, None)));
                         if let Some(args) = args {
                             let mut uri = PWSTR::null();
                             args.Uri(&mut uri)?;
                             let url = take_pwstr(uri);
-                            let _ = proxy_url
-                                .send_event(UserEvent::WebView(WebViewEvent::UrlChanged(url)));
+                            let _ = proxy_url.send_event(UserEvent::WebView(
+                                WebViewEvent::UrlChanged(tab_id, url),
+                            ));
                         }
                         Ok(())
                     })),
@@ -239,7 +264,7 @@ impl WebViewHost {
                                 GetFaviconCompletedHandler::create(Box::new(move |_, stream| {
                                     let bytes = stream.as_ref().and_then(read_stream);
                                     let _ = proxy.send_event(UserEvent::WebView(
-                                        WebViewEvent::Favicon(bytes),
+                                        WebViewEvent::Favicon(tab_id, bytes),
                                     ));
                                     Ok(())
                                 }));
@@ -264,17 +289,53 @@ impl WebViewHost {
                             webview.Source(&mut uri)?;
                             let url = take_pwstr(uri);
                             if !url.is_empty() {
-                                let _ = proxy_final_url
-                                    .send_event(UserEvent::WebView(WebViewEvent::UrlChanged(url)));
+                                let _ = proxy_final_url.send_event(UserEvent::WebView(
+                                    WebViewEvent::UrlChanged(tab_id, url),
+                                ));
+                            }
+                            if let Ok(webview8) = webview.cast::<ICoreWebView2_8>() {
+                                let mut playing = windows::core::BOOL(0);
+                                if webview8.IsDocumentPlayingAudio(&mut playing).is_ok() {
+                                    let _ = proxy_final_url.send_event(UserEvent::WebView(
+                                        WebViewEvent::PlayingAudio(tab_id, playing.0 != 0),
+                                    ));
+                                }
                             }
                         }
-                        let _ =
-                            proxy_final_url.send_event(UserEvent::WebView(WebViewEvent::Loaded));
+                        let _ = proxy_final_url
+                            .send_event(UserEvent::WebView(WebViewEvent::Loaded(tab_id)));
                         Ok(())
                     })),
                     &mut navigation_completed_token,
                 )
                 .map_err(|error| error.to_string())?;
+        }
+
+        // Ikon speaker muncul saat halaman memutar audio, termasuk di tab background.
+        let mut audio_token = 0i64;
+        let proxy_audio = proxy.clone();
+        if let Ok(webview8) = webview.cast::<ICoreWebView2_8>() {
+            unsafe {
+                webview8
+                    .add_IsDocumentPlayingAudioChanged(
+                        &IsDocumentPlayingAudioChangedEventHandler::create(Box::new(
+                            move |sender, _| {
+                                if let Some(webview) = sender {
+                                    if let Ok(webview8) = webview.cast::<ICoreWebView2_8>() {
+                                        let mut playing = windows::core::BOOL(0);
+                                        webview8.IsDocumentPlayingAudio(&mut playing)?;
+                                        let _ = proxy_audio.send_event(UserEvent::WebView(
+                                            WebViewEvent::PlayingAudio(tab_id, playing.0 != 0),
+                                        ));
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )),
+                        &mut audio_token,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
 
         let mut new_window_token = 0i64;
@@ -312,7 +373,7 @@ impl WebViewHost {
                                 let mut contains = windows::core::BOOL(0);
                                 webview.ContainsFullScreenElement(&mut contains)?;
                                 let _ = proxy_fullscreen.send_event(UserEvent::WebView(
-                                    WebViewEvent::FullScreenChanged(contains.0 != 0),
+                                    WebViewEvent::FullScreenChanged(tab_id, contains.0 != 0),
                                 ));
                             }
                             Ok(())
@@ -325,10 +386,14 @@ impl WebViewHost {
 
         let mut accelerator_token = 0i64;
         let proxy_accelerator = proxy.clone();
+        let active_tab = Arc::clone(&self.active_tab);
         unsafe {
             controller
                 .add_AcceleratorKeyPressed(
                     &AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+                        if active_tab.load(Ordering::Relaxed) != tab_id.0 {
+                            return Ok(());
+                        }
                         let Some(args) = args else {
                             return Ok(());
                         };
@@ -348,6 +413,7 @@ impl WebViewHost {
                             args.SetHandled(true)?;
                             let _ = proxy_accelerator.send_event(UserEvent::WebView(
                                 WebViewEvent::Accelerator {
+                                    tab_id,
                                     key,
                                     ctrl,
                                     alt,
@@ -362,13 +428,15 @@ impl WebViewHost {
                 .map_err(|error| error.to_string())?;
         }
 
-        Ok(Self {
+        Ok(WebViewHost {
             controller,
             webview,
             tokens: Tokens {
                 title: title_token,
                 navigation_start: navigation_start_token,
                 navigation_completed: navigation_completed_token,
+                favicon: favicon_token,
+                audio: audio_token,
                 new_window: new_window_token,
                 fullscreen: fullscreen_token,
                 accelerator: accelerator_token,
@@ -376,7 +444,16 @@ impl WebViewHost {
             showing_new_tab: Cell::new(false),
         })
     }
+}
 
+pub struct WebViewHost {
+    controller: ICoreWebView2Controller,
+    webview: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    tokens: Tokens,
+    showing_new_tab: Cell<bool>,
+}
+
+impl WebViewHost {
     pub fn load(&self, url: &str) -> Result<(), String> {
         if url == NEW_TAB_URL {
             return self.load_new_tab();
@@ -464,6 +541,12 @@ impl Drop for WebViewHost {
             let _ = self
                 .webview
                 .remove_NavigationCompleted(self.tokens.navigation_completed);
+            if let Ok(webview15) = self.webview.cast::<ICoreWebView2_15>() {
+                let _ = webview15.remove_FaviconChanged(self.tokens.favicon);
+            }
+            if let Ok(webview8) = self.webview.cast::<ICoreWebView2_8>() {
+                let _ = webview8.remove_IsDocumentPlayingAudioChanged(self.tokens.audio);
+            }
             let _ = self
                 .webview
                 .remove_NewWindowRequested(self.tokens.new_window);

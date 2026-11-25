@@ -1907,6 +1907,7 @@ dependencies = [
  "ico",
  "png 0.17.16",
  "pollster",
+ "rb-tabs",
  "rb-ui",
  "rb-ui-renderer",
  "rb-ui-widgets",

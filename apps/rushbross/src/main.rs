@@ -3,9 +3,11 @@
 mod webview;
 
 mod app_icon;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use rb_tabs::TabId;
 use rb_ui::Rect;
 use rb_ui_renderer::{RenderError, Renderer};
 use rb_ui_widgets::{BrowserShell, ChromeAction, ChromeElement, CursorRole};
@@ -18,7 +20,7 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowId};
 
-use webview::{UserEvent, WebViewHost};
+use webview::{UserEvent, WebViewHost, WebViewRuntime};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
@@ -40,12 +42,15 @@ struct State {
     window: Arc<Window>,
     renderer: Renderer,
     shell: BrowserShell,
-    webview: Option<WebViewHost>,
+    proxy: EventLoopProxy<UserEvent>,
+    webview_env: Option<WebViewRuntime>,
+    /// Satu WebView per tab: tab background tetap hidup sehingga audio/video tidak berhenti.
+    webviews: HashMap<TabId, WebViewHost>,
+    ready: HashSet<TabId>,
+    visible_webview: Option<TabId>,
     /// Bounds WebView terakhir yang dikirim, supaya SetBounds tidak dipanggil tiap frame.
-    last_webview_bounds: Option<(i32, i32, i32, i32)>,
+    last_webview_bounds: Option<(TabId, i32, i32, i32, i32)>,
     window_shown: bool,
-    webview_ready: bool,
-    webview_visible: bool,
     overlay_open: bool,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
@@ -54,7 +59,11 @@ struct State {
 }
 
 impl State {
-    fn new(window: Arc<Window>, renderer: Renderer) -> Result<Self, String> {
+    fn new(
+        window: Arc<Window>,
+        renderer: Renderer,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<Self, String> {
         let scale = window.scale_factor() as f32;
         let physical = window.inner_size();
         let size = (
@@ -66,11 +75,13 @@ impl State {
             window,
             renderer,
             shell,
-            webview: None,
+            proxy,
+            webview_env: None,
+            webviews: HashMap::new(),
+            ready: HashSet::new(),
+            visible_webview: None,
             last_webview_bounds: None,
             window_shown: false,
-            webview_ready: false,
-            webview_visible: false,
             overlay_open: false,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
             size,
@@ -79,22 +90,20 @@ impl State {
         })
     }
 
-    fn init_webview(
-        &mut self,
-        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-    ) -> Result<(), String> {
-        let hwnd = match self.window.window_handle() {
+    fn parent_hwnd(&self) -> Result<windows::Win32::Foundation::HWND, String> {
+        match self.window.window_handle() {
             Ok(handle) => match handle.as_raw() {
-                RawWindowHandle::Win32(handle) => {
-                    windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void)
-                }
-                _ => return Err("window is not a Win32 window".to_string()),
+                RawWindowHandle::Win32(handle) => Ok(windows::Win32::Foundation::HWND(
+                    handle.hwnd.get() as *mut c_void,
+                )),
+                _ => Err("window is not a Win32 window".to_string()),
             },
-            Err(error) => return Err(error.to_string()),
-        };
-        let webview = WebViewHost::new(hwnd, proxy)?;
-        self.webview = Some(webview);
-        self.sync_webview_bounds();
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn init_webview(&mut self) -> Result<(), String> {
+        self.webview_env = Some(WebViewRuntime::new()?);
         self.pump_navigation();
         // WebView tetap tersembunyi sampai event Loaded, lihat user_event.
         Ok(())
@@ -127,28 +136,45 @@ impl State {
             self.window.set_visible(true);
         }
         self.overlay_open = frame.popup_open;
+        self.sync_active_tab();
+    }
+
+    fn sync_active_tab(&mut self) {
+        let active = self.shell.active_tab_id();
+        if let (Some(env), Some(id)) = (self.webview_env.as_ref(), active) {
+            env.set_active_tab(id);
+        }
         self.sync_webview_visibility();
         self.sync_webview_bounds();
     }
 
-    /// WebView ditampilkan setelah halaman siap dan tidak tertutup popup/menu.
+    /// Hanya WebView tab aktif yang tampil; tab lain tetap berjalan di background.
     fn sync_webview_visibility(&mut self) {
-        let visible = self.webview_ready && !self.overlay_open;
-        if visible == self.webview_visible {
+        let target = self
+            .shell
+            .active_tab_id()
+            .filter(|id| self.ready.contains(id) && !self.overlay_open);
+        if target == self.visible_webview {
             return;
         }
-        self.webview_visible = visible;
-        if let Some(webview) = &self.webview {
-            if let Err(error) = webview.set_visible(visible) {
-                eprintln!("webview visible: {error}");
+        if let Some(previous) = self.visible_webview {
+            if let Some(host) = self.webviews.get(&previous) {
+                if let Err(error) = host.set_visible(false) {
+                    eprintln!("webview hide: {error}");
+                }
             }
         }
+        if let Some(id) = target {
+            if let Some(host) = self.webviews.get(&id) {
+                if let Err(error) = host.set_visible(true) {
+                    eprintln!("webview show: {error}");
+                }
+            }
+        }
+        self.visible_webview = target;
     }
 
-    fn sync_webview_bounds(&mut self) {
-        if self.webview.is_none() {
-            return;
-        }
+    fn content_bounds(&self) -> Rect {
         let (width, height) = self.size;
         let rect = self.shell.content_rect(width, height);
         let scale = self.window.scale_factor() as f32;
@@ -158,13 +184,21 @@ impl State {
         } else {
             RESIZE_EDGE
         };
-        let physical = Rect::new(
+        Rect::new(
             (rect.x + inset) * scale,
             rect.y * scale,
             (rect.width - inset * 2.0).max(0.0) * scale,
             (rect.height - inset).max(0.0) * scale,
-        );
+        )
+    }
+
+    fn sync_webview_bounds(&mut self) {
+        let Some(active) = self.shell.active_tab_id() else {
+            return;
+        };
+        let physical = self.content_bounds();
         let key = (
+            active,
             physical.x.round() as i32,
             physical.y.round() as i32,
             physical.width.round() as i32,
@@ -174,22 +208,55 @@ impl State {
             return;
         }
         self.last_webview_bounds = Some(key);
-        if let Some(webview) = &self.webview {
-            if let Err(error) = webview.set_bounds(physical) {
+        if let Some(host) = self.webviews.get(&active) {
+            if let Err(error) = host.set_bounds(physical) {
                 eprintln!("webview bounds: {error}");
             }
         }
     }
 
+    fn ensure_webview(&mut self, tab_id: TabId) -> Result<(), String> {
+        if self.webviews.contains_key(&tab_id) {
+            return Ok(());
+        }
+        let hwnd = self.parent_hwnd()?;
+        let host = self
+            .webview_env
+            .as_ref()
+            .ok_or_else(|| "WebView2 environment is not ready".to_string())?
+            .create_host(hwnd, tab_id, self.proxy.clone())?;
+        if let Err(error) = host.set_bounds(self.content_bounds()) {
+            eprintln!("webview bounds: {error}");
+        }
+        self.webviews.insert(tab_id, host);
+        Ok(())
+    }
+
     fn pump_navigation(&mut self) {
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
+        for tab_id in self.shell.take_closed_tabs() {
+            self.webviews.remove(&tab_id);
+            self.ready.remove(&tab_id);
+            if self.visible_webview == Some(tab_id) {
+                self.visible_webview = None;
+            }
+        }
         while let Some(request) = self.shell.take_navigation() {
-            if let Err(error) = webview.load(&request.url) {
+            if let Err(error) = self.ensure_webview(request.tab_id) {
+                eprintln!("webview create: {error}");
+                continue;
+            }
+            let Some(host) = self.webviews.get(&request.tab_id) else {
+                continue;
+            };
+            let result = match request.kind {
+                rb_ui_widgets::NavigationKind::Load => host.load(&request.url),
+                rb_ui_widgets::NavigationKind::Reload => host.reload(),
+            };
+            if let Err(error) = result {
                 eprintln!("webview navigate {}: {error}", request.url);
             }
         }
+        self.sync_active_tab();
     }
 
     fn redraw(&self) {
@@ -242,12 +309,16 @@ impl State {
 
     fn handle_accelerator(
         &mut self,
+        tab_id: TabId,
         key: u32,
         ctrl: bool,
         alt: bool,
         shift: bool,
         event_loop: &ActiveEventLoop,
     ) {
+        if self.shell.active_tab_id() != Some(tab_id) {
+            return;
+        }
         let focus_shell = if ctrl && !alt {
             match key {
                 VK_TAB => {
@@ -275,11 +346,7 @@ impl State {
                     true
                 }
                 VK_R => {
-                    if let Some(webview) = &self.webview {
-                        if let Err(error) = webview.reload() {
-                            eprintln!("webview reload: {error}");
-                        }
-                    }
+                    self.shell.reload();
                     false
                 }
                 VK_Q => {
@@ -381,13 +448,7 @@ impl State {
                 "w" => self.shell.close_active_tab(),
                 "d" => self.shell.toggle_bookmark(),
                 "a" => self.shell.select_all(),
-                "r" => {
-                    if let Some(webview) = &self.webview {
-                        if let Err(error) = webview.reload() {
-                            eprintln!("webview reload: {error}");
-                        }
-                    }
-                }
+                "r" => self.shell.reload(),
                 "q" => {
                     event_loop.exit();
                     return;
@@ -474,7 +535,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        let mut state = match State::new(window, renderer) {
+        let mut state = match State::new(window, renderer, proxy.clone()) {
             Ok(state) => state,
             Err(error) => {
                 eprintln!("create state: {error}");
@@ -485,7 +546,7 @@ impl ApplicationHandler<UserEvent> for App {
         state.draw();
         self.state = Some(state);
         if let Some(state) = self.state.as_mut() {
-            if let Err(error) = state.init_webview(proxy) {
+            if let Err(error) = state.init_webview() {
                 eprintln!("create webview: {error}");
             }
             state.redraw();
@@ -613,34 +674,40 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
-            UserEvent::WebView(webview::WebViewEvent::Loaded) => {
-                state.webview_ready = true;
+            UserEvent::WebView(webview::WebViewEvent::Loaded(tab_id)) => {
+                state.ready.insert(tab_id);
+                state.shell.webview_loaded(tab_id);
                 state.sync_webview_visibility();
-                return;
             }
-            UserEvent::WebView(webview::WebViewEvent::Favicon(favicon)) => {
-                state.shell.webview_favicon(favicon)
+            UserEvent::WebView(webview::WebViewEvent::Favicon(tab_id, favicon)) => {
+                state.shell.webview_favicon(tab_id, favicon)
             }
-            UserEvent::WebView(webview::WebViewEvent::TitleChanged(title)) => {
-                state.shell.webview_title_changed(&title)
+            UserEvent::WebView(webview::WebViewEvent::TitleChanged(tab_id, title)) => {
+                state.shell.webview_title_changed(tab_id, &title)
             }
-            UserEvent::WebView(webview::WebViewEvent::UrlChanged(url)) => {
-                state.shell.webview_url_changed(&url)
+            UserEvent::WebView(webview::WebViewEvent::UrlChanged(tab_id, url)) => {
+                state.shell.webview_url_changed(tab_id, &url)
+            }
+            UserEvent::WebView(webview::WebViewEvent::PlayingAudio(tab_id, playing)) => {
+                state.shell.webview_playing_audio(tab_id, playing)
             }
             UserEvent::WebView(webview::WebViewEvent::NewWindowRequested(url)) => {
                 state.shell.webview_new_window(&url)
             }
-            UserEvent::WebView(webview::WebViewEvent::FullScreenChanged(enabled)) => {
-                state.set_web_fullscreen(enabled);
+            UserEvent::WebView(webview::WebViewEvent::FullScreenChanged(tab_id, enabled)) => {
+                if state.shell.active_tab_id() == Some(tab_id) {
+                    state.set_web_fullscreen(enabled);
+                }
                 return;
             }
             UserEvent::WebView(webview::WebViewEvent::Accelerator {
+                tab_id,
                 key,
                 ctrl,
                 alt,
                 shift,
             }) => {
-                state.handle_accelerator(key, ctrl, alt, shift, event_loop);
+                state.handle_accelerator(tab_id, key, ctrl, alt, shift, event_loop);
                 return;
             }
         }
@@ -650,7 +717,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = self.state.as_mut() {
-            if state.shell.animate_tabs() {
+            if state.shell.has_animation() {
                 state.redraw();
             }
         }
