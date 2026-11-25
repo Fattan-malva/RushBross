@@ -14,6 +14,8 @@ pub struct Tab {
     pub loading: bool,
     /// WebView tab sedang memutar audio (YouTube, Discord, dll).
     pub playing_audio: bool,
+    /// Tab pinned selalu berada di kiri dan diperkecil jadi favicon saja.
+    pub pinned: bool,
     history: Vec<String>,
     history_index: usize,
 }
@@ -136,6 +138,53 @@ impl TabManager {
         }
     }
 
+    pub fn is_pinned(&self, id: TabId) -> bool {
+        self.tab(id).is_some_and(|tab| tab.pinned)
+    }
+
+    pub fn toggle_pin(&mut self, id: TabId) -> Option<bool> {
+        let pinned = {
+            let tab = self.tab_mut(id)?;
+            tab.pinned = !tab.pinned;
+            tab.pinned
+        };
+        let mut pinned_tabs = Vec::new();
+        let mut normal_tabs = Vec::new();
+        for tab in std::mem::take(&mut self.tabs) {
+            if tab.pinned {
+                pinned_tabs.push(tab);
+            } else {
+                normal_tabs.push(tab);
+            }
+        }
+        pinned_tabs.extend(normal_tabs);
+        self.tabs = pinned_tabs;
+        Some(pinned)
+    }
+
+    pub fn duplicate(&mut self, id: TabId) -> Option<TabId> {
+        let (index, mut tab) = self
+            .tabs
+            .iter()
+            .enumerate()
+            .find(|(_, tab)| tab.id == id)
+            .map(|(index, tab)| (index, tab.clone()))?;
+        let duplicated_id = TabId(self.next_id);
+        self.next_id += 1;
+        tab.id = duplicated_id;
+        tab.pinned = false;
+        tab.loading = false;
+        tab.playing_audio = false;
+        let insert_at = if self.tabs[index].pinned {
+            self.tabs.iter().take_while(|tab| tab.pinned).count()
+        } else {
+            index + 1
+        };
+        self.tabs.insert(insert_at, tab);
+        self.active = Some(duplicated_id);
+        Some(duplicated_id)
+    }
+
     pub fn activate(&mut self, id: TabId) {
         if self.tab(id).is_some() {
             self.active = Some(id);
@@ -152,6 +201,7 @@ impl TabManager {
             favicon: None,
             loading: false,
             playing_audio: false,
+            pinned: false,
             history: Vec::new(),
             history_index: 0,
         };
@@ -180,9 +230,39 @@ impl TabManager {
         let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let pinned = self.tabs[from].pinned;
         let tab = self.tabs.remove(from);
-        let target = target.min(self.tabs.len());
+        let pinned_count = self.tabs.iter().filter(|tab| tab.pinned).count();
+        let target = if pinned {
+            target.min(pinned_count)
+        } else {
+            target.clamp(pinned_count, self.tabs.len())
+        };
         self.tabs.insert(target, tab);
+    }
+
+    pub fn move_group(&mut self, ids: &[TabId], target: usize) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut group = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.id == *id) {
+                group.push(self.tabs.remove(index));
+            }
+        }
+        if group.is_empty() {
+            return;
+        }
+        let pinned_count = self.tabs.iter().filter(|tab| tab.pinned).count();
+        let target = if group.iter().any(|tab| !tab.pinned) {
+            target.clamp(pinned_count, self.tabs.len())
+        } else {
+            target.min(pinned_count)
+        };
+        for tab in group.into_iter().rev() {
+            self.tabs.insert(target, tab);
+        }
     }
 
     pub fn index_of(&self, id: TabId) -> Option<usize> {
@@ -230,5 +310,57 @@ mod tests {
         manager.move_to(first, 2);
         let order: Vec<TabId> = manager.tabs().iter().map(|tab| tab.id).collect();
         assert_eq!(order, vec![third, second, first]);
+    }
+
+    #[test]
+    fn move_group_keeps_split_tabs_together() {
+        let mut manager = TabManager::new();
+        let first = manager.open("first", None);
+        let second = manager.open("second", None);
+        let third = manager.open("third", None);
+        let fourth = manager.open("fourth", None);
+
+        manager.move_group(&[second, fourth], 0);
+        let order: Vec<TabId> = manager.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![second, fourth, first, third]);
+    }
+
+    #[test]
+    fn pinned_tabs_stay_at_the_front() {
+        let mut manager = TabManager::new();
+        let first = manager.open("first", None);
+        let second = manager.open("second", None);
+        let third = manager.open("third", None);
+
+        assert_eq!(manager.toggle_pin(third), Some(true));
+        let order: Vec<TabId> = manager.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![third, first, second]);
+
+        manager.move_to(third, 2);
+        let order: Vec<TabId> = manager.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![third, first, second]);
+    }
+
+    #[test]
+    fn duplicate_preserves_history_and_activates_copy() {
+        let mut manager = TabManager::new();
+        let first = manager.open("first", Some("https://example.com".to_string()));
+        manager
+            .tab_mut(first)
+            .unwrap()
+            .push_navigation("https://example.com/next".to_string());
+
+        let copy = manager.duplicate(first).unwrap();
+        assert_ne!(copy, first);
+        assert_eq!(manager.active_id(), Some(copy));
+        assert_eq!(
+            manager.tab(copy).unwrap().history(),
+            &[
+                "https://example.com".to_string(),
+                "https://example.com/next".to_string(),
+            ]
+        );
+        let order: Vec<TabId> = manager.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![first, copy]);
     }
 }

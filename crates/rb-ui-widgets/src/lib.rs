@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,13 @@ const TAB_RADIUS: f32 = 8.0;
 /// Ukuran favicon di tab dan jarak ke judul.
 const TAB_ICON_SIZE: f32 = 16.0;
 const TAB_ICON_GAP: f32 = 8.0;
+const PINNED_TAB_WIDTH: f32 = 44.0;
+const SPLIT_GAP: f32 = 6.0;
+const SPLIT_HEADER_HEIGHT: f32 = 28.0;
+const SPLIT_MIN_RATIO: f32 = 0.18;
+const SPLIT_GROUP_COLOR: Color = Color::rgb(0x3b, 0x82, 0xf6);
+const CONTEXT_ITEM_HEIGHT: f32 = 30.0;
+const TAB_CONTEXT_WIDTH: f32 = 220.0;
 
 /// Ikon halaman baru (`assets/icons.png`), dibagi antar tab.
 fn new_tab_icon() -> Arc<[u8]> {
@@ -60,6 +68,9 @@ enum Element {
     Tab(TabId),
     TabClose(TabId),
     NewTabButton,
+    SplitDivider(usize),
+    SplitPaneHeader(usize),
+    SplitPaneClose(usize),
     WindowMinimize,
     WindowMaximizeToggle,
     WindowClose,
@@ -89,6 +100,22 @@ enum Element {
     ContextOpen,
     ContextEdit,
     ContextDelete,
+    TabContextArea,
+    TabContextPin(TabId),
+    TabContextDuplicate(TabId),
+    TabContextReload(TabId),
+    TabContextNewTabRight(TabId),
+    TabContextSplit(TabId),
+    TabContextAddToSplit(TabId),
+    TabContextRemoveFromSplit(TabId),
+    TabContextCloseSplit,
+    TabContextCloseOthers(TabId),
+    TabContextCloseRight(TabId),
+    TabContextClose(TabId),
+    SplitPickerArea,
+    SplitPickerRow(TabId),
+    SplitPickerCancel,
+    SplitPickerConfirm,
 }
 
 impl Element {
@@ -114,6 +141,32 @@ impl Element {
                 | Element::ContextOpen
                 | Element::ContextEdit
                 | Element::ContextDelete
+                | Element::TabContextArea
+                | Element::TabContextPin(_)
+                | Element::TabContextDuplicate(_)
+                | Element::TabContextReload(_)
+                | Element::TabContextNewTabRight(_)
+                | Element::TabContextSplit(_)
+                | Element::TabContextAddToSplit(_)
+                | Element::TabContextRemoveFromSplit(_)
+                | Element::TabContextCloseSplit
+                | Element::TabContextCloseOthers(_)
+                | Element::TabContextCloseRight(_)
+                | Element::TabContextClose(_)
+                | Element::SplitPickerArea
+                | Element::SplitPickerRow(_)
+                | Element::SplitPickerCancel
+                | Element::SplitPickerConfirm
+        )
+    }
+
+    fn is_split_picker(self) -> bool {
+        matches!(
+            self,
+            Element::SplitPickerArea
+                | Element::SplitPickerRow(_)
+                | Element::SplitPickerCancel
+                | Element::SplitPickerConfirm
         )
     }
 }
@@ -131,12 +184,114 @@ struct ContextMenu {
     position: Vec2,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TabContextMenu {
+    id: TabId,
+    position: Vec2,
+}
+
+#[derive(Clone, Debug)]
+struct SplitPicker {
+    selected: Vec<TabId>,
+    position: Vec2,
+}
+
+#[derive(Clone, Debug)]
+struct SplitView {
+    panes: Vec<TabId>,
+    ratios: [f32; 2],
+    active_pane: usize,
+}
+
+impl SplitView {
+    fn new(first: TabId, second: TabId) -> Self {
+        Self {
+            panes: vec![first, second],
+            ratios: [0.5, 0.5],
+            active_pane: 1,
+        }
+    }
+
+    fn rebalance(&mut self) {
+        self.ratios = match self.panes.len() {
+            3 => [1.0 / 3.0, 2.0 / 3.0],
+            _ => [0.5, 0.5],
+        };
+        self.active_pane = self.active_pane.min(self.panes.len().saturating_sub(1));
+    }
+
+    fn boundaries(&self) -> &[f32] {
+        &self.ratios[..self.panes.len().saturating_sub(1)]
+    }
+
+    fn pane_rects(&self, content: Rect) -> Vec<Rect> {
+        let count = self.panes.len();
+        if count <= 1 {
+            return vec![content];
+        }
+        let usable = (content.width - SPLIT_GAP * (count as f32 - 1.0)).max(0.0);
+        let mut edges = Vec::with_capacity(count + 1);
+        edges.push(0.0);
+        edges.extend_from_slice(self.boundaries());
+        edges.push(1.0);
+        let mut rects = Vec::with_capacity(count);
+        let mut x = content.x;
+        for index in 0..count {
+            let width = usable * (edges[index + 1] - edges[index]).max(0.0);
+            rects.push(Rect::new(x, content.y, width, content.height));
+            x += width;
+            if index + 1 < count {
+                x += SPLIT_GAP;
+            }
+        }
+        rects
+    }
+
+    fn divider_rects(&self, content: Rect) -> Vec<Rect> {
+        let panes = self.pane_rects(content);
+        panes
+            .iter()
+            .take(panes.len().saturating_sub(1))
+            .map(|pane| Rect::new(pane.right(), content.y, SPLIT_GAP, content.height))
+            .collect()
+    }
+
+    fn set_divider(&mut self, index: usize, ratio: f32) {
+        let count = self.panes.len();
+        if count < 2 {
+            return;
+        }
+        let ratio = ratio.clamp(SPLIT_MIN_RATIO, 1.0 - SPLIT_MIN_RATIO);
+        if count == 2 {
+            self.ratios[0] = ratio;
+            return;
+        }
+        if index == 0 {
+            let ceiling = self.ratios[1] - SPLIT_MIN_RATIO;
+            self.ratios[0] = ratio.min(ceiling).max(SPLIT_MIN_RATIO);
+        } else {
+            let floor = self.ratios[0] + SPLIT_MIN_RATIO;
+            self.ratios[1] = ratio.max(floor).min(1.0 - SPLIT_MIN_RATIO);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TabMenuItem {
+    label: String,
+    element: Element,
+    icon: Icon,
+    destructive: bool,
+    separator_before: bool,
+}
+
 #[derive(Clone, Debug)]
 struct TabDrag {
-    id: TabId,
+    ids: Vec<TabId>,
     start: Vec2,
     current: Vec2,
     visual_x: f32,
+    origin_x: f32,
     grab_offset: f32,
     order: Vec<TabId>,
     target: usize,
@@ -185,9 +340,14 @@ pub struct BrowserShell {
     show_bookmarks: bool,
     editing: Option<BookmarkEdit>,
     context_menu: Option<ContextMenu>,
+    tab_context_menu: Option<TabContextMenu>,
+    split_picker: Option<SplitPicker>,
+    split: Option<SplitView>,
+    split_drag: Option<usize>,
     pointer: Vec2,
     hover: Option<Element>,
     hits: Vec<(Element, Rect)>,
+    size: Vec2,
     layout: Layout,
     tab_rects: Vec<(TabId, Rect)>,
     tab_drag: Option<TabDrag>,
@@ -221,9 +381,14 @@ impl BrowserShell {
             show_bookmarks: false,
             editing: None,
             context_menu: None,
+            tab_context_menu: None,
+            split_picker: None,
+            split: None,
+            split_drag: None,
             pointer: Vec2::new(-1000.0, -1000.0),
             hover: None,
             hits: Vec::new(),
+            size: Vec2::new(0.0, 0.0),
             layout: Layout::default(),
             tab_rects: Vec::new(),
             tab_drag: None,
@@ -253,6 +418,10 @@ impl BrowserShell {
         // tanpa membangun frame dua kali.
         self.hover = self.hit_at(position).map(|(element, _)| element);
         let mut dirty = self.hover != previous_hover;
+        if let Some(index) = self.split_drag {
+            self.update_split_divider(index, position.x);
+            return true;
+        }
         if self.address_dragging && self.focus == Some(Focus::Address) {
             let text = self.address.text().to_string();
             let offset =
@@ -277,13 +446,17 @@ impl BrowserShell {
                 .iter()
                 .map(|tab| tab.id)
                 .collect::<Vec<_>>();
-            let centers = drag.slots.clone();
+            let slots: HashMap<TabId, f32> = order
+                .iter()
+                .copied()
+                .zip(drag.slots.iter().copied())
+                .collect();
             let mut target = 0usize;
-            for (index, id) in order.iter().enumerate() {
-                if *id == drag.id {
+            for id in &order {
+                if drag.ids.contains(id) {
                     continue;
                 }
-                let center = centers.get(index).copied().unwrap_or(position.x);
+                let center = slots.get(id).copied().unwrap_or(position.x);
                 if position.x < center {
                     break;
                 }
@@ -291,7 +464,8 @@ impl BrowserShell {
             }
             drag.order = order;
             drag.target = target;
-            self.tabs.move_to(drag.id, target);
+            self.tabs.move_group(&drag.ids, target);
+            self.sync_split_order();
         }
         self.tab_drag = Some(drag);
         dirty
@@ -302,12 +476,27 @@ impl BrowserShell {
         let hit = self.hit_at(position);
 
         self.address_dragging = false;
+        self.split_drag = None;
+        if let Some((Element::SplitDivider(index), _)) = hit {
+            self.split_drag = Some(index);
+        }
         if let Some((Element::Tab(id), rect)) = hit {
+            let mut ids = self
+                .split
+                .as_ref()
+                .filter(|split| split.panes.contains(&id))
+                .map(|split| split.panes.clone())
+                .unwrap_or_else(|| vec![id]);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            ids.sort_by_key(|id| self.tabs.index_of(*id).unwrap_or(usize::MAX));
             self.tab_drag = Some(TabDrag {
-                id,
+                ids,
                 start: position,
                 current: position,
                 visual_x: rect.x,
+                origin_x: rect.x,
                 grab_offset: position.x - rect.x,
                 order: self.tabs.tabs().iter().map(|tab| tab.id).collect(),
                 target: self.tabs.index_of(id).unwrap_or(0),
@@ -315,6 +504,12 @@ impl BrowserShell {
                 slots: Vec::new(),
                 settled: true,
             });
+        }
+
+        if let Some(element) = hit.map(|(element, _)| element) {
+            if self.split_picker.is_some() && !element.is_split_picker() {
+                self.split_picker = None;
+            }
         }
 
         if let Some((Element::Address, rect)) = hit {
@@ -326,6 +521,7 @@ impl BrowserShell {
             self.address.set_caret(index);
             let _ = rect;
             self.context_menu = None;
+            self.split_picker = None;
             if self.show_bookmarks {
                 self.show_bookmarks = false;
                 self.editing = None;
@@ -338,6 +534,9 @@ impl BrowserShell {
             if self.context_menu.is_some() && !element.is_context() {
                 self.context_menu = None;
             }
+            if self.tab_context_menu.is_some() && !element.is_context() {
+                self.tab_context_menu = None;
+            }
             if self.show_bookmarks && !element.is_popover() {
                 self.show_bookmarks = false;
                 self.editing = None;
@@ -346,6 +545,8 @@ impl BrowserShell {
             self.activate(element);
         } else {
             self.context_menu = None;
+            self.tab_context_menu = None;
+            self.split_picker = None;
             if self.show_bookmarks {
                 self.show_bookmarks = false;
                 self.editing = None;
@@ -358,6 +559,7 @@ impl BrowserShell {
         self.pointer = position;
         self.tab_drag = None;
         self.address_dragging = false;
+        self.split_drag = None;
     }
 
     pub fn animate_tabs(&mut self) -> bool {
@@ -370,19 +572,27 @@ impl BrowserShell {
     pub fn right_click(&mut self, position: Vec2) {
         self.pointer = position;
         let hit = self.hit_at(position).map(|(element, _)| element);
-        let target = match hit {
-            Some(Element::BookmarkChip(id)) | Some(Element::PopoverRow(id)) => Some(id),
-            _ => None,
-        };
-        match target {
-            Some(id) => {
+        match hit {
+            Some(Element::BookmarkChip(id)) | Some(Element::PopoverRow(id)) => {
                 self.show_bookmarks = false;
                 self.editing = None;
+                self.tab_context_menu = None;
+                self.split_picker = None;
                 self.context_menu = Some(ContextMenu { id, position });
                 self.blur();
             }
-            None => {
+            Some(Element::Tab(id)) | Some(Element::TabClose(id)) => {
                 self.context_menu = None;
+                self.split_picker = None;
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.tab_context_menu = Some(TabContextMenu { id, position });
+                self.blur();
+            }
+            _ => {
+                self.context_menu = None;
+                self.tab_context_menu = None;
+                self.split_picker = None;
             }
         }
     }
@@ -401,6 +611,8 @@ impl BrowserShell {
         if fullscreen {
             self.show_bookmarks = false;
             self.context_menu = None;
+            self.tab_context_menu = None;
+            self.split_picker = None;
             self.blur();
         }
     }
@@ -563,8 +775,16 @@ impl BrowserShell {
     }
 
     pub fn escape(&mut self) {
+        if self.split_picker.is_some() {
+            self.split_picker = None;
+            return;
+        }
         if self.context_menu.is_some() {
             self.context_menu = None;
+            return;
+        }
+        if self.tab_context_menu.is_some() {
+            self.tab_context_menu = None;
             return;
         }
         if self.show_bookmarks {
@@ -583,18 +803,31 @@ impl BrowserShell {
             "Tab baru".to_string(),
             NavigationKind::Load,
         );
-        self.address.clear();
-        self.focus = None;
+        self.reveal_tab_in_split(id);
         self.show_bookmarks = false;
     }
 
     pub fn close_active_tab(&mut self) {
-        if let Some(id) = self.tabs.active_id() {
+        if let Some(id) = self.focused_tab_id() {
             self.close_tab(id);
         }
     }
 
     pub fn cycle_tabs(&mut self, delta: isize) {
+        if let Some(split) = self.split.as_mut() {
+            if split.panes.len() < 2 {
+                return;
+            }
+            let current = split.active_pane as isize;
+            let count = split.panes.len() as isize;
+            split.active_pane = ((current + delta + count) % count) as usize;
+            if let Some(id) = split.panes.get(split.active_pane).copied() {
+                self.tabs.activate(id);
+            }
+            self.sync_address_to_active();
+            self.focus = None;
+            return;
+        }
         if self.tabs.tabs().len() < 2 {
             return;
         }
@@ -604,7 +837,10 @@ impl BrowserShell {
     }
 
     pub fn toggle_bookmark(&mut self) {
-        let Some(tab) = self.tabs.active() else {
+        let Some(tab) = self
+            .focused_tab_id()
+            .and_then(|id| self.tabs.tab(id).cloned())
+        else {
             return;
         };
         let Some(url) = tab.url.clone() else {
@@ -637,6 +873,343 @@ impl BrowserShell {
         self.tabs.active_id()
     }
 
+    /// Tab yang sedang difokuskan WebView. Dalam split view ini adalah pane aktif.
+    pub fn focused_tab_id(&self) -> Option<TabId> {
+        self.split
+            .as_ref()
+            .and_then(|split| split.panes.get(split.active_pane).copied())
+            .or_else(|| self.tabs.active_id())
+    }
+
+    /// Rectangle WebView per pane. Header pane dan jarak antar pane tidak ikut.
+    pub fn webview_layout(&self, content: Rect) -> Vec<(TabId, Rect)> {
+        if let Some(split) = &self.split {
+            return split
+                .pane_rects(content)
+                .into_iter()
+                .zip(split.panes.iter().copied())
+                .map(|(mut rect, tab_id)| {
+                    rect.y += SPLIT_HEADER_HEIGHT;
+                    rect.height = (rect.height - SPLIT_HEADER_HEIGHT).max(0.0);
+                    (tab_id, rect)
+                })
+                .collect();
+        }
+        self.tabs
+            .active_id()
+            .map(|tab_id| vec![(tab_id, content)])
+            .unwrap_or_default()
+    }
+
+    fn update_split_divider(&mut self, index: usize, x: f32) {
+        let content = self.content_rect(self.size.x, self.size.y);
+        if content.width <= 1.0 {
+            return;
+        }
+        let ratio = (x - content.x) / content.width;
+        if let Some(split) = self.split.as_mut() {
+            split.set_divider(index, ratio);
+        }
+    }
+
+    fn sync_split_order(&mut self) {
+        let Some(panes) = self.split.as_ref().map(|split| split.panes.clone()) else {
+            return;
+        };
+        let mut ordered = panes;
+        ordered.sort_by_key(|id| self.tabs.index_of(*id).unwrap_or(usize::MAX));
+        if let Some(split) = self.split.as_mut() {
+            split.panes = ordered;
+        }
+    }
+
+    fn open_split_picker(&mut self, suggested: &[TabId], position: Vec2) {
+        let mut selected: Vec<TabId> = self
+            .tabs
+            .tabs()
+            .iter()
+            .map(|tab| tab.id)
+            .filter(|id| suggested.contains(id))
+            .collect();
+        if selected.is_empty() {
+            if let Some(id) = self.tabs.active_id() {
+                selected.push(id);
+            }
+        }
+        selected.truncate(3);
+        self.split_picker = Some(SplitPicker { selected, position });
+        self.tab_context_menu = None;
+    }
+
+    fn toggle_split_picker(&mut self, id: TabId) {
+        let order: HashMap<TabId, usize> = self
+            .tabs
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (tab.id, index))
+            .collect();
+        let Some(picker) = self.split_picker.as_mut() else {
+            return;
+        };
+        if let Some(index) = picker.selected.iter().position(|selected| *selected == id) {
+            picker.selected.remove(index);
+            return;
+        }
+        if picker.selected.len() < 3 {
+            picker.selected.push(id);
+            picker
+                .selected
+                .sort_by_key(|id| order.get(id).copied().unwrap_or(usize::MAX));
+        }
+    }
+
+    fn confirm_split_picker(&mut self) {
+        let order: HashMap<TabId, usize> = self
+            .tabs
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (tab.id, index))
+            .collect();
+        let Some(picker) = self.split_picker.as_ref() else {
+            return;
+        };
+        let mut ids = picker.selected.clone();
+        ids.sort_by_key(|id| order.get(id).copied().unwrap_or(usize::MAX));
+        ids.truncate(3);
+        if ids.len() < 2 {
+            return;
+        }
+        self.split_picker = None;
+        for id in &ids {
+            if self.tabs.is_pinned(*id) {
+                self.tabs.toggle_pin(*id);
+            }
+        }
+        let mut split = SplitView::new(ids[0], ids[1]);
+        if let Some(third) = ids.get(2) {
+            split.panes.push(*third);
+            split.active_pane = 2;
+        }
+        split.rebalance();
+        self.split = Some(split);
+        self.sync_split_order();
+        if let Some(id) = ids.last() {
+            self.tabs.activate(*id);
+        }
+        self.sync_address_to_active();
+        self.focus = None;
+    }
+
+    fn start_split(&mut self, id: TabId) {
+        let Some(active) = self.tabs.active_id() else {
+            return;
+        };
+        let second = if id == active {
+            match self.duplicate_tab(id) {
+                Some(duplicated) => duplicated,
+                None => return,
+            }
+        } else {
+            id
+        };
+        self.split = Some(SplitView::new(active, second));
+        self.sync_split_order();
+        self.tabs.activate(second);
+        self.sync_address_to_active();
+        self.tab_context_menu = None;
+        self.split_picker = None;
+    }
+
+    fn add_to_split(&mut self, id: TabId) {
+        let mut focus = None;
+        let mut started = false;
+        if let Some(split) = self.split.as_mut() {
+            if split.panes.contains(&id) || split.panes.len() >= 3 {
+                self.tab_context_menu = None;
+                self.split_picker = None;
+                return;
+            }
+            split.panes.push(id);
+            split.active_pane = split.panes.len() - 1;
+            split.rebalance();
+            focus = Some(id);
+        } else {
+            started = true;
+        }
+        if started {
+            self.start_split(id);
+            return;
+        }
+        if let Some(id) = focus {
+            self.tabs.activate(id);
+            self.sync_address_to_active();
+            self.focus = None;
+        }
+        self.tab_context_menu = None;
+        self.split_picker = None;
+    }
+
+    fn reveal_tab_in_split(&mut self, id: TabId) {
+        if self.split.is_some() {
+            if let Some(split) = self.split.as_mut() {
+                if let Some(index) = split.panes.iter().position(|pane| *pane == id) {
+                    split.active_pane = index;
+                } else if split.panes.len() < 3 {
+                    split.panes.push(id);
+                    split.active_pane = split.panes.len() - 1;
+                    split.rebalance();
+                } else {
+                    split.panes[split.active_pane] = id;
+                    split.rebalance();
+                }
+            }
+            self.sync_split_order();
+            if let Some(split) = self.split.as_mut() {
+                if let Some(index) = split.panes.iter().position(|pane| *pane == id) {
+                    split.active_pane = index;
+                }
+            }
+        }
+        self.tabs.activate(id);
+        self.sync_address_to_active();
+        self.focus = None;
+    }
+
+    fn remove_from_split(&mut self, id: TabId) {
+        self.forget_split_tab(id);
+        self.tab_context_menu = None;
+    }
+
+    fn remove_split_pane(&mut self, index: usize) {
+        let mut target = None;
+        if let Some(split) = self.split.as_mut() {
+            if index < split.panes.len() {
+                target = Some(split.panes[index]);
+            }
+        }
+        if let Some(id) = target {
+            self.forget_split_tab(id);
+        }
+    }
+
+    fn close_split(&mut self) {
+        self.split = None;
+        self.split_drag = None;
+        self.tab_context_menu = None;
+        self.split_picker = None;
+        self.sync_address_to_active();
+    }
+
+    fn forget_split_tab(&mut self, id: TabId) {
+        let mut clear = false;
+        let mut focus = None;
+        if let Some(split) = self.split.as_mut() {
+            if let Some(position) = split.panes.iter().position(|pane| *pane == id) {
+                split.panes.remove(position);
+            }
+            if split.panes.len() <= 1 {
+                clear = true;
+            } else {
+                split.rebalance();
+                focus = split.panes.get(split.active_pane).copied();
+            }
+        }
+        self.sync_split_order();
+        if clear {
+            self.split = None;
+            self.split_drag = None;
+        }
+        if let Some(id) = focus {
+            self.tabs.activate(id);
+            self.sync_address_to_active();
+            self.focus = None;
+        }
+    }
+
+    fn focus_pane(&mut self, index: usize) {
+        let id = {
+            let Some(split) = self.split.as_mut() else {
+                return;
+            };
+            if index >= split.panes.len() {
+                return;
+            }
+            split.active_pane = index;
+            split.panes[index]
+        };
+        self.tabs.activate(id);
+        self.sync_address_to_active();
+        self.focus = None;
+        self.tab_context_menu = None;
+    }
+
+    fn duplicate_tab(&mut self, id: TabId) -> Option<TabId> {
+        let tab = self.tabs.tab(id).cloned()?;
+        let duplicated = self.tabs.duplicate(id)?;
+        let url = tab.url.clone().unwrap_or_else(|| NEW_TAB_URL.to_string());
+        self.begin_load(duplicated, url, tab.title, NavigationKind::Load);
+        self.sync_address_to_active();
+        self.tab_context_menu = None;
+        Some(duplicated)
+    }
+
+    fn reload_tab(&mut self, id: TabId) {
+        let Some(tab) = self.tabs.tab(id).cloned() else {
+            return;
+        };
+        let url = tab.url.clone().unwrap_or_else(|| NEW_TAB_URL.to_string());
+        self.begin_load(id, url, tab.title, NavigationKind::Reload);
+        self.tab_context_menu = None;
+    }
+
+    fn new_tab_after(&mut self, id: TabId) {
+        let new_id = self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
+        if let Some(index) = self.tabs.index_of(id) {
+            self.tabs.move_to(new_id, index + 1);
+        }
+        self.begin_load(
+            new_id,
+            NEW_TAB_URL.to_string(),
+            "Tab baru".to_string(),
+            NavigationKind::Load,
+        );
+        self.reveal_tab_in_split(new_id);
+        self.tab_context_menu = None;
+    }
+
+    fn close_other_tabs(&mut self, id: TabId) {
+        let ids: Vec<TabId> = self
+            .tabs
+            .tabs()
+            .iter()
+            .map(|tab| tab.id)
+            .filter(|tab_id| *tab_id != id)
+            .collect();
+        for other in ids {
+            self.close_tab(other);
+        }
+        self.tab_context_menu = None;
+    }
+
+    fn close_tabs_to_right(&mut self, id: TabId) {
+        let Some(index) = self.tabs.index_of(id) else {
+            return;
+        };
+        let ids: Vec<TabId> = self
+            .tabs
+            .tabs()
+            .iter()
+            .skip(index + 1)
+            .map(|tab| tab.id)
+            .collect();
+        for other in ids {
+            self.close_tab(other);
+        }
+        self.tab_context_menu = None;
+    }
+
     /// Spinner harus terus beranimasi selama halaman dimuat dan sesaat setelahnya.
     pub fn has_animation(&self) -> bool {
         self.spin_start
@@ -653,7 +1226,12 @@ impl BrowserShell {
             return 0.0;
         };
         let elapsed = start.elapsed().as_secs_f32();
-        if elapsed > 1.2 && !self.tabs.active().is_some_and(|tab| tab.loading) {
+        if elapsed > 1.2
+            && !self
+                .focused_tab_id()
+                .and_then(|id| self.tabs.tab(id))
+                .is_some_and(|tab| tab.loading)
+        {
             return 0.0;
         }
         elapsed * 7.0
@@ -678,8 +1256,8 @@ impl BrowserShell {
         if self.fullscreen || self.bookmarks.is_empty() {
             return false;
         }
-        self.tabs
-            .active()
+        self.focused_tab_id()
+            .and_then(|id| self.tabs.tab(id))
             .and_then(|tab| tab.url.as_deref())
             .map(is_blank_url)
             .unwrap_or(true)
@@ -715,7 +1293,7 @@ impl BrowserShell {
             return;
         }
         tab.push_navigation(url.to_string());
-        if self.tabs.active_id() == Some(tab_id) && self.focus != Some(Focus::Address) {
+        if self.focused_tab_id() == Some(tab_id) && self.focus != Some(Focus::Address) {
             self.address.set_text(url);
         }
     }
@@ -738,7 +1316,10 @@ impl BrowserShell {
     }
 
     pub fn reload(&mut self) {
-        let Some(tab) = self.tabs.active() else {
+        let Some(tab) = self
+            .focused_tab_id()
+            .and_then(|id| self.tabs.tab(id).cloned())
+        else {
             return;
         };
         let tab_id = tab.id;
@@ -748,7 +1329,7 @@ impl BrowserShell {
     }
 
     pub fn go_back(&mut self) {
-        let Some(tab) = self.tabs.active_mut() else {
+        let Some(tab) = self.focused_tab_id().and_then(|id| self.tabs.tab_mut(id)) else {
             return;
         };
         if let Some(url) = tab.back() {
@@ -761,7 +1342,7 @@ impl BrowserShell {
     }
 
     pub fn go_forward(&mut self) {
-        let Some(tab) = self.tabs.active_mut() else {
+        let Some(tab) = self.focused_tab_id().and_then(|id| self.tabs.tab_mut(id)) else {
             return;
         };
         if let Some(url) = tab.forward() {
@@ -820,13 +1401,12 @@ impl BrowserShell {
             Element::FullscreenClose => {
                 self.pending_fullscreen_exit = true;
             }
-            Element::Tab(id) => {
-                self.tabs.activate(id);
-                self.sync_address_to_active();
-                self.focus = None;
-            }
+            Element::Tab(id) => self.reveal_tab_in_split(id),
             Element::TabClose(id) => self.close_tab(id),
             Element::NewTabButton => self.new_tab(),
+            Element::SplitDivider(_) => {}
+            Element::SplitPaneHeader(index) => self.focus_pane(index),
+            Element::SplitPaneClose(index) => self.remove_split_pane(index),
             Element::Address => {
                 self.focus = Some(Focus::Address);
             }
@@ -929,6 +1509,61 @@ impl BrowserShell {
                 }
                 self.context_menu = None;
             }
+            Element::TabContextArea => {}
+            Element::TabContextPin(id) => {
+                let pinned = self.tabs.toggle_pin(id);
+                if pinned == Some(true) {
+                    self.forget_split_tab(id);
+                }
+                self.sync_split_order();
+                self.tab_context_menu = None;
+            }
+            Element::TabContextDuplicate(id) => {
+                self.duplicate_tab(id);
+            }
+            Element::TabContextReload(id) => {
+                self.reload_tab(id);
+            }
+            Element::TabContextNewTabRight(id) => {
+                self.new_tab_after(id);
+            }
+            Element::TabContextSplit(id) => {
+                let position = self
+                    .tab_context_menu
+                    .map(|menu| menu.position)
+                    .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+                let active = self.tabs.active_id();
+                let mut suggested = vec![id];
+                if let Some(active) = active {
+                    if active != id {
+                        suggested.push(active);
+                    }
+                }
+                self.open_split_picker(&suggested, position);
+            }
+            Element::TabContextAddToSplit(id) => {
+                self.add_to_split(id);
+            }
+            Element::TabContextRemoveFromSplit(id) => {
+                self.remove_from_split(id);
+            }
+            Element::TabContextCloseSplit => {
+                self.close_split();
+            }
+            Element::TabContextCloseOthers(id) => {
+                self.close_other_tabs(id);
+            }
+            Element::TabContextCloseRight(id) => {
+                self.close_tabs_to_right(id);
+            }
+            Element::TabContextClose(id) => {
+                self.close_tab(id);
+                self.tab_context_menu = None;
+            }
+            Element::SplitPickerArea => {}
+            Element::SplitPickerRow(id) => self.toggle_split_picker(id),
+            Element::SplitPickerCancel => self.split_picker = None,
+            Element::SplitPickerConfirm => self.confirm_split_picker(),
         }
     }
 
@@ -952,10 +1587,18 @@ impl BrowserShell {
 
     fn close_tab(&mut self, id: TabId) {
         let was_active = self.tabs.active_id() == Some(id);
+        self.forget_split_tab(id);
         self.tabs.close(id);
         self.closed_tabs.push(id);
-        if self.tab_drag.as_ref().map(|drag| drag.id) == Some(id) {
+        if self
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| drag.ids.contains(&id))
+        {
             self.tab_drag = None;
+        }
+        if let Some(picker) = self.split_picker.as_mut() {
+            picker.selected.retain(|selected| *selected != id);
         }
         if was_active {
             self.sync_address_to_active();
@@ -965,8 +1608,8 @@ impl BrowserShell {
 
     fn sync_address_to_active(&mut self) {
         let value = self
-            .tabs
-            .active()
+            .focused_tab_id()
+            .and_then(|id| self.tabs.tab(id))
             .and_then(|tab| tab.url.clone())
             .unwrap_or_default();
         if is_blank_url(&value) {
@@ -977,7 +1620,7 @@ impl BrowserShell {
     }
 
     fn navigate(&mut self, url: String, title: String) {
-        let tab_id = if let Some(tab) = self.tabs.active_mut() {
+        let tab_id = if let Some(tab) = self.focused_tab_id().and_then(|id| self.tabs.tab_mut(id)) {
             tab.push_navigation(url.clone());
             tab.title = title.clone();
             tab.id
@@ -988,6 +1631,8 @@ impl BrowserShell {
         self.begin_load(tab_id, url, title, NavigationKind::Load);
         self.show_bookmarks = false;
         self.context_menu = None;
+        self.tab_context_menu = None;
+        self.split_picker = None;
     }
 
     fn begin_load(&mut self, tab_id: TabId, url: String, title: String, kind: NavigationKind) {
@@ -1023,8 +1668,22 @@ impl BrowserShell {
     }
 
     fn build(&mut self, width: f32, height: f32) -> Frame {
+        self.size = Vec2::new(width, height);
         let theme = self.theme;
         let tabs: Vec<Tab> = self.tabs.tabs().to_vec();
+        let split_group = self
+            .split
+            .as_ref()
+            .map(|split| {
+                let mut ids = split.panes.clone();
+                ids.sort_by_key(|id| {
+                    tabs.iter()
+                        .position(|tab| tab.id == *id)
+                        .unwrap_or(usize::MAX)
+                });
+                ids
+            })
+            .unwrap_or_default();
         let active_id = self.tabs.active_id();
         let bookmarks: Vec<Bookmark> = self.bookmarks.items().to_vec();
         let address_text = self.address.text().to_string();
@@ -1034,6 +1693,9 @@ impl BrowserShell {
         let hover = self.hover;
         let show_bookmarks = self.show_bookmarks;
         let context_menu = self.context_menu;
+        let tab_context_menu = self.tab_context_menu;
+        let split_picker = self.split_picker.clone();
+        let picker_is_open = split_picker.is_some();
 
         self.hits.clear();
         let mut frame = Frame::default();
@@ -1049,6 +1711,9 @@ impl BrowserShell {
             let viewport = Rect::new(0.0, 0.0, width, height);
             self.layout.viewport = viewport;
             self.build_viewport(base, viewport);
+            if self.split.is_some() {
+                self.build_split_view(base, viewport, hover);
+            }
             self.build_fullscreen(&mut frame, width, hover);
             return frame;
         }
@@ -1077,6 +1742,7 @@ impl BrowserShell {
             tab_strip,
             width,
             &tabs,
+            &split_group,
             active_id,
             hover,
         );
@@ -1094,6 +1760,9 @@ impl BrowserShell {
             self.build_bookmark_bar(base, bookmark_bar, width, &bookmarks, hover);
         }
         self.build_viewport(base, viewport);
+        if self.split.is_some() {
+            self.build_split_view(base, viewport, hover);
+        }
         if !self.maximized {
             base.push_rect(RectShape::bordered(
                 Rect::new(0.5, 0.5, (width - 1.0).max(0.0), (height - 1.0).max(0.0)),
@@ -1112,6 +1781,12 @@ impl BrowserShell {
 
         if let Some(menu) = context_menu {
             self.build_context_menu(&mut frame, width, height, &bookmarks, menu, hover);
+        }
+        if let Some(menu) = tab_context_menu {
+            self.build_tab_context_menu(&mut frame, width, height, menu, hover);
+        }
+        if let Some(picker) = split_picker {
+            self.build_split_picker(&mut frame, width, height, &picker, hover);
         }
 
         let tooltip = hover
@@ -1135,7 +1810,11 @@ impl BrowserShell {
                     None
                 }
             });
-        frame.popup_open = show_bookmarks || context_menu.is_some() || tooltip.is_some();
+        frame.popup_open = show_bookmarks
+            || context_menu.is_some()
+            || tab_context_menu.is_some()
+            || picker_is_open
+            || tooltip.is_some();
         if let Some((center_x, y, text)) = tooltip {
             let tooltip_width = (approx_text_width(&text, 12.0) + 16.0).min(width - 16.0);
             let x = (center_x - tooltip_width * 0.5)
@@ -1163,6 +1842,85 @@ impl BrowserShell {
         }
 
         frame
+    }
+
+    fn build_split_view(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        content: Rect,
+        hover: Option<Element>,
+    ) {
+        let Some(split) = self.split.clone() else {
+            return;
+        };
+        let theme = self.theme;
+        for (index, pane) in split.pane_rects(content).into_iter().enumerate() {
+            let header = Rect::new(
+                pane.x,
+                pane.y,
+                pane.width,
+                SPLIT_HEADER_HEIGHT.min(pane.height),
+            );
+            let is_active = index == split.active_pane;
+            layer.push_rect(RectShape::filled(
+                header,
+                if is_active {
+                    theme.tab_hover
+                } else {
+                    theme.tab_inactive
+                },
+                0.0,
+            ));
+            let Some(tab_id) = split.panes.get(index).copied() else {
+                continue;
+            };
+            let close_rect = Rect::new(header.right() - 22.0, header.y + 6.0, 16.0, 16.0);
+            if let Some(tab) = self.tabs.tab(tab_id).cloned() {
+                let favicon_rect = Rect::new(header.x + 10.0, header.y + 6.0, 14.0, 14.0);
+                if tab.loading {
+                    layer.push_icon(
+                        IconShape::new(Icon::Loader, favicon_rect, theme.accent)
+                            .rotation(self.spin_rotation()),
+                    );
+                } else {
+                    let blank = tab.url.as_deref().is_none_or(is_blank_url);
+                    let icon_source = if blank {
+                        Some((new_tab_icon(), true))
+                    } else {
+                        tab.favicon.clone().map(|source| (source, false))
+                    };
+                    if let Some((source, muted)) = icon_source {
+                        layer.push_image(ImageShape::new(source, favicon_rect).muted(muted));
+                    }
+                }
+            }
+            if hover == Some(Element::SplitPaneClose(index)) {
+                layer.push_rect(RectShape::filled(close_rect, theme.accent, 4.0));
+            }
+            layer.push_icon(IconShape::new(
+                Icon::Close,
+                icon_rect(close_rect.center(), 10.0),
+                theme.muted_foreground,
+            ));
+            self.push_hit(Element::SplitPaneHeader(index), header);
+            self.push_hit(Element::SplitPaneClose(index), close_rect);
+        }
+        for (index, divider) in split.divider_rects(content).into_iter().enumerate() {
+            let center = divider.center().x;
+            let hovered = hover == Some(Element::SplitDivider(index));
+            let color = if hovered { theme.primary } else { theme.border };
+            layer.push_rect(RectShape::filled(
+                Rect::new(center - 1.0, divider.y, 2.0, divider.height),
+                color,
+                1.0,
+            ));
+            layer.push_rect(RectShape::filled(
+                Rect::new(center - 2.0, divider.center().y - 14.0, 4.0, 28.0),
+                if hovered { theme.primary } else { theme.muted },
+                2.0,
+            ));
+            self.push_hit(Element::SplitDivider(index), divider);
+        }
     }
 
     /// Menggambar satu tab. Mengembalikan warna latar dan batas kanan judul jika judul terpotong,
@@ -1195,12 +1953,21 @@ impl BrowserShell {
 
         let close_rect = Rect::new(rect.right() - 10.0 - 20.0, rect.y + 6.0, 20.0, 20.0);
 
-        let favicon_rect = Rect::new(
-            rect.x + 10.0,
-            rect.y + (TAB_HEIGHT - TAB_ICON_SIZE) * 0.5,
-            TAB_ICON_SIZE,
-            TAB_ICON_SIZE,
-        );
+        let favicon_rect = if tab.pinned {
+            Rect::new(
+                rect.center().x - TAB_ICON_SIZE * 0.5,
+                rect.center().y - TAB_ICON_SIZE * 0.5,
+                TAB_ICON_SIZE,
+                TAB_ICON_SIZE,
+            )
+        } else {
+            Rect::new(
+                rect.x + 10.0,
+                rect.y + (TAB_HEIGHT - TAB_ICON_SIZE) * 0.5,
+                TAB_ICON_SIZE,
+                TAB_ICON_SIZE,
+            )
+        };
         // Saat memuat, ikon tab diganti spinner. Favicon lama tetap disimpan dan
         // tampil lagi begitu halaman selesai, jadi ikon tidak ikut hilang.
         if tab.loading {
@@ -1218,6 +1985,14 @@ impl BrowserShell {
             if let Some((source, muted)) = icon_source {
                 layer.push_image(ImageShape::new(source, favicon_rect).muted(muted));
             }
+        }
+        if tab.pinned {
+            layer.push_icon(IconShape::new(
+                Icon::Pin,
+                Rect::new(rect.right() - 13.0, rect.bottom() - 13.0, 9.0, 9.0),
+                theme.muted_foreground,
+            ));
+            return None;
         }
 
         let audio_rect = tab
@@ -1282,6 +2057,7 @@ impl BrowserShell {
         strip: Rect,
         width: f32,
         tabs: &[Tab],
+        split_group: &[TabId],
         active_id: Option<TabId>,
         hover: Option<Element>,
     ) {
@@ -1300,9 +2076,13 @@ impl BrowserShell {
         let naturals: Vec<f32> = tabs
             .iter()
             .map(|tab| {
-                let title = approx_text_width(&tab.title, 12.0);
-                (10.0 + TAB_ICON_SIZE + TAB_ICON_GAP + title + 8.0 + 20.0 + 10.0)
-                    .clamp(TAB_MIN_WIDTH, max_width.max(TAB_MIN_WIDTH))
+                if tab.pinned {
+                    PINNED_TAB_WIDTH
+                } else {
+                    let title = approx_text_width(&tab.title, 12.0);
+                    (10.0 + TAB_ICON_SIZE + TAB_ICON_GAP + title + 8.0 + 20.0 + 10.0)
+                        .clamp(TAB_MIN_WIDTH, max_width.max(TAB_MIN_WIDTH))
+                }
             })
             .collect();
         let mut widths = naturals.clone();
@@ -1310,10 +2090,34 @@ impl BrowserShell {
             let sum: f32 = naturals.iter().sum();
             let gaps = TAB_GAP * (tabs.len() as f32 - 1.0);
             if sum + gaps > available {
-                let scale = ((available - gaps).max(0.0) / sum.max(1.0)).clamp(0.0, 1.0);
-                widths = naturals
+                let pinned_total: f32 = tabs
                     .iter()
-                    .map(|value| (value * scale).max(TAB_MIN_WIDTH).min(*value))
+                    .zip(naturals.iter())
+                    .filter(|(tab, _)| tab.pinned)
+                    .map(|(_, width)| *width)
+                    .sum();
+                let flexible_sum = (sum - pinned_total).max(0.0);
+                let flexible_available = (available - pinned_total - gaps).max(0.0);
+                let scale = if flexible_sum > 0.0 {
+                    (flexible_available / flexible_sum).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let flexible_count = tabs.iter().filter(|tab| !tab.pinned).count().max(1) as f32;
+                let per_tab = flexible_available / flexible_count;
+                widths = tabs
+                    .iter()
+                    .zip(naturals.iter())
+                    .map(|(tab, natural)| {
+                        if tab.pinned {
+                            PINNED_TAB_WIDTH
+                        } else {
+                            (natural * scale)
+                                .max(TAB_MIN_WIDTH)
+                                .min(*natural)
+                                .min(per_tab.max(TAB_MIN_WIDTH))
+                        }
+                    })
                     .collect();
             }
         }
@@ -1330,7 +2134,7 @@ impl BrowserShell {
             .map(|(tab_x, tab_width)| tab_x + tab_width * 0.5)
             .collect();
 
-        let mut dragged_state = None;
+        let mut dragged_state: Option<(Vec<TabId>, f32)> = None;
         if let Some(drag) = self.tab_drag.as_mut() {
             if drag.dragging {
                 if drag.slots.len() != target_centers.len() {
@@ -1350,7 +2154,7 @@ impl BrowserShell {
                     settled = false;
                 }
                 drag.settled = settled;
-                dragged_state = Some((drag.id, drag.visual_x));
+                dragged_state = Some((drag.ids.clone(), drag.visual_x - drag.origin_x));
             }
         }
 
@@ -1360,28 +2164,86 @@ impl BrowserShell {
             .filter(|drag| drag.dragging)
             .map(|drag| drag.slots.clone())
             .unwrap_or_else(|| target_centers.clone());
-
-        self.tab_rects.clear();
-        // Tab yang sedang di-drag digambar paling akhir agar selalu di atas tab lain.
-        let dragged_id = dragged_state.map(|(id, _)| id);
-        let mut dragged_draw = None;
-        for (index, tab) in tabs.iter().enumerate() {
-            let tab_width = widths[index];
-            let tab_x = if dragged_state.is_some_and(|(id, _)| id == tab.id) {
-                dragged_state.map(|(_, x)| x).unwrap_or(target_xs[index])
-            } else {
-                slot_centers
+        let visual_xs: Vec<f32> = (0..tabs.len())
+            .map(|index| {
+                let base = slot_centers
                     .get(index)
                     .copied()
                     .unwrap_or(target_centers[index])
-                    - tab_width * 0.5
-            };
-            let tab_rect = Rect::new(tab_x, strip.y + 8.0, tab_width, TAB_HEIGHT);
+                    - widths[index] * 0.5;
+                match &dragged_state {
+                    Some((ids, offset)) if ids.contains(&tabs[index].id) => {
+                        target_xs[index] + offset
+                    }
+                    _ => base,
+                }
+            })
+            .collect();
+
+        let group_indices: Vec<usize> = split_group
+            .iter()
+            .filter_map(|id| tabs.iter().position(|tab| tab.id == *id))
+            .collect();
+        if group_indices.len() >= 2 {
+            let left = group_indices
+                .iter()
+                .map(|index| visual_xs[*index] - 2.0)
+                .fold(f32::INFINITY, f32::min);
+            let right = group_indices
+                .iter()
+                .map(|index| visual_xs[*index] + widths[*index] + 2.0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            layer.push_rect(RectShape::bordered(
+                Rect::new(
+                    left,
+                    strip.y + 6.0,
+                    (right - left).max(0.0),
+                    TAB_HEIGHT + 2.0,
+                ),
+                Color::TRANSPARENT,
+                TAB_RADIUS + 2.0,
+                2.0,
+                SPLIT_GROUP_COLOR,
+            ));
+            layer.push_rect(RectShape::filled(
+                Rect::new(
+                    left - 2.0,
+                    strip.y + TAB_HEIGHT - 2.0,
+                    (right - left + 4.0).max(0.0),
+                    6.0,
+                ),
+                theme.tab_strip,
+                0.0,
+            ));
+            for pair in group_indices.windows(2) {
+                let boundary = visual_xs[pair[1]] - TAB_GAP * 0.5;
+                layer.push_rect(RectShape::filled(
+                    Rect::new(
+                        boundary - 1.0,
+                        strip.y + 12.0,
+                        2.0,
+                        (TAB_HEIGHT - 8.0).max(0.0),
+                    ),
+                    SPLIT_GROUP_COLOR,
+                    1.0,
+                ));
+            }
+        }
+
+        self.tab_rects.clear();
+        // Tab yang sedang di-drag digambar paling akhir agar selalu di atas tab lain.
+        let mut dragged_draw = Vec::new();
+        for (index, tab) in tabs.iter().enumerate() {
+            let tab_width = widths[index];
+            let tab_rect = Rect::new(visual_xs[index], strip.y + 8.0, tab_width, TAB_HEIGHT);
             self.tab_rects.push((tab.id, tab_rect));
             let is_active = active_id == Some(tab.id);
             let is_hover = hover == Some(Element::Tab(tab.id));
-            if dragged_id == Some(tab.id) {
-                dragged_draw = Some((tab, tab_rect, is_hover));
+            if dragged_state
+                .as_ref()
+                .is_some_and(|(ids, _)| ids.contains(&tab.id))
+            {
+                dragged_draw.push((tab, tab_rect, is_active, is_hover));
                 continue;
             }
             let fade = self.draw_tab(layer, tab, tab_rect, is_active, is_hover, hover);
@@ -1390,8 +2252,8 @@ impl BrowserShell {
             }
         }
         // Tab yang di-drag digambar di overlay (di atas teks tab lain) dengan warna gelap penuh.
-        if let Some((tab, tab_rect, is_hover)) = dragged_draw {
-            let fade = self.draw_tab(overlay, tab, tab_rect, true, is_hover, hover);
+        for (tab, tab_rect, is_active, is_hover) in dragged_draw {
+            let fade = self.draw_tab(overlay, tab, tab_rect, is_active, is_hover, hover);
             if let Some((color, right)) = fade {
                 push_title_fade(overlay, tab_rect, right, color);
             }
@@ -2262,6 +3124,380 @@ impl BrowserShell {
 
         let _ = bookmarks;
     }
+
+    fn tab_menu_items(&self, menu: TabContextMenu) -> Vec<TabMenuItem> {
+        let Some(tab) = self.tabs.tab(menu.id).cloned() else {
+            return Vec::new();
+        };
+        let active = self.tabs.active_id();
+        let index = self.tabs.index_of(menu.id);
+        let count = self.tabs.tabs().len();
+        let split = self.split.as_ref();
+        let in_split = split.is_some_and(|split| split.panes.contains(&menu.id));
+        let can_add = split.is_some_and(|split| split.panes.len() < 3 && !in_split);
+        let can_remove = split.is_some_and(|split| split.panes.len() > 1 && in_split);
+        let mut items = Vec::new();
+        let mut push = |label: &str,
+                        element: Element,
+                        icon: Icon,
+                        destructive: bool,
+                        separator_before: bool| {
+            items.push(TabMenuItem {
+                label: label.to_string(),
+                element,
+                icon,
+                destructive,
+                separator_before,
+            });
+        };
+
+        if tab.pinned {
+            push(
+                "Unpin tab",
+                Element::TabContextPin(menu.id),
+                Icon::PinOff,
+                false,
+                false,
+            );
+        } else {
+            push(
+                "Pin tab",
+                Element::TabContextPin(menu.id),
+                Icon::Pin,
+                false,
+                false,
+            );
+        }
+        push(
+            "Duplicate",
+            Element::TabContextDuplicate(menu.id),
+            Icon::Duplicate,
+            false,
+            false,
+        );
+        push(
+            "Reload",
+            Element::TabContextReload(menu.id),
+            Icon::Reload,
+            false,
+            false,
+        );
+        push(
+            "New tab to the right",
+            Element::TabContextNewTabRight(menu.id),
+            Icon::Plus,
+            false,
+            true,
+        );
+
+        match split {
+            None => push(
+                if active == Some(menu.id) {
+                    "Choose tabs to split..."
+                } else {
+                    "Choose tabs for split..."
+                },
+                Element::TabContextSplit(menu.id),
+                Icon::Split,
+                false,
+                true,
+            ),
+            Some(_) => {
+                if can_add {
+                    push(
+                        "Add to split view",
+                        Element::TabContextAddToSplit(menu.id),
+                        Icon::Columns,
+                        false,
+                        true,
+                    );
+                }
+                if can_remove {
+                    push(
+                        "Remove from split view",
+                        Element::TabContextRemoveFromSplit(menu.id),
+                        Icon::Close,
+                        false,
+                        true,
+                    );
+                }
+                push(
+                    "Close split view",
+                    Element::TabContextCloseSplit,
+                    Icon::Split,
+                    false,
+                    true,
+                );
+            }
+        }
+
+        if count > 1 {
+            push(
+                "Close other tabs",
+                Element::TabContextCloseOthers(menu.id),
+                Icon::Close,
+                false,
+                true,
+            );
+        }
+        if index.is_some_and(|index| index + 1 < count) {
+            push(
+                "Close tabs to the right",
+                Element::TabContextCloseRight(menu.id),
+                Icon::Close,
+                false,
+                false,
+            );
+        }
+        push(
+            "Close tab",
+            Element::TabContextClose(menu.id),
+            Icon::Close,
+            true,
+            true,
+        );
+        items
+    }
+
+    fn build_split_picker(
+        &mut self,
+        frame: &mut Frame,
+        width: f32,
+        height: f32,
+        picker: &SplitPicker,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let picker_width = (TAB_CONTEXT_WIDTH + 100.0).min((width - 16.0).max(160.0));
+        let row_height = 30.0;
+        let list_height = (self.tabs.tabs().len() as f32 * row_height).min(240.0);
+        let picker_height = 8.0 + 30.0 + list_height + 8.0 + 34.0 + 8.0;
+        let x = picker
+            .position
+            .x
+            .max(8.0)
+            .min((width - picker_width - 8.0).max(8.0));
+        let y = picker
+            .position
+            .y
+            .max(8.0)
+            .min((height - picker_height - 8.0).max(8.0));
+        let rect = Rect::new(x, y, picker_width, picker_height);
+        let layer = &mut frame.overlay;
+        layer.push_rect(RectShape::bordered(
+            rect,
+            theme.popover,
+            6.0,
+            1.0,
+            theme.border,
+        ));
+        self.push_hit(Element::SplitPickerArea, rect);
+
+        layer.push_text(
+            TextShape::new(
+                "Pilih tab untuk split (maks. 3)".to_string(),
+                rect.x + 12.0,
+                rect.y + 9.0,
+                12.0,
+                theme.popover_foreground,
+            )
+            .width(rect.width - 24.0)
+            .ellipsis(),
+        );
+        let list_rect = Rect::new(rect.x + 6.0, rect.y + 38.0, rect.width - 12.0, list_height);
+        let rows: Vec<(usize, TabId, String)> = self
+            .tabs
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (index, tab.id, tab.title.clone()))
+            .collect();
+        for (index, id, title) in rows {
+            let row_rect = Rect::new(
+                list_rect.x,
+                list_rect.y + index as f32 * row_height,
+                list_rect.width,
+                row_height,
+            );
+            if row_rect.bottom() > list_rect.bottom() {
+                break;
+            }
+            if hover == Some(Element::SplitPickerRow(id)) {
+                layer.push_rect(RectShape::filled(row_rect, theme.muted, 4.0));
+            }
+            let selected = picker.selected.contains(&id);
+            let box_rect = Rect::new(row_rect.x + 10.0, row_rect.center().y - 7.0, 14.0, 14.0);
+            if selected {
+                layer.push_rect(RectShape::filled(box_rect, SPLIT_GROUP_COLOR, 3.0));
+                layer.push_icon(IconShape::new(
+                    Icon::Check,
+                    icon_rect(box_rect.center(), 10.0),
+                    theme.background,
+                ));
+            } else {
+                layer.push_rect(RectShape::bordered(
+                    box_rect,
+                    Color::TRANSPARENT,
+                    3.0,
+                    1.0,
+                    theme.border,
+                ));
+            }
+            layer.push_text(
+                TextShape::new(
+                    title,
+                    box_rect.right() + 10.0,
+                    row_rect.y + 7.0,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width((row_rect.right() - box_rect.right() - 18.0).max(0.0))
+                .ellipsis(),
+            );
+            self.push_hit(Element::SplitPickerRow(id), row_rect);
+        }
+
+        let footer_y = list_rect.bottom() + 8.0;
+        let cancel_rect = Rect::new(rect.x + 10.0, footer_y, 80.0, 32.0);
+        let confirm_rect = Rect::new(rect.right() - 10.0 - 110.0, footer_y, 110.0, 32.0);
+        let can_confirm = picker.selected.len() >= 2;
+        let cancel_hover = hover == Some(Element::SplitPickerCancel);
+        let confirm_hover = hover == Some(Element::SplitPickerConfirm);
+        layer.push_rect(RectShape::filled(
+            cancel_rect,
+            if cancel_hover {
+                theme.muted
+            } else {
+                theme.tab_inactive
+            },
+            4.0,
+        ));
+        layer.push_text(
+            TextShape::new(
+                "Batal",
+                cancel_rect.center().x - 16.0,
+                cancel_rect.y + 8.0,
+                12.0,
+                theme.popover_foreground,
+            )
+            .width(56.0),
+        );
+        layer.push_rect(RectShape::filled(
+            confirm_rect,
+            if !can_confirm {
+                theme.tab_inactive
+            } else if confirm_hover {
+                SPLIT_GROUP_COLOR.mix(Color::rgb(255, 255, 255), 0.15)
+            } else {
+                SPLIT_GROUP_COLOR
+            },
+            4.0,
+        ));
+        layer.push_text(
+            TextShape::new(
+                format!("Split ({}/3)", picker.selected.len().min(3)),
+                confirm_rect.x + 12.0,
+                confirm_rect.y + 8.0,
+                12.0,
+                if can_confirm {
+                    theme.background
+                } else {
+                    theme.muted_foreground
+                },
+            )
+            .width(confirm_rect.width - 24.0),
+        );
+        self.push_hit(Element::SplitPickerCancel, cancel_rect);
+        self.push_hit(Element::SplitPickerConfirm, confirm_rect);
+    }
+
+    fn build_tab_context_menu(
+        &mut self,
+        frame: &mut Frame,
+        width: f32,
+        height: f32,
+        menu: TabContextMenu,
+        hover: Option<Element>,
+    ) {
+        let items = self.tab_menu_items(menu);
+        if items.is_empty() {
+            return;
+        }
+        let theme = self.theme;
+        let separators = items.iter().filter(|item| item.separator_before).count() as f32;
+        let menu_height = 8.0 + items.len() as f32 * CONTEXT_ITEM_HEIGHT + separators * 6.0 + 8.0;
+        let x = menu
+            .position
+            .x
+            .max(8.0)
+            .min((width - TAB_CONTEXT_WIDTH - 8.0).max(8.0));
+        let y = menu
+            .position
+            .y
+            .max(8.0)
+            .min((height - menu_height - 8.0).max(8.0));
+        let rect = Rect::new(x, y, TAB_CONTEXT_WIDTH, menu_height);
+        let layer = &mut frame.overlay;
+        layer.push_rect(RectShape::bordered(
+            rect,
+            theme.popover,
+            6.0,
+            1.0,
+            theme.border,
+        ));
+        self.push_hit(Element::TabContextArea, rect);
+
+        let mut y = rect.y + 4.0;
+        for item in items {
+            if item.separator_before {
+                layer.push_rect(RectShape::filled(
+                    Rect::new(rect.x + 4.0, y, rect.width - 8.0, 1.0),
+                    theme.border,
+                    0.0,
+                ));
+                y += 6.0;
+            }
+            let item_rect = Rect::new(rect.x + 4.0, y, rect.width - 8.0, CONTEXT_ITEM_HEIGHT);
+            let hovered = hover == Some(item.element);
+            if hovered {
+                layer.push_rect(RectShape::filled(
+                    item_rect,
+                    if item.destructive {
+                        theme.destructive.with_alpha(0.1)
+                    } else {
+                        theme.muted
+                    },
+                    4.0,
+                ));
+            }
+            let color = if item.destructive {
+                theme.destructive
+            } else {
+                theme.popover_foreground
+            };
+            layer.push_icon(
+                IconShape::new(
+                    item.icon,
+                    icon_rect(Vec2::new(item_rect.x + 14.0, item_rect.center().y), 14.0),
+                    color,
+                )
+                .stroke(1.7),
+            );
+            layer.push_text(
+                TextShape::new(
+                    item.label,
+                    item_rect.x + 28.0,
+                    item_rect.y + 7.0,
+                    12.0,
+                    color,
+                )
+                .width((item_rect.width - 36.0).max(0.0))
+                .ellipsis(),
+            );
+            self.push_hit(item.element, item_rect);
+            y += CONTEXT_ITEM_HEIGHT;
+        }
+    }
 }
 
 fn is_blank_url(url: &str) -> bool {
@@ -2466,5 +3702,210 @@ mod tests {
             .shapes
             .iter()
             .any(|shape| shape.border_width > 0.0 && shape.rect.width >= 899.0));
+    }
+
+    #[test]
+    fn right_click_on_tab_opens_its_context_menu() {
+        let mut shell = BrowserShell::new();
+        shell.render(900.0, 600.0);
+        let position = shell.tab_rects[0].1.center();
+
+        shell.right_click(position);
+
+        assert_eq!(
+            shell.tab_context_menu.map(|menu| menu.id),
+            shell.tabs.active_id()
+        );
+        assert!(shell.context_menu.is_none());
+    }
+
+    #[test]
+    fn split_view_grows_to_three_resizable_panes() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let second = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let third = shell.active_tab_id().unwrap();
+        shell.tabs.activate(second);
+        shell.start_split(first);
+        shell.add_to_split(third);
+
+        let split = shell.split.as_ref().expect("split view");
+        assert_eq!(split.panes.len(), 3);
+        assert!(split.panes.contains(&second));
+        assert!(split.panes.contains(&first));
+        assert!(split.panes.contains(&third));
+
+        shell.update_split_divider(0, 200.0);
+        assert!((0.18..=0.34).contains(&shell.split.as_ref().unwrap().ratios[0]));
+
+        let layout = shell.webview_layout(Rect::new(0.0, 0.0, 900.0, 500.0));
+        assert_eq!(layout.len(), 3);
+        for pair in layout.windows(2) {
+            assert!(pair[0].1.right() < pair[1].1.x);
+        }
+        shell.close_split();
+        assert!(shell.split.is_none());
+    }
+
+    #[test]
+    fn split_starts_with_a_tab_picker() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let second = shell.active_tab_id().unwrap();
+        shell.tabs.activate(first);
+        shell.render(900.0, 600.0);
+        let position = shell.tab_rects[1].1.center();
+
+        shell.right_click(position);
+        let menu = shell.tab_context_menu.unwrap();
+        let split_element = shell
+            .tab_menu_items(menu)
+            .into_iter()
+            .find(|item| matches!(item.element, Element::TabContextSplit(_)))
+            .map(|item| item.element)
+            .expect("split menu item");
+        shell.activate(split_element);
+
+        assert!(shell.split.is_none());
+        assert_eq!(shell.split_picker.as_ref().unwrap().selected.len(), 2);
+        shell.activate(Element::SplitPickerRow(first));
+        assert_eq!(shell.split_picker.as_ref().unwrap().selected.len(), 1);
+        shell.activate(Element::SplitPickerConfirm);
+        assert!(shell.split.is_none());
+        shell.activate(Element::SplitPickerRow(first));
+        shell.activate(Element::SplitPickerConfirm);
+
+        let split = shell.split.as_ref().expect("split view");
+        assert_eq!(split.panes.len(), 2);
+        assert!(split.panes.contains(&first));
+        assert!(split.panes.contains(&second));
+        assert!(shell.split_picker.is_none());
+    }
+
+    #[test]
+    fn opening_new_tab_keeps_the_split_group() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let second = shell.active_tab_id().unwrap();
+        shell.tabs.activate(first);
+        shell.start_split(second);
+        let old_panes = shell.split.as_ref().unwrap().panes.clone();
+
+        shell.new_tab();
+        let new_id = shell.active_tab_id().unwrap();
+
+        assert!(!old_panes.contains(&new_id));
+        assert_eq!(shell.focused_tab_id(), Some(new_id));
+        assert!(shell.split.as_ref().unwrap().panes.contains(&new_id));
+        assert_eq!(
+            shell
+                .webview_layout(Rect::new(0.0, 0.0, 900.0, 500.0))
+                .len(),
+            3
+        );
+        let frame = shell.render(900.0, 600.0);
+        assert!(frame
+            .base
+            .shapes
+            .iter()
+            .any(|shape| shape.color == SPLIT_GROUP_COLOR && shape.border_width == 0.0));
+        assert!(frame.base.shapes.iter().any(|shape| {
+            shape.border_color == SPLIT_GROUP_COLOR
+                && shape.border_width >= 2.0
+                && shape.radius >= TAB_RADIUS
+                && shape.rect.bottom() <= TAB_STRIP_HEIGHT
+        }));
+
+        shell.activate(Element::Tab(first));
+        assert_eq!(shell.focused_tab_id(), Some(first));
+        assert!(shell.split.is_some());
+        shell.close_split();
+        assert!(shell.split.is_none());
+    }
+
+    #[test]
+    fn clicking_outside_tab_reveals_it_inside_the_split() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let second = shell.active_tab_id().unwrap();
+        shell.tabs.activate(first);
+        shell.start_split(second);
+        shell.new_tab();
+
+        let outside = shell
+            .tabs
+            .open("Luar", Some("https://example.com".to_string()));
+        shell.activate(Element::Tab(outside));
+
+        assert_eq!(shell.split.as_ref().unwrap().panes.len(), 3);
+        assert!(shell.split.as_ref().unwrap().panes.contains(&outside));
+        assert_eq!(shell.focused_tab_id(), Some(outside));
+    }
+
+    #[test]
+    fn dragging_one_split_tab_moves_the_whole_group() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let second = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        shell.new_tab();
+        shell.tabs.activate(first);
+        shell.start_split(second);
+        let frame = shell.render(900.0, 600.0);
+        assert!(frame
+            .base
+            .shapes
+            .iter()
+            .any(|shape| shape.color == SPLIT_GROUP_COLOR && shape.border_width == 0.0));
+        assert!(frame
+            .base
+            .shapes
+            .iter()
+            .filter(|shape| shape.color == SPLIT_GROUP_COLOR)
+            .all(|shape| shape.rect.bottom() <= TAB_STRIP_HEIGHT));
+        assert!(frame.base.shapes.iter().any(|shape| {
+            shape.border_color == SPLIT_GROUP_COLOR
+                && shape.border_width >= 2.0
+                && shape.radius >= TAB_RADIUS
+                && shape.rect.bottom() <= TAB_STRIP_HEIGHT
+        }));
+        assert!(frame
+            .base
+            .shapes
+            .iter()
+            .filter(|shape| shape.border_color == SPLIT_GROUP_COLOR)
+            .all(|shape| shape.rect.bottom() <= TAB_STRIP_HEIGHT));
+        let position = shell.tab_rects[1].1.center();
+
+        shell.left_click(position);
+        assert_eq!(shell.tab_drag.as_ref().unwrap().ids.len(), 2);
+        shell.render(900.0, 600.0);
+        shell.pointer_moved(Vec2::new(position.x + 300.0, position.y));
+
+        let order: Vec<TabId> = shell.tabs.tabs().iter().map(|tab| tab.id).collect();
+        let first_index = order.iter().position(|id| *id == first).unwrap();
+        let second_index = order.iter().position(|id| *id == second).unwrap();
+        assert_eq!(second_index, first_index + 1);
+        assert_eq!(shell.split.as_ref().unwrap().panes, vec![first, second]);
+    }
+
+    #[test]
+    fn context_menu_duplicate_and_pin_change_tab_state() {
+        let mut shell = BrowserShell::new();
+        let original = shell.active_tab_id().unwrap();
+        shell.duplicate_tab(original);
+        let duplicate = shell.active_tab_id().unwrap();
+        assert_ne!(duplicate, original);
+        assert_eq!(shell.tabs.tabs().len(), 2);
+
+        shell.tabs.toggle_pin(original);
+        assert_eq!(shell.tabs.tabs()[0].id, original);
+        assert!(shell.tabs.is_pinned(original));
     }
 }

@@ -24,6 +24,12 @@ pub enum Icon {
     ArrowRight,
     Menu,
     Profile,
+    Pin,
+    PinOff,
+    Split,
+    Columns,
+    Duplicate,
+    Check,
 }
 
 impl Icon {
@@ -50,6 +56,12 @@ impl Icon {
             Self::ArrowRight => Some(LucideIcon::ArrowRight),
             Self::Menu => Some(LucideIcon::Menu),
             Self::Profile => Some(LucideIcon::CircleUserRound),
+            Self::Pin => Some(LucideIcon::Pin),
+            Self::PinOff => Some(LucideIcon::PinOff),
+            Self::Split => Some(LucideIcon::Split),
+            Self::Columns => Some(LucideIcon::Columns3),
+            Self::Duplicate => Some(LucideIcon::Copy),
+            Self::Check => Some(LucideIcon::Check),
         }
     }
 }
@@ -83,6 +95,12 @@ mod tests {
             Icon::ArrowRight,
             Icon::Menu,
             Icon::Profile,
+            Icon::Pin,
+            Icon::PinOff,
+            Icon::Split,
+            Icon::Columns,
+            Icon::Duplicate,
+            Icon::Check,
         ];
         for icon in icons {
             let lucide = icon.lucide().expect("lucide icon");

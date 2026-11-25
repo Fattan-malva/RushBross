@@ -47,9 +47,10 @@ struct State {
     /// Satu WebView per tab: tab background tetap hidup sehingga audio/video tidak berhenti.
     webviews: HashMap<TabId, WebViewHost>,
     ready: HashSet<TabId>,
-    visible_webview: Option<TabId>,
-    /// Bounds WebView terakhir yang dikirim, supaya SetBounds tidak dipanggil tiap frame.
-    last_webview_bounds: Option<(TabId, i32, i32, i32, i32)>,
+    /// Semua pane yang sedang tampil (satu tab biasa, atau hingga tiga pane split).
+    visible_webviews: Vec<TabId>,
+    /// Bounds WebView terakhir per tab, supaya SetBounds tidak dipanggil tiap frame.
+    last_webview_bounds: HashMap<TabId, (i32, i32, i32, i32)>,
     window_shown: bool,
     overlay_open: bool,
     cursor: rb_ui::Vec2,
@@ -79,8 +80,8 @@ impl State {
             webview_env: None,
             webviews: HashMap::new(),
             ready: HashSet::new(),
-            visible_webview: None,
-            last_webview_bounds: None,
+            visible_webviews: Vec::new(),
+            last_webview_bounds: HashMap::new(),
             window_shown: false,
             overlay_open: false,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
@@ -140,7 +141,7 @@ impl State {
     }
 
     fn sync_active_tab(&mut self) {
-        let active = self.shell.active_tab_id();
+        let active = self.shell.focused_tab_id();
         if let (Some(env), Some(id)) = (self.webview_env.as_ref(), active) {
             env.set_active_tab(id);
         }
@@ -148,35 +149,11 @@ impl State {
         self.sync_webview_bounds();
     }
 
-    /// Hanya WebView tab aktif yang tampil; tab lain tetap berjalan di background.
-    fn sync_webview_visibility(&mut self) {
-        let target = self
-            .shell
-            .active_tab_id()
-            .filter(|id| self.ready.contains(id) && !self.overlay_open);
-        if target == self.visible_webview {
-            return;
-        }
-        if let Some(previous) = self.visible_webview {
-            if let Some(host) = self.webviews.get(&previous) {
-                if let Err(error) = host.set_visible(false) {
-                    eprintln!("webview hide: {error}");
-                }
-            }
-        }
-        if let Some(id) = target {
-            if let Some(host) = self.webviews.get(&id) {
-                if let Err(error) = host.set_visible(true) {
-                    eprintln!("webview show: {error}");
-                }
-            }
-        }
-        self.visible_webview = target;
-    }
-
-    fn content_bounds(&self) -> Rect {
+    /// Pane biasa memakai satu WebView; split view memakai hingga tiga WebView yang
+    /// semuanya tampil. Tab non-pane tetap hidup di background.
+    fn webview_layout(&self) -> Vec<(TabId, Rect)> {
         let (width, height) = self.size;
-        let rect = self.shell.content_rect(width, height);
+        let logical = self.shell.content_rect(width, height);
         let scale = self.window.scale_factor() as f32;
         // Saat fullscreen atau maximized, konten menempel ke tepi layar tanpa celah.
         let inset = if self.shell.is_fullscreen() || self.window.is_maximized() {
@@ -184,33 +161,83 @@ impl State {
         } else {
             RESIZE_EDGE
         };
-        Rect::new(
-            (rect.x + inset) * scale,
-            rect.y * scale,
-            (rect.width - inset * 2.0).max(0.0) * scale,
-            (rect.height - inset).max(0.0) * scale,
-        )
+        let inset = Rect::new(
+            logical.x + inset,
+            logical.y,
+            (logical.width - inset * 2.0).max(0.0),
+            (logical.height - inset).max(0.0),
+        );
+        self.shell
+            .webview_layout(inset)
+            .into_iter()
+            .map(|(tab_id, rect)| {
+                (
+                    tab_id,
+                    Rect::new(
+                        rect.x * scale,
+                        rect.y * scale,
+                        rect.width * scale,
+                        rect.height * scale,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn content_bounds(&self) -> Rect {
+        self.webview_layout()
+            .first()
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, 0.0, 0.0))
+    }
+
+    fn sync_webview_visibility(&mut self) {
+        let target: Vec<TabId> = if self.overlay_open {
+            Vec::new()
+        } else {
+            self.webview_layout()
+                .into_iter()
+                .filter(|(tab_id, _)| self.ready.contains(tab_id))
+                .map(|(tab_id, _)| tab_id)
+                .collect()
+        };
+        for previous in &self.visible_webviews {
+            if !target.contains(previous) {
+                if let Some(host) = self.webviews.get(previous) {
+                    if let Err(error) = host.set_visible(false) {
+                        eprintln!("webview hide: {error}");
+                    }
+                }
+            }
+        }
+        for id in &target {
+            if !self.visible_webviews.contains(id) {
+                if let Some(host) = self.webviews.get(id) {
+                    if let Err(error) = host.set_visible(true) {
+                        eprintln!("webview show: {error}");
+                    }
+                }
+            }
+        }
+        self.visible_webviews = target;
     }
 
     fn sync_webview_bounds(&mut self) {
-        let Some(active) = self.shell.active_tab_id() else {
-            return;
-        };
-        let physical = self.content_bounds();
-        let key = (
-            active,
-            physical.x.round() as i32,
-            physical.y.round() as i32,
-            physical.width.round() as i32,
-            physical.height.round() as i32,
-        );
-        if self.last_webview_bounds == Some(key) {
-            return;
-        }
-        self.last_webview_bounds = Some(key);
-        if let Some(host) = self.webviews.get(&active) {
-            if let Err(error) = host.set_bounds(physical) {
-                eprintln!("webview bounds: {error}");
+        for (tab_id, physical) in self.webview_layout() {
+            let key = (
+                physical.x.round() as i32,
+                physical.y.round() as i32,
+                physical.width.round() as i32,
+                physical.height.round() as i32,
+            );
+            if self.last_webview_bounds.get(&tab_id) == Some(&key) {
+                continue;
+            }
+            self.last_webview_bounds.insert(tab_id, key);
+            if let Some(host) = self.webviews.get(&tab_id) {
+                if let Err(error) = host.set_bounds(physical) {
+                    eprintln!("webview bounds: {error}");
+                }
             }
         }
     }
@@ -236,9 +263,8 @@ impl State {
         for tab_id in self.shell.take_closed_tabs() {
             self.webviews.remove(&tab_id);
             self.ready.remove(&tab_id);
-            if self.visible_webview == Some(tab_id) {
-                self.visible_webview = None;
-            }
+            self.last_webview_bounds.remove(&tab_id);
+            self.visible_webviews.retain(|visible| *visible != tab_id);
         }
         while let Some(request) = self.shell.take_navigation() {
             if let Err(error) = self.ensure_webview(request.tab_id) {
@@ -316,7 +342,7 @@ impl State {
         shift: bool,
         event_loop: &ActiveEventLoop,
     ) {
-        if self.shell.active_tab_id() != Some(tab_id) {
+        if self.shell.focused_tab_id() != Some(tab_id) {
             return;
         }
         let focus_shell = if ctrl && !alt {
@@ -695,7 +721,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.shell.webview_new_window(&url)
             }
             UserEvent::WebView(webview::WebViewEvent::FullScreenChanged(tab_id, enabled)) => {
-                if state.shell.active_tab_id() == Some(tab_id) {
+                if state.shell.focused_tab_id() == Some(tab_id) {
                     state.set_web_fullscreen(enabled);
                 }
                 return;
