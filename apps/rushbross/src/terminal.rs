@@ -40,6 +40,7 @@ impl PtyTerminal {
                     .map(std::path::PathBuf::from)
                     .map(|root| root.join("System32").join("cmd.exe"))
                     .filter(|path| path.is_file())
+                    .map(std::path::PathBuf::into_os_string)
             })
             .unwrap_or_else(|| "cmd.exe".into());
         let shell_path = shell_path.to_string_lossy().into_owned();
