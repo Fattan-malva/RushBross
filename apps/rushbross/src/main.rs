@@ -207,12 +207,19 @@ impl State {
                     if let Err(error) = host.set_visible(false) {
                         eprintln!("webview hide: {error}");
                     }
+                    // Tab yang disembunyikan turun ke memori rendah; tab audio tetap jalan.
+                    if let Err(error) = host.set_background(true) {
+                        eprintln!("webview background: {error}");
+                    }
                 }
             }
         }
         for id in &target {
             if !self.visible_webviews.contains(id) {
                 if let Some(host) = self.webviews.get(id) {
+                    if let Err(error) = host.set_background(false) {
+                        eprintln!("webview foreground: {error}");
+                    }
                     if let Err(error) = host.set_visible(true) {
                         eprintln!("webview show: {error}");
                     }
@@ -291,7 +298,10 @@ impl State {
 
     fn apply_chrome_action(&mut self, action: ChromeAction, event_loop: &ActiveEventLoop) {
         match action {
-            ChromeAction::Minimize => self.window.set_minimized(true),
+            ChromeAction::Minimize => {
+                self.window.set_minimized(true);
+                webview::trim_working_set();
+            }
             ChromeAction::MaximizeToggle => {
                 self.window.set_maximized(!self.window.is_maximized());
             }

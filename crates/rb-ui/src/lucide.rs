@@ -30,6 +30,10 @@ pub enum Icon {
     Columns,
     Duplicate,
     Check,
+    /// Tab kosong (halaman baru) di tab strip dan header pane.
+    Globe,
+    /// Keluar dari split view dan kembali ke satu tab penuh.
+    Unsplit,
 }
 
 impl Icon {
@@ -60,8 +64,10 @@ impl Icon {
             Self::PinOff => Some(LucideIcon::PinOff),
             Self::Split => Some(LucideIcon::Split),
             Self::Columns => Some(LucideIcon::Columns3),
-            Self::Duplicate => Some(LucideIcon::Copy),
+            Self::Duplicate => Some(LucideIcon::CopyPlus),
             Self::Check => Some(LucideIcon::Check),
+            Self::Globe => Some(LucideIcon::Globe),
+            Self::Unsplit => Some(LucideIcon::Maximize2),
         }
     }
 }
@@ -101,6 +107,8 @@ mod tests {
             Icon::Columns,
             Icon::Duplicate,
             Icon::Check,
+            Icon::Globe,
+            Icon::Unsplit,
         ];
         for icon in icons {
             let lucide = icon.lucide().expect("lucide icon");

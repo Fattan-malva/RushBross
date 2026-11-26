@@ -9,9 +9,11 @@ use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2Environment, ICoreWebView2Controller, ICoreWebView2Controller2,
-        ICoreWebView2Environment, ICoreWebView2_15, ICoreWebView2_8, COREWEBVIEW2_COLOR,
-        COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, COREWEBVIEW2_KEY_EVENT_KIND,
-        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        ICoreWebView2Environment, ICoreWebView2_15, ICoreWebView2_19, ICoreWebView2_3,
+        ICoreWebView2_8, COREWEBVIEW2_COLOR, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+        COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
     },
 };
 use webview2_com::{
@@ -19,11 +21,13 @@ use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     DocumentTitleChangedEventHandler, FaviconChangedEventHandler, GetFaviconCompletedHandler,
     IsDocumentPlayingAudioChangedEventHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, TrySuspendCompletedHandler,
 };
-use windows::core::{Interface, PCWSTR, PWSTR};
+use windows::core::{Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use winit::event_loop::EventLoopProxy;
 
@@ -516,6 +520,46 @@ impl WebViewHost {
         Ok(())
     }
 
+    /// Menurunkan pemakaian memori WebView tab yang tidak tampil. Target memori
+    /// dibuat Low dan halaman di-suspend, kecuali tab yang sedang memutar audio
+    /// supaya musik/video tidak berhenti. Saat tab tampil lagi, keduanya dikembalikan.
+    pub fn set_background(&self, background: bool) -> Result<(), String> {
+        unsafe {
+            if let Ok(webview19) = self.webview.cast::<ICoreWebView2_19>() {
+                let level = if background {
+                    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+                } else {
+                    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+                };
+                webview19
+                    .SetMemoryUsageTargetLevel(level)
+                    .map_err(|error| error.to_string())?;
+            }
+            if let Ok(webview3) = self.webview.cast::<ICoreWebView2_3>() {
+                if background {
+                    if self.is_playing_audio() {
+                        return Ok(());
+                    }
+                    let handler = TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(())));
+                    webview3
+                        .TrySuspend(&handler)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    webview3.Resume().map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_playing_audio(&self) -> bool {
+        let Ok(webview8) = self.webview.cast::<ICoreWebView2_8>() else {
+            return false;
+        };
+        let mut playing = BOOL(0);
+        unsafe { webview8.IsDocumentPlayingAudio(&mut playing) }.is_ok() && playing.0 != 0
+    }
+
     pub fn set_bounds(&self, rect: Rect) -> Result<(), String> {
         unsafe {
             self.controller
@@ -558,6 +602,15 @@ impl Drop for WebViewHost {
                 .remove_AcceleratorKeyPressed(self.tokens.accelerator);
             let _ = self.controller.Close();
         }
+    }
+}
+
+/// Mengosongkan working set proses shell. Halaman yang jarang dipakai lalu dipindah
+/// ke file paging oleh Windows dan dimuat lagi hanya saat dibutuhkan, sehingga angka
+/// RAM di Task Manager turun saat aplikasi diminimize.
+pub fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
     }
 }
 

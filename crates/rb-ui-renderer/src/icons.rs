@@ -140,6 +140,9 @@ mod tests {
             Icon::ArrowRight,
             Icon::Menu,
             Icon::Profile,
+            Icon::Globe,
+            Icon::Unsplit,
+            Icon::Duplicate,
         ];
         let mut registry = IconRegistry::default();
         for icon in icons {
