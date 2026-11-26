@@ -17,12 +17,12 @@ use webview2_com::{
     },
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
-    ContainsFullScreenElementChangedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
-    FaviconChangedEventHandler, GetFaviconCompletedHandler,
-    IsDocumentPlayingAudioChangedEventHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, TrySuspendCompletedHandler,
+    AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
+    GetFaviconCompletedHandler, IsDocumentPlayingAudioChangedEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    TrySuspendCompletedHandler,
 };
 use windows::core::{Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
@@ -80,36 +80,6 @@ const PAGE_BACKGROUND: COREWEBVIEW2_COLOR = COREWEBVIEW2_COLOR {
 };
 /// Alamat yang dilaporkan WebView2 untuk konten yang dimuat dengan NavigateToString.
 const ABOUT_BLANK: &str = "about:blank";
-
-const DISABLE_VERTICAL_OVERSCROLL_JS: &str = r#"(function () {
-  function applyRoot() {
-    try {
-      [document.documentElement, document.body].forEach(function (element) {
-        if (element && element.style) {
-          element.style.setProperty("overscroll-behavior-y", "none", "important");
-        }
-      });
-    } catch (error) {}
-  }
-  var style = document.getElementById("rb-no-vertical-overscroll");
-  if (!style) {
-    style = document.createElement("style");
-    style.id = "rb-no-vertical-overscroll";
-    style.textContent = "html,body,*{overscroll-behavior-y:none !important}";
-  }
-  function place() {
-    try {
-      (document.head || document.documentElement || document).appendChild(style);
-    } catch (error) {}
-    applyRoot();
-  }
-  try {
-    applyRoot();
-    place();
-    document.addEventListener("readystatechange", applyRoot);
-    document.addEventListener("DOMContentLoaded", place, { once: true });
-  } catch (error) {}
-})();"#;
 
 const VK_TAB: u32 = 0x09;
 const VK_LEFT: u32 = 0x25;
@@ -461,23 +431,6 @@ impl WebViewRuntime {
                     &mut accelerator_token,
                 )
                 .map_err(|error| error.to_string())?;
-        }
-
-        let script: Vec<u16> = DISABLE_VERTICAL_OVERSCROLL_JS
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let injected = webview.clone();
-        let operation = AddScriptToExecuteOnDocumentCreatedCompletedHandler::wait_for_async_operation(
-            Box::new(move |handler| unsafe {
-                injected
-                    .AddScriptToExecuteOnDocumentCreated(PCWSTR(script.as_ptr()), &handler)
-                    .map_err(webview2_com::Error::WindowsError)
-            }),
-            Box::new(|error_code, _| error_code),
-        );
-        if let Err(error) = operation {
-            eprintln!("disable vertical overscroll: {error}");
         }
 
         Ok(WebViewHost {

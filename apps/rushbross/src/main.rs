@@ -573,6 +573,7 @@ impl State {
             .webview_layout()
             .into_iter()
             .map(|(tab_id, _)| tab_id)
+            .filter(|tab_id| self.ready.contains(tab_id))
             .collect();
         for previous in &self.visible_webviews {
             if !target.contains(previous) {
