@@ -8,6 +8,7 @@ license.workspace = true
 rb-ui.workspace = true
 rb-tabs.workspace = true
 rb-bookmarks.workspace = true
+rb-terminal.workspace = true
 url.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -14,6 +14,7 @@ rb-ui.workspace = true
 rb-ui-widgets.workspace = true
 rb-ui-renderer.workspace = true
 rb-agent.workspace = true
+rb-terminal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 winit.workspace = true

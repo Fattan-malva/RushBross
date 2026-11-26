@@ -650,6 +650,7 @@ pub fn default_shell() -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -718,6 +719,7 @@ mod tests {
         assert_eq!(indexed_color(1), ANSI[1]);
     }
 
+    #[cfg(unix)]
     fn pump_until(
         terminal: &mut PtyTerminal,
         timeout: Duration,
@@ -736,6 +738,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn text_of(snapshot: &Snapshot) -> Vec<String> {
         snapshot
             .lines

@@ -60,6 +60,8 @@ pub enum WebViewEvent {
 pub enum UserEvent {
     WebView(WebViewEvent),
     Agent(AgentRequest),
+    /// Output PTY baru; UI perlu menggambar ulang isi terminal.
+    TerminalOutput,
 }
 
 struct Tokens {
