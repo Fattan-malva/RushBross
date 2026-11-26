@@ -29,6 +29,14 @@ const SPLIT_GAP: f32 = 6.0;
 const SPLIT_HEADER_HEIGHT: f32 = 28.0;
 const SPLIT_MIN_RATIO: f32 = 0.18;
 const SPLIT_GROUP_COLOR: Color = Color::rgb(0x3b, 0x82, 0xf6);
+/// Warna border per grup split. Grup baru mengambil warna pertama yang belum dipakai.
+const SPLIT_PALETTE: [Color; 5] = [
+    Color::rgb(0x3b, 0x82, 0xf6),
+    Color::rgb(0xf9, 0x73, 0x16),
+    Color::rgb(0x22, 0xc5, 0x5e),
+    Color::rgb(0xa8, 0x55, 0xf7),
+    Color::rgb(0xec, 0x48, 0x99),
+];
 const CONTEXT_ITEM_HEIGHT: f32 = 30.0;
 const TAB_CONTEXT_WIDTH: f32 = 220.0;
 
@@ -100,9 +108,10 @@ enum Element {
     TabContextReload(TabId),
     TabContextNewTabRight(TabId),
     TabContextSplit(TabId),
-    TabContextAddToSplit(TabId),
+    /// Tambahkan tab ke grup yang memuat anchor (anggota grup tujuan).
+    TabContextAddToSplit(TabId, TabId),
     TabContextRemoveFromSplit(TabId),
-    TabContextCloseSplit,
+    TabContextCloseSplit(TabId),
     TabContextCloseOthers(TabId),
     TabContextCloseRight(TabId),
     TabContextClose(TabId),
@@ -141,9 +150,9 @@ impl Element {
                 | Element::TabContextReload(_)
                 | Element::TabContextNewTabRight(_)
                 | Element::TabContextSplit(_)
-                | Element::TabContextAddToSplit(_)
+                | Element::TabContextAddToSplit(_, _)
                 | Element::TabContextRemoveFromSplit(_)
-                | Element::TabContextCloseSplit
+                | Element::TabContextCloseSplit(_)
                 | Element::TabContextCloseOthers(_)
                 | Element::TabContextCloseRight(_)
                 | Element::TabContextClose(_)
@@ -195,14 +204,16 @@ struct SplitView {
     panes: Vec<TabId>,
     ratios: [f32; 2],
     active_pane: usize,
+    color: Color,
 }
 
 impl SplitView {
-    fn new(first: TabId, second: TabId) -> Self {
+    fn new(first: TabId, second: TabId, color: Color) -> Self {
         Self {
             panes: vec![first, second],
             ratios: [0.5, 0.5],
             active_pane: 1,
+            color,
         }
     }
 
@@ -336,7 +347,8 @@ pub struct BrowserShell {
     context_menu: Option<ContextMenu>,
     tab_context_menu: Option<TabContextMenu>,
     split_picker: Option<SplitPicker>,
-    split: Option<SplitView>,
+    /// Semua grup split. Satu tab hanya boleh menjadi anggota satu grup.
+    splits: Vec<SplitView>,
     split_drag: Option<usize>,
     pointer: Vec2,
     hover: Option<Element>,
@@ -377,7 +389,7 @@ impl BrowserShell {
             context_menu: None,
             tab_context_menu: None,
             split_picker: None,
-            split: None,
+            splits: Vec::new(),
             split_drag: None,
             pointer: Vec2::new(-1000.0, -1000.0),
             hover: None,
@@ -458,29 +470,31 @@ impl BrowserShell {
             }
             // Tab yang bukan anggota grup tidak boleh masuk ke tengah grup. Jika titik
             // jatuhnya di dalam grup, tab ditempel ke sisi terdekat grup.
-            if let Some(split) = self.split.as_ref() {
+            // Berlaku untuk setiap grup yang tidak sedang di-drag utuh.
+            for split in &self.splits {
                 let is_group_drag = split.panes.len() >= 2
                     && split.panes.iter().all(|pane| drag.ids.contains(pane));
-                if !is_group_drag {
-                    let rest: Vec<TabId> = order
-                        .iter()
-                        .copied()
-                        .filter(|id| !drag.ids.contains(id))
-                        .collect();
-                    let members: Vec<usize> = rest
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, id)| split.panes.contains(id))
-                        .map(|(index, _)| index)
-                        .collect();
-                    if let (Some(&lo), Some(&hi)) = (members.first(), members.last()) {
-                        if target > lo && target <= hi {
-                            target = if target - lo <= hi + 1 - target {
-                                lo
-                            } else {
-                                hi + 1
-                            };
-                        }
+                if is_group_drag {
+                    continue;
+                }
+                let rest: Vec<TabId> = order
+                    .iter()
+                    .copied()
+                    .filter(|id| !drag.ids.contains(id))
+                    .collect();
+                let members: Vec<usize> = rest
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| split.panes.contains(id))
+                    .map(|(index, _)| index)
+                    .collect();
+                if let (Some(&lo), Some(&hi)) = (members.first(), members.last()) {
+                    if target > lo && target <= hi {
+                        target = if target - lo <= hi + 1 - target {
+                            lo
+                        } else {
+                            hi + 1
+                        };
                     }
                 }
             }
@@ -504,9 +518,7 @@ impl BrowserShell {
         }
         if let Some((Element::Tab(id), rect)) = hit {
             let mut ids = self
-                .split
-                .as_ref()
-                .filter(|split| split.panes.contains(&id))
+                .split_of(id)
                 .map(|split| split.panes.clone())
                 .unwrap_or_else(|| vec![id]);
             if !ids.contains(&id) {
@@ -826,6 +838,8 @@ impl BrowserShell {
             NavigationKind::Load,
         );
         self.activate_tab(id);
+        // Tab baru langsung siap diketik: address bar aktif dan teks terpilih.
+        self.focus_address();
         self.show_bookmarks = false;
     }
 
@@ -888,15 +902,50 @@ impl BrowserShell {
         if !self.split_is_shown() {
             return self.tabs.active_id();
         }
-        self.split
-            .as_ref()
+        self.shown_split()
             .and_then(|split| split.panes.get(split.active_pane).copied())
             .or_else(|| self.tabs.active_id())
     }
 
+    /// Grup yang memuat tab `id`, jika ada.
+    fn split_of(&self, id: TabId) -> Option<&SplitView> {
+        self.splits.iter().find(|split| split.panes.contains(&id))
+    }
+
+    fn split_index_of(&self, id: TabId) -> Option<usize> {
+        self.splits
+            .iter()
+            .position(|split| split.panes.contains(&id))
+    }
+
+    /// Indeks grup yang tampil: grup milik tab aktif, jika grup itu punya minimal dua pane.
+    fn shown_split_index(&self) -> Option<usize> {
+        let active = self.tabs.active_id()?;
+        let index = self.split_index_of(active)?;
+        (self.splits[index].panes.len() >= 2).then_some(index)
+    }
+
+    fn shown_split(&self) -> Option<&SplitView> {
+        self.shown_split_index().map(|index| &self.splits[index])
+    }
+
+    fn shown_split_mut(&mut self) -> Option<&mut SplitView> {
+        let index = self.shown_split_index()?;
+        self.splits.get_mut(index)
+    }
+
+    /// Warna pertama dari palet yang belum dipakai grup lain.
+    fn next_split_color(&self) -> Color {
+        SPLIT_PALETTE
+            .iter()
+            .copied()
+            .find(|color| self.splits.iter().all(|split| split.color != *color))
+            .unwrap_or(SPLIT_PALETTE[self.splits.len() % SPLIT_PALETTE.len()])
+    }
+
     /// Rectangle WebView per pane. Header pane dan jarak antar pane tidak ikut.
     pub fn webview_layout(&self, content: Rect) -> Vec<(TabId, Rect)> {
-        if let Some(split) = self.split.as_ref().filter(|_| self.split_is_shown()) {
+        if let Some(split) = self.shown_split() {
             return split
                 .pane_rects(content)
                 .into_iter()
@@ -920,17 +969,28 @@ impl BrowserShell {
             return;
         }
         let ratio = (x - content.x) / content.width;
-        if let Some(split) = self.split.as_mut() {
+        if let Some(split) = self.shown_split_mut() {
             split.set_divider(index, ratio);
         }
     }
 
-    /// Mengurutkan pane mengikuti tab strip dan memastikan anggota grup selalu
-    /// berdampingan. Tab non-anggota tidak boleh terselip di antara anggota grup.
+    /// Merapikan semua grup agar anggotanya berdampingan di tab strip. Merapikan satu
+    /// grup bisa menggeser grup lain, jadi diulang sampai stabil.
     fn sync_split_order(&mut self) {
-        let Some(split) = self.split.as_ref() else {
-            return;
-        };
+        for _ in 0..=self.splits.len() {
+            let mut moved = false;
+            for index in 0..self.splits.len() {
+                moved |= self.sync_split_at(index);
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    /// Merapikan satu grup. Mengembalikan `true` jika tab strip harus dipindah.
+    fn sync_split_at(&mut self, index: usize) -> bool {
+        let split = &self.splits[index];
         let active_pane = split.panes.get(split.active_pane).copied();
         let mut ordered = split.panes.clone();
         ordered.sort_by_key(|id| self.tabs.index_of(*id).unwrap_or(usize::MAX));
@@ -940,15 +1000,17 @@ impl BrowserShell {
             .collect();
         let contiguous =
             indices.len() == ordered.len() && indices.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        let mut moved = false;
         if !contiguous && !indices.is_empty() {
             self.tabs.move_group(&ordered, indices[0]);
+            moved = true;
         }
-        if let Some(split) = self.split.as_mut() {
-            split.panes = ordered;
-            split.active_pane = active_pane
-                .and_then(|id| split.panes.iter().position(|pane| *pane == id))
-                .unwrap_or(0);
-        }
+        let split = &mut self.splits[index];
+        split.panes = ordered;
+        split.active_pane = active_pane
+            .and_then(|id| split.panes.iter().position(|pane| *pane == id))
+            .unwrap_or(0);
+        moved
     }
 
     fn open_split_picker(&mut self, suggested: &[TabId], position: Vec2) {
@@ -992,6 +1054,8 @@ impl BrowserShell {
         }
     }
 
+    /// Membuat grup split baru dari tab yang dipilih. Tab yang sudah ada di grup lain
+    /// dilepas dari grup lamanya lebih dulu.
     fn confirm_split_picker(&mut self) {
         let order: HashMap<TabId, usize> = self
             .tabs
@@ -1014,14 +1078,16 @@ impl BrowserShell {
             if self.tabs.is_pinned(*id) {
                 self.tabs.toggle_pin(*id);
             }
+            self.detach_from_splits(*id);
         }
-        let mut split = SplitView::new(ids[0], ids[1]);
+        let color = self.next_split_color();
+        let mut split = SplitView::new(ids[0], ids[1], color);
         if let Some(third) = ids.get(2) {
             split.panes.push(*third);
             split.active_pane = 2;
         }
         split.rebalance();
-        self.split = Some(split);
+        self.splits.push(split);
         self.sync_split_order();
         if let Some(id) = ids.last() {
             self.activate_tab(*id);
@@ -1029,46 +1095,32 @@ impl BrowserShell {
         self.tab_context_menu = None;
     }
 
-    fn start_split(&mut self, id: TabId) {
-        let Some(active) = self.tabs.active_id() else {
-            return;
-        };
-        let second = if id == active {
-            match self.duplicate_tab(id) {
-                Some(duplicated) => duplicated,
-                None => return,
-            }
-        } else {
-            id
-        };
-        self.split = Some(SplitView::new(active, second));
-        self.sync_split_order();
-        self.activate_tab(second);
+    /// Menambahkan tab ke grup yang memuat `anchor`. Grup yang penuh atau tab yang
+    /// sudah di grup itu tidak mengubah apa pun.
+    fn add_to_split(&mut self, id: TabId, anchor: TabId) {
         self.tab_context_menu = None;
         self.split_picker = None;
-    }
-
-    fn add_to_split(&mut self, id: TabId) {
-        let mut started = false;
-        if let Some(split) = self.split.as_mut() {
-            if split.panes.contains(&id) || split.panes.len() >= 3 {
-                self.tab_context_menu = None;
-                self.split_picker = None;
-                return;
-            }
-            split.panes.push(id);
-            split.rebalance();
-        } else {
-            started = true;
-        }
-        if started {
-            self.start_split(id);
+        if self
+            .split_of(id)
+            .is_some_and(|split| split.panes.contains(&anchor))
+        {
             return;
         }
+        if self
+            .split_of(anchor)
+            .is_none_or(|split| split.panes.len() >= 3)
+        {
+            return;
+        }
+        self.detach_from_splits(id);
+        let Some(index) = self.split_index_of(anchor) else {
+            return;
+        };
+        let split = &mut self.splits[index];
+        split.panes.push(id);
+        split.rebalance();
         self.sync_split_order();
         self.activate_tab(id);
-        self.tab_context_menu = None;
-        self.split_picker = None;
     }
 
     /// Mengaktifkan tab tanpa mengubah keanggotaan split. Tab di luar grup tampil
@@ -1083,10 +1135,10 @@ impl BrowserShell {
         self.focus = None;
     }
 
-    /// Menyamakan pane aktif split dengan tab yang aktif di tab strip.
+    /// Menyamakan pane aktif setiap grup dengan tab yang aktif di tab strip.
     fn sync_active_pane(&mut self) {
         let active = self.tabs.active_id();
-        if let Some(split) = self.split.as_mut() {
+        for split in self.splits.iter_mut() {
             if let Some(index) = split.panes.iter().position(|pane| Some(*pane) == active) {
                 split.active_pane = index;
             }
@@ -1094,12 +1146,9 @@ impl BrowserShell {
     }
 
     /// Split view hanya ditampilkan saat tab aktif adalah anggota grup. Tab lain
-    /// tampil penuh, tetapi grup tetap utuh di tab strip.
+    /// tampil penuh, tetapi semua grup tetap utuh di tab strip.
     fn split_is_shown(&self) -> bool {
-        let active = self.tabs.active_id();
-        self.split.as_ref().is_some_and(|split| {
-            split.panes.len() >= 2 && split.panes.iter().any(|pane| Some(*pane) == active)
-        })
+        self.shown_split_index().is_some()
     }
 
     fn remove_from_split(&mut self, id: TabId) {
@@ -1108,55 +1157,64 @@ impl BrowserShell {
     }
 
     fn remove_split_pane(&mut self, index: usize) {
-        let mut target = None;
-        if let Some(split) = self.split.as_mut() {
-            if index < split.panes.len() {
-                target = Some(split.panes[index]);
-            }
-        }
+        let target = self
+            .shown_split()
+            .and_then(|split| split.panes.get(index).copied());
         if let Some(id) = target {
             self.forget_split_tab(id);
         }
     }
 
-    fn close_split(&mut self) {
-        self.split = None;
+    /// Membubarkan grup yang memuat `id`. Tab-tabnya tetap terbuka.
+    fn close_split(&mut self, id: TabId) {
+        self.splits.retain(|split| !split.panes.contains(&id));
         self.split_drag = None;
         self.tab_context_menu = None;
         self.split_picker = None;
         self.sync_address_to_active();
     }
 
-    fn forget_split_tab(&mut self, id: TabId) {
-        let mut clear = false;
-        let mut focus = None;
-        if let Some(split) = self.split.as_mut() {
-            let was_active = split.panes.get(split.active_pane).copied();
-            if let Some(position) = split.panes.iter().position(|pane| *pane == id) {
-                split.panes.remove(position);
-                if split.panes.len() <= 1 {
-                    clear = true;
-                } else {
-                    split.rebalance();
-                    // Jika tab yang dilepas sedang aktif, pilih tetangganya; selain itu
-                    // pane aktif tetap sama.
-                    focus = if was_active == Some(id) {
-                        split
-                            .panes
-                            .get(position.min(split.panes.len() - 1))
-                            .copied()
-                    } else {
-                        was_active
-                    };
-                }
+    /// Melepas tab dari grup mana pun tanpa mengubah tab aktif. Grup yang tersisa
+    /// kurang dari dua pane dibubarkan.
+    fn detach_from_splits(&mut self, id: TabId) {
+        for split in self.splits.iter_mut() {
+            if split.panes.contains(&id) {
+                split.panes.retain(|pane| *pane != id);
+                split.rebalance();
             }
         }
-        if clear {
-            self.split = None;
+        self.splits.retain(|split| split.panes.len() >= 2);
+    }
+
+    /// Melepas tab dari grupnya dan memilih tetangga sebagai pane aktif jika tab itu
+    /// sedang aktif.
+    fn forget_split_tab(&mut self, id: TabId) {
+        let Some(index) = self.split_index_of(id) else {
+            return;
+        };
+        let split = &mut self.splits[index];
+        let was_active = split.panes.get(split.active_pane).copied();
+        let Some(position) = split.panes.iter().position(|pane| *pane == id) else {
+            return;
+        };
+        split.panes.remove(position);
+        if split.panes.len() <= 1 {
+            self.splits.remove(index);
             self.split_drag = None;
             self.split_picker = None;
             return;
         }
+        split.rebalance();
+        // Jika tab yang dilepas sedang aktif, pilih tetangganya; selain itu pane aktif
+        // tetap sama.
+        let focus = if was_active == Some(id) {
+            split
+                .panes
+                .get(position.min(split.panes.len() - 1))
+                .copied()
+        } else {
+            was_active
+        };
         self.sync_split_order();
         if let Some(id) = focus {
             self.activate_tab(id);
@@ -1165,7 +1223,7 @@ impl BrowserShell {
 
     fn focus_pane(&mut self, index: usize) {
         let id = {
-            let Some(split) = self.split.as_mut() else {
+            let Some(split) = self.shown_split_mut() else {
                 return;
             };
             if index >= split.panes.len() {
@@ -1576,14 +1634,14 @@ impl BrowserShell {
                 }
                 self.open_split_picker(&suggested, position);
             }
-            Element::TabContextAddToSplit(id) => {
-                self.add_to_split(id);
+            Element::TabContextAddToSplit(id, anchor) => {
+                self.add_to_split(id, anchor);
             }
             Element::TabContextRemoveFromSplit(id) => {
                 self.remove_from_split(id);
             }
-            Element::TabContextCloseSplit => {
-                self.close_split();
+            Element::TabContextCloseSplit(id) => {
+                self.close_split(id);
             }
             Element::TabContextCloseOthers(id) => {
                 self.close_other_tabs(id);
@@ -1706,9 +1764,10 @@ impl BrowserShell {
         self.size = Vec2::new(width, height);
         let theme = self.theme;
         let tabs: Vec<Tab> = self.tabs.tabs().to_vec();
-        let split_group = self
-            .split
-            .as_ref()
+        // Setiap grup membawa warnanya sendiri untuk bracket border di tab strip.
+        let split_groups: Vec<(Color, Vec<TabId>)> = self
+            .splits
+            .iter()
             .map(|split| {
                 let mut ids = split.panes.clone();
                 ids.sort_by_key(|id| {
@@ -1716,9 +1775,9 @@ impl BrowserShell {
                         .position(|tab| tab.id == *id)
                         .unwrap_or(usize::MAX)
                 });
-                ids
+                (split.color, ids)
             })
-            .unwrap_or_default();
+            .collect();
         let active_id = self.tabs.active_id();
         let bookmarks: Vec<Bookmark> = self.bookmarks.items().to_vec();
         let address_text = self.address.text().to_string();
@@ -1777,7 +1836,7 @@ impl BrowserShell {
             tab_strip,
             width,
             &tabs,
-            &split_group,
+            &split_groups,
             active_id,
             hover,
         );
@@ -1885,7 +1944,7 @@ impl BrowserShell {
         content: Rect,
         hover: Option<Element>,
     ) {
-        let Some(split) = self.split.clone() else {
+        let Some(split) = self.shown_split().cloned() else {
             return;
         };
         let theme = self.theme;
@@ -2076,7 +2135,7 @@ impl BrowserShell {
         strip: Rect,
         width: f32,
         tabs: &[Tab],
-        split_group: &[TabId],
+        split_groups: &[(Color, Vec<TabId>)],
         active_id: Option<TabId>,
         hover: Option<Element>,
     ) {
@@ -2199,20 +2258,28 @@ impl BrowserShell {
             })
             .collect();
 
-        let group_indices: Vec<usize> = split_group
-            .iter()
-            .filter_map(|id| tabs.iter().position(|tab| tab.id == *id))
-            .collect();
-        // Satu bracket per run tab yang berdampingan. Tab non-anggota di antara dua
-        // run tidak pernah ikut terkurung.
-        let mut runs: Vec<Vec<usize>> = Vec::new();
-        for index in group_indices {
-            match runs.last_mut() {
-                Some(run) if run.last().is_some_and(|last| last + 1 == index) => run.push(index),
-                _ => runs.push(vec![index]),
+        // Satu bracket per run tab yang berdampingan, dengan warna grupnya. Tab non-anggota
+        // di antara dua run tidak pernah ikut terkurung.
+        let mut runs: Vec<(Color, Vec<usize>)> = Vec::new();
+        for (color, ids) in split_groups {
+            let group_indices: Vec<usize> = ids
+                .iter()
+                .filter_map(|id| tabs.iter().position(|tab| tab.id == *id))
+                .collect();
+            for index in group_indices {
+                match runs.last_mut() {
+                    Some((run_color, run))
+                        if *run_color == *color
+                            && run.last().is_some_and(|last| last + 1 == index) =>
+                    {
+                        run.push(index)
+                    }
+                    _ => runs.push((*color, vec![index])),
+                }
             }
         }
-        for run in runs.iter().filter(|run| run.len() >= 2) {
+        for (color, run) in runs.iter().filter(|(_, run)| run.len() >= 2) {
+            let color = *color;
             let left = run
                 .iter()
                 .map(|index| visual_xs[*index] - 2.0)
@@ -2231,7 +2298,7 @@ impl BrowserShell {
                 Color::TRANSPARENT,
                 TAB_RADIUS + 2.0,
                 2.0,
-                SPLIT_GROUP_COLOR,
+                color,
             ));
             layer.push_rect(RectShape::filled(
                 Rect::new(
@@ -2252,7 +2319,7 @@ impl BrowserShell {
                         2.0,
                         (TAB_HEIGHT - 8.0).max(0.0),
                     ),
-                    SPLIT_GROUP_COLOR,
+                    color,
                     1.0,
                 ));
             }
@@ -3157,13 +3224,8 @@ impl BrowserShell {
         let Some(tab) = self.tabs.tab(menu.id).cloned() else {
             return Vec::new();
         };
-        let active = self.tabs.active_id();
         let index = self.tabs.index_of(menu.id);
         let count = self.tabs.tabs().len();
-        let split = self.split.as_ref();
-        let in_split = split.is_some_and(|split| split.panes.contains(&menu.id));
-        let can_add = split.is_some_and(|split| split.panes.len() < 3 && !in_split);
-        let can_remove = split.is_some_and(|split| split.panes.len() > 1 && in_split);
         let mut items = Vec::new();
         let mut push = |label: &str,
                         element: Element,
@@ -3218,44 +3280,45 @@ impl BrowserShell {
             true,
         );
 
-        match split {
-            None => push(
-                if active == Some(menu.id) {
-                    "Choose tabs to split..."
-                } else {
-                    "Choose tabs for split..."
-                },
-                Element::TabContextSplit(menu.id),
-                Icon::Split,
-                false,
-                true,
-            ),
+        // Selalu ada "Add split..." untuk membuat grup baru dari beberapa tab.
+        push(
+            "Add split...",
+            Element::TabContextSplit(menu.id),
+            Icon::Split,
+            false,
+            true,
+        );
+        match self.split_index_of(menu.id) {
             Some(_) => {
-                if can_add {
-                    push(
-                        "Add to split view",
-                        Element::TabContextAddToSplit(menu.id),
-                        Icon::Columns,
-                        false,
-                        true,
-                    );
-                }
-                if can_remove {
-                    push(
-                        "Remove from split view",
-                        Element::TabContextRemoveFromSplit(menu.id),
-                        Icon::Close,
-                        false,
-                        true,
-                    );
-                }
+                push(
+                    "Remove from split view",
+                    Element::TabContextRemoveFromSplit(menu.id),
+                    Icon::Close,
+                    false,
+                    true,
+                );
                 push(
                     "Close split view",
-                    Element::TabContextCloseSplit,
+                    Element::TabContextCloseSplit(menu.id),
                     Icon::Unsplit,
                     false,
                     true,
                 );
+            }
+            None => {
+                // Satu item per grup yang masih punya tempat. Anchor adalah anggota grup
+                // itu, sehingga tab tujuan tetap benar walau indeks grup bergeser.
+                for (index, split) in self.splits.iter().enumerate() {
+                    if split.panes.len() < 3 {
+                        push(
+                            &format!("Add to Grup {}", index + 1),
+                            Element::TabContextAddToSplit(menu.id, split.panes[0]),
+                            Icon::Columns,
+                            false,
+                            true,
+                        );
+                    }
+                }
             }
         }
 
@@ -3676,6 +3739,31 @@ fn push_title_fade(layer: &mut rb_ui::Layer, rect: Rect, title_right: f32, color
 
 #[cfg(test)]
 mod tests {
+
+    /// Pembantu pengujian: membuat grup dari tab aktif dan `id`. Jika `id` adalah tab
+    /// aktif, tab itu diduplikasi lebih dulu (perilaku split langsung dari menu).
+    impl BrowserShell {
+        fn start_split(&mut self, id: TabId) {
+            let Some(active) = self.tabs.active_id() else {
+                return;
+            };
+            let second = if id == active {
+                match self.duplicate_tab(id) {
+                    Some(duplicated) => duplicated,
+                    None => return,
+                }
+            } else {
+                id
+            };
+            self.detach_from_splits(active);
+            self.detach_from_splits(second);
+            let color = self.next_split_color();
+            self.splits.push(SplitView::new(active, second, color));
+            self.sync_split_order();
+            self.activate_tab(second);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -3719,6 +3807,47 @@ mod tests {
         let mut shell = BrowserShell::new();
         shell.toggle_bookmark();
         assert!(shell.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn new_tab_focuses_the_address_bar() {
+        let mut shell = BrowserShell::new();
+        shell.new_tab();
+        assert!(shell.is_editing());
+        assert_eq!(shell.focus, Some(Focus::Address));
+    }
+
+    #[test]
+    fn each_split_group_gets_its_own_border_color() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.start_split(first);
+        shell.new_tab();
+        let c = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let d = shell.active_tab_id().unwrap();
+        shell.start_split(c);
+        assert_eq!(shell.splits.len(), 2);
+        assert_ne!(shell.splits[0].color, shell.splits[1].color);
+        assert!(shell.split_of(d).is_none());
+    }
+
+    #[test]
+    fn add_to_split_joins_the_chosen_group_only() {
+        let mut shell = BrowserShell::new();
+        let first = shell.active_tab_id().unwrap();
+        shell.start_split(first);
+        shell.new_tab();
+        let c = shell.active_tab_id().unwrap();
+        shell.new_tab();
+        let e = shell.active_tab_id().unwrap();
+        shell.start_split(c);
+        let anchor = shell.splits[0].panes[0];
+        shell.add_to_split(e, anchor);
+        assert_eq!(shell.splits.len(), 2);
+        assert_eq!(shell.splits[0].panes.len(), 3);
+        assert!(shell.splits[0].panes.contains(&e));
+        assert_eq!(shell.splits[1].panes.len(), 2);
     }
 
     #[test]
@@ -3766,24 +3895,24 @@ mod tests {
         let third = shell.active_tab_id().unwrap();
         shell.tabs.activate(second);
         shell.start_split(first);
-        shell.add_to_split(third);
+        shell.add_to_split(third, first);
 
-        let split = shell.split.as_ref().expect("split view");
+        let split = shell.shown_split().expect("split view");
         assert_eq!(split.panes.len(), 3);
         assert!(split.panes.contains(&second));
         assert!(split.panes.contains(&first));
         assert!(split.panes.contains(&third));
 
         shell.update_split_divider(0, 200.0);
-        assert!((0.18..=0.34).contains(&shell.split.as_ref().unwrap().ratios[0]));
+        assert!((0.18..=0.34).contains(&shell.shown_split().unwrap().ratios[0]));
 
         let layout = shell.webview_layout(Rect::new(0.0, 0.0, 900.0, 500.0));
         assert_eq!(layout.len(), 3);
         for pair in layout.windows(2) {
             assert!(pair[0].1.right() < pair[1].1.x);
         }
-        shell.close_split();
-        assert!(shell.split.is_none());
+        shell.close_split(second);
+        assert!(shell.splits.is_empty());
     }
 
     #[test]
@@ -3806,16 +3935,16 @@ mod tests {
             .expect("split menu item");
         shell.activate(split_element);
 
-        assert!(shell.split.is_none());
+        assert!(shell.splits.is_empty());
         assert_eq!(shell.split_picker.as_ref().unwrap().selected.len(), 2);
         shell.activate(Element::SplitPickerRow(first));
         assert_eq!(shell.split_picker.as_ref().unwrap().selected.len(), 1);
         shell.activate(Element::SplitPickerConfirm);
-        assert!(shell.split.is_none());
+        assert!(shell.splits.is_empty());
         shell.activate(Element::SplitPickerRow(first));
         shell.activate(Element::SplitPickerConfirm);
 
-        let split = shell.split.as_ref().expect("split view");
+        let split = shell.shown_split().expect("split view");
         assert_eq!(split.panes.len(), 2);
         assert!(split.panes.contains(&first));
         assert!(split.panes.contains(&second));
@@ -3830,13 +3959,13 @@ mod tests {
         let second = shell.active_tab_id().unwrap();
         shell.tabs.activate(first);
         shell.start_split(second);
-        let old_panes = shell.split.as_ref().unwrap().panes.clone();
+        let old_panes = shell.shown_split().unwrap().panes.clone();
 
         shell.new_tab();
         let new_id = shell.active_tab_id().unwrap();
 
         assert!(!old_panes.contains(&new_id));
-        assert_eq!(shell.split.as_ref().unwrap().panes, old_panes);
+        assert_eq!(shell.shown_split().unwrap().panes, old_panes);
         assert_eq!(shell.focused_tab_id(), Some(new_id));
         // Tab baru tampil penuh, bukan di dalam split view.
         assert_eq!(
@@ -3862,8 +3991,8 @@ mod tests {
                 .len(),
             2
         );
-        shell.close_split();
-        assert!(shell.split.is_none());
+        shell.close_split(first);
+        assert!(shell.splits.is_empty());
     }
 
     #[test]
@@ -3874,7 +4003,7 @@ mod tests {
         let second = shell.active_tab_id().unwrap();
         shell.tabs.activate(first);
         shell.start_split(second);
-        let before = shell.split.as_ref().unwrap().clone();
+        let before = shell.shown_split().unwrap().clone();
 
         shell.cycle_tabs(1);
         shell.cycle_tabs(1);
@@ -3885,7 +4014,7 @@ mod tests {
         shell.activate(Element::Tab(outside));
         shell.cycle_tabs(-1);
 
-        let after = shell.split.as_ref().expect("group still exists");
+        let after = shell.shown_split().expect("group still exists");
         assert_eq!(after.panes, before.panes);
         assert_eq!(after.ratios, before.ratios);
 
@@ -3907,15 +4036,15 @@ mod tests {
         let second = shell.active_tab_id().unwrap();
         shell.tabs.activate(first);
         shell.start_split(second);
-        let panes = shell.split.as_ref().unwrap().panes.clone();
+        let panes = shell.shown_split().unwrap().panes.clone();
 
         let outside = shell
             .tabs
             .open("Luar", Some("https://example.com".to_string()));
         shell.activate(Element::Tab(outside));
 
-        assert_eq!(shell.split.as_ref().unwrap().panes, panes);
-        assert!(!shell.split.as_ref().unwrap().panes.contains(&outside));
+        assert_eq!(shell.shown_split().unwrap().panes, panes);
+        assert!(!shell.shown_split().unwrap().panes.contains(&outside));
         assert_eq!(shell.focused_tab_id(), Some(outside));
         assert_eq!(
             shell
@@ -3956,7 +4085,7 @@ mod tests {
         let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
         shell.tabs.activate(b);
         shell.start_split(c);
-        assert_eq!(shell.split.as_ref().unwrap().panes, vec![b, c]);
+        assert_eq!(shell.shown_split().unwrap().panes, vec![b, c]);
 
         shell.render(900.0, 600.0);
         let from = shell.tab_rects.iter().find(|(id, _)| *id == d).unwrap().1;
@@ -4024,7 +4153,7 @@ mod tests {
         let first_index = order.iter().position(|id| *id == first).unwrap();
         let second_index = order.iter().position(|id| *id == second).unwrap();
         assert_eq!(second_index, first_index + 1);
-        assert_eq!(shell.split.as_ref().unwrap().panes, vec![first, second]);
+        assert_eq!(shell.shown_split().unwrap().panes, vec![first, second]);
     }
 
     #[test]
