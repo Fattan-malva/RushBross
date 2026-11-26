@@ -19,12 +19,12 @@ use windows::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleWindow, WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0,
     KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AttachThreadInput, GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId, IsChild,
-    SetParent, SetWindowLongW, SetWindowPos, ShowWindow, GUITHREADINFO, GWL_STYLE, HWND_TOP,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId, IsChild, SetParent, SetWindowLongW,
+    SetWindowPos, ShowWindow, GUITHREADINFO, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
 };
 
 /// Shell bawaan Windows: COMSPEC (biasanya cmd.exe), sama seperti terminal bawaan.
