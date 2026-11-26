@@ -67,11 +67,9 @@ impl PtyTerminal {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        let data: Vec<u8> = chunk[..count]
-                            .iter()
-                            .copied()
-                            .filter(|byte| *byte != 7)
-                            .collect();
+                        // BEL (0x07) tetap dikirim: ia penutup urutan OSC (judul jendela)
+                        // dan diabaikan oleh parser. Membuangnya membuat parser macet di OSC.
+                        let data: Vec<u8> = chunk[..count].to_vec();
                         if !data.is_empty() {
                             if tx.send(data).is_err() {
                                 break;
@@ -149,6 +147,10 @@ enum Mode {
     Escape,
     Csi,
     Osc,
+    /// Baru saja melihat ESC di dalam OSC; karakter berikutnya `\` menutup OSC (ST).
+    OscEscape,
+    /// Setelah `ESC (`, `ESC )`, dst: satu karakter pemilih charset dilewati.
+    Charset,
 }
 
 struct TerminalBuffer {
@@ -192,17 +194,20 @@ impl TerminalBuffer {
         let text = String::from_utf8_lossy(bytes);
         for ch in text.chars() {
             match self.mode {
-                Mode::Osc => {
-                    if ch == '\x07' {
-                        self.mode = Mode::Normal;
-                    }
-                }
+                Mode::Osc => match ch {
+                    '\x07' => self.mode = Mode::Normal,
+                    '\x1b' => self.mode = Mode::OscEscape,
+                    _ => {}
+                },
+                Mode::OscEscape => self.mode = Mode::Normal,
+                Mode::Charset => self.mode = Mode::Normal,
                 Mode::Escape => match ch {
                     '[' => {
                         self.csi.clear();
                         self.mode = Mode::Csi;
                     }
                     ']' => self.mode = Mode::Osc,
+                    '(' | ')' | '*' | '+' | '#' | '%' => self.mode = Mode::Charset,
                     _ => self.mode = Mode::Normal,
                 },
                 Mode::Csi => {
@@ -306,6 +311,23 @@ mod tests {
     use super::*;
     use std::thread::sleep;
     use std::time::Duration;
+
+    #[test]
+    fn buffer_keeps_output_after_osc_title_terminated_by_bel_or_st() {
+        let mut buffer = TerminalBuffer::new(100, 30);
+        buffer.feed(b"\x1b]0;C:\\RushBross\x07C:\\RushBross>echo hi\r\nhi\r\n");
+        buffer.feed(b"\x1b]0;title\x1b\\prompt> ");
+        assert_eq!(buffer.lines()[0], "C:\\RushBross>echo hi");
+        assert_eq!(buffer.lines()[1], "hi");
+        assert_eq!(buffer.lines()[2], "prompt> ");
+    }
+
+    #[test]
+    fn buffer_skips_charset_selection_and_erase_sequences() {
+        let mut buffer = TerminalBuffer::new(100, 30);
+        buffer.feed(b"\x1b(Bok\x1b[Kx");
+        assert_eq!(buffer.lines()[0], "okx");
+    }
 
     #[test]
     fn pty_starts_and_captures_output() {
