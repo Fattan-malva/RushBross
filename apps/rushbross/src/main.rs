@@ -100,11 +100,25 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
+const TOOL_NAMES: &[&str] = &[
+    "browser_state",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_scroll",
+    "browser_screenshot",
+    "browser_select",
+    "browser_get_selection",
+    "browser_tabs",
+    "browser_hover",
+    "browser_eval",
+];
+
 /// Nama tool yang diiklankan lewat `tools/list`. Pemanggilan nama lain dibalas error protokol.
 fn is_known_tool(name: &str) -> bool {
-    tool_definitions()
-        .as_array()
-        .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+    TOOL_NAMES.contains(&name)
 }
 
 /// Token acak per sesi. Dibuat dari RandomState (seed acak OS), bukan waktu/PID saja.
@@ -124,10 +138,18 @@ fn new_session_token() -> String {
 
 fn tool_channel(reply: Sender<String>, id: Option<Value>) -> mpsc::Sender<Result<Value, String>> {
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        if let Ok(result) = receiver.recv() {
+    std::thread::spawn(move || match receiver.recv_timeout(rb_agent::REQUEST_TIMEOUT) {
+        Ok(result) => {
             let _ = reply.send(json_rpc(id, Ok(tool_content(result))));
         }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let message = format!(
+                "RushBross did not complete the tool call within {} seconds",
+                rb_agent::REQUEST_TIMEOUT.as_secs()
+            );
+            let _ = reply.send(json_rpc(id, Ok(tool_content(Err(message)))));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
     });
     sender
 }
@@ -449,7 +471,7 @@ Available tools:
 - `browser_select`: ask the user to pick an element with the green cursor.
 - `browser_get_selection`: get details of the last element selected by the user.
 
-Suggested flow: call `browser_state`, then `browser_snapshot`, perform the action, and verify with `browser_snapshot` or `browser_screenshot`. The green cursor marks agent actions. When the user selects an element in Select mode, a summary is also sent to this terminal automatically, but `browser_get_selection` returns full details. For ordinary web exploration, use these tools as freely as a person would use a browser; ask for confirmation only for destructive or paid actions."#;
+Suggested flow: call `browser_state`, then `browser_snapshot`, perform the action, and verify with `browser_snapshot` or `browser_screenshot`. Always use these browser tools for visible actions; the green cursor is moved automatically on every click, hover, type, press, and scroll so the user can follow along. Use `browser_hover` to point at an element before reading it when helpful. Never render a gear emoji as a RushBross tool icon. When the user selects an element in Select mode, a summary is also sent to this terminal automatically, but `browser_get_selection` returns full details. For ordinary web exploration, use these tools as freely as a person would use a browser; ask for confirmation only for destructive or paid actions."#;
 
 struct ManagedFile {
     path: std::path::PathBuf,
@@ -1127,18 +1149,34 @@ impl State {
     }
 
     fn scroll_terminal(&mut self, delta: winit::event::MouseScrollDelta, point: rb_ui::Vec2) -> bool {
-        if self.terminal.is_none() || !self.shell.terminal_pane_at(point) {
+        if !self.shell.terminal_scroll_at(point) {
             return false;
         }
-        let lines = (wheel_lines(delta) * 3.0).round() as i32;
+        let raw = wheel_lines(delta);
+        let mut lines = (raw * 3.0).round() as i32;
+        if lines == 0 && raw != 0.0 {
+            lines = if raw > 0.0 { 1 } else { -1 };
+        }
         if lines == 0 {
             return false;
         }
-        if let Some(terminal) = self.terminal.as_mut() {
-            terminal.scroll(lines);
+        let Some(terminal) = self.terminal.as_mut() else {
+            return false;
+        };
+        if !terminal.scroll(lines) {
+            return false;
         }
-        self.pump_terminal();
+        let snapshot = terminal.snapshot().clone();
+        self.shell.set_terminal_snapshot(snapshot);
         true
+    }
+
+    fn show_agent_cursor_home(&self) {
+        if let Some(tab_id) = self.shell.focused_tab_id() {
+            if let Some(host) = self.webviews.get(&tab_id) {
+                host.move_cursor(24.0, 24.0);
+            }
+        }
     }
 
     fn handle_agent_request(&mut self, request: AgentRequest) {
@@ -1156,7 +1194,7 @@ impl State {
                             "prompts": { "listChanged": false }
                         },
                         "serverInfo": { "name": "rushbross", "version": env!("CARGO_PKG_VERSION") },
-                        "instructions": "Use the browser_* tools to control RushBross like a real browser: state, navigate, snapshot, click, type, press, scroll, screenshot, tabs, hover, eval, select, and get_selection. The green cursor marks agent actions. browser_get_selection returns the element selected by the user in Select mode."
+                        "instructions": "Use the browser_* tools to control RushBross like a real browser: state, navigate, snapshot, click, type, press, scroll, screenshot, tabs, hover, eval, select, and get_selection. The green cursor marks every agent action and is moved automatically by the browser tools; keep using these tools instead of raw shell commands. browser_get_selection returns the element selected by the user in Select mode. Never render a gear emoji as a RushBross tool icon."
                     })),
                 )
             }
@@ -1213,6 +1251,7 @@ impl State {
                 match action {
                     "new" => {
                         self.shell.new_tab();
+                        self.show_agent_cursor_home();
                         self.redraw();
                         ok(json!({ "ok": true }))
                     }
@@ -1221,6 +1260,7 @@ impl State {
                             return Some(Err("id is required".to_string()));
                         };
                         if self.shell.activate_tab_by_id(TabId(id)) {
+                            self.show_agent_cursor_home();
                             self.redraw();
                             ok(json!({ "ok": true }))
                         } else {
@@ -1270,6 +1310,7 @@ impl State {
                     return Some(Err("url is required".to_string()));
                 };
                 self.shell.navigate_active(url.to_string());
+                self.show_agent_cursor_home();
                 self.redraw();
                 ok(json!({ "ok": true, "url": url }))
             }
@@ -1319,6 +1360,7 @@ impl State {
                     let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                     let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
                     host.move_cursor(x, y);
+                    host.cursor_click(x, y);
                     host.click_at(x, y, tool_channel(reply, id));
                 }
                 None
@@ -1340,12 +1382,13 @@ impl State {
                 }
                 if let Some(selector) = args.get("selector").and_then(Value::as_str) {
                     let expression = format!(
-                        "(function(){{var el=document.querySelector({}); if(!el)return false; el.focus(); window.__rbAgentCursor.type(); document.execCommand('insertText',false,{}); return true;}})()",
+                        "(function(){{var el=document.querySelector({}); if(!el)return false; var r=el.getBoundingClientRect(); window.__rbAgentCursor.move(r.x+r.width/2,r.y+r.height/2); el.focus(); window.__rbAgentCursor.type(); document.execCommand('insertText',false,{}); return true;}})()",
                         js_string(selector),
                         js_string(&inserted)
                     );
                     host.eval(&expression, tool_channel(reply, id));
                 } else {
+                    host.cursor_type();
                     host.insert_text(text, tool_channel(reply, id));
                 }
                 None
@@ -1360,6 +1403,7 @@ impl State {
                 let Some(key) = args.get("key").and_then(Value::as_str) else {
                     return Some(Err("key is required".to_string()));
                 };
+                host.cursor_type();
                 host.press_key(key, tool_channel(reply, id));
                 None
             }
@@ -1372,7 +1416,9 @@ impl State {
                 };
                 let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-                let expression = format!("window.scrollBy({x},{y}); true");
+                let expression = format!(
+                    "window.__rbAgentCursor.move({x},{y}); window.scrollBy({x},{y}); true"
+                );
                 host.eval(&expression, tool_channel(reply, id));
                 None
             }
@@ -1695,7 +1741,15 @@ impl State {
                 self.draw_overlay();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.shell.folder_picker_scroll(wheel_lines(delta)) {
+                let local = self
+                    .overlay
+                    .as_ref()
+                    .map(|overlay| overlay.cursor)
+                    .unwrap_or(rb_ui::Vec2::new(-1000.0, -1000.0));
+                let point = self.overlay_point(local);
+                if self.scroll_terminal(delta, point)
+                    || self.shell.folder_picker_scroll(wheel_lines(delta))
+                {
                     self.draw();
                     self.draw_overlay();
                 }
@@ -2470,6 +2524,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Agent(request) => {
                 state.handle_agent_request(request);
+                state.pump_navigation();
+                state.redraw();
                 return;
             }
             UserEvent::TerminalOutput => {

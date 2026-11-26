@@ -272,11 +272,16 @@ impl PtyTerminal {
     }
 
     /// Gulir riwayat. `lines` positif = ke atas (riwayat), negatif = ke bawah.
-    pub fn scroll(&mut self, lines: i32) {
-        if lines != 0 {
-            self.term.scroll_display(Scroll::Delta(lines));
-            self.refresh();
+    /// Mengembalikan true bila posisi gulir benar-benar berubah.
+    pub fn scroll(&mut self, lines: i32) -> bool {
+        if lines == 0 {
+            return false;
         }
+        let before = self.term.grid().display_offset();
+        self.term.scroll_display(Scroll::Delta(lines));
+        let after = self.term.grid().display_offset();
+        self.refresh();
+        before != after
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -775,6 +780,26 @@ mod tests {
             "output not visible: {:?}",
             text_of(terminal.snapshot())
         );
+        terminal.kill();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scroll_moves_into_history_and_back() {
+        let script = "for i in $(seq 1 200); do echo line$i; done; sleep 2";
+        let mut terminal =
+            PtyTerminal::spawn("/bin/sh", &["-c", script], &std::env::temp_dir(), || {})
+                .expect("spawn");
+        let ok = pump_until(&mut terminal, Duration::from_secs(5), |snapshot| {
+            text_of(snapshot)
+                .iter()
+                .any(|line| line.contains("line200"))
+        });
+        assert!(ok, "last line was not rendered");
+        assert!(terminal.scroll(5), "scroll up should change the viewport");
+        assert!(terminal.snapshot().scrolled);
+        assert!(terminal.scroll(-5), "scroll down should change the viewport");
+        assert!(!terminal.snapshot().scrolled);
         terminal.kill();
     }
 

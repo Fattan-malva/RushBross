@@ -19,15 +19,15 @@ use webview2_com::{
     },
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
+    AcceleratorKeyPressedEventHandler, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CallDevToolsProtocolMethodCompletedHandler,
     ContainsFullScreenElementChangedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     ExecuteScriptCompletedHandler, FaviconChangedEventHandler, GetFaviconCompletedHandler,
     IsDocumentPlayingAudioChangedEventHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, TrySuspendCompletedHandler,
-    WebMessageReceivedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, WebMessageReceivedEventHandler,
 };
-use windows::core::{Interface, BOOL, PCWSTR, PWSTR};
+use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
@@ -99,43 +99,75 @@ const AGENT_JS: &str = r##"(function () {
     if (window.CSS && CSS.escape) return CSS.escape(value);
     return String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
   }
-  var style = document.createElement("style");
-  style.id = "rb-agent-style";
-  style.textContent =
-    "#rb-agent-cursor{position:fixed;left:0;top:0;width:24px;height:24px;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .12s ease-out,opacity .15s;will-change:transform}" +
-    "#rb-agent-cursor.rb-visible{opacity:1}" +
-    "#rb-agent-cursor svg{display:block;width:22px;height:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}" +
-    "#rb-agent-cursor .rb-label{position:absolute;left:18px;top:18px;padding:2px 5px;border-radius:4px;background:#22c55e;color:#04140b;font:600 10px/1.2 sans-serif;white-space:nowrap}" +
-    "#rb-agent-cursor.rb-typing .rb-label{background:#16a34a;color:white}" +
-    "#rb-agent-highlight{position:fixed;pointer-events:none;z-index:2147483646;display:none;border:2px solid #22c55e;background:rgba(34,197,94,.12);border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.4)}" +
-    "#rb-agent-ripple{position:fixed;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #22c55e;border-radius:50%;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .35s ease-out,opacity .35s ease-out}";
-  (document.head || document.documentElement).appendChild(style);
-  var cursor = document.createElement("div");
-  cursor.id = "rb-agent-cursor";
-  cursor.innerHTML = '<svg viewBox="0 0 24 24" fill="#22c55e"><path d="M4 2l15 10-7 1.2L9.4 20 4 2z"/></svg><span class="rb-label">RushAgent</span>';
-  (document.body || document.documentElement).appendChild(cursor);
-  var highlight = document.createElement("div");
-  highlight.id = "rb-agent-highlight";
-  (document.body || document.documentElement).appendChild(highlight);
-  var ripple = document.createElement("div");
-  ripple.id = "rb-agent-ripple";
-  (document.body || document.documentElement).appendChild(ripple);
-  window.__rbAgentCursor = {
-    move: function (x, y) {
-      cursor.style.transform = "translate3d(" + x + "px," + y + "px,0)";
-      cursor.classList.add("rb-visible");
-    },
-    click: function (x, y) {
-      this.move(x, y);
-      ripple.style.transform = "translate3d(" + x + "px," + y + "px,0) scale(2.4)";
-      ripple.style.opacity = "0.9";
-      window.setTimeout(function () { ripple.style.opacity = "0"; }, 60);
-    },
-    type: function () {
-      cursor.classList.add("rb-typing");
-      window.setTimeout(function () { cursor.classList.remove("rb-typing"); }, 700);
+  var dom = null;
+  function ensureDom() {
+    if (dom && dom.cursor.isConnected && dom.highlight.isConnected && dom.ripple.isConnected) {
+      return dom;
     }
-  };
+    var head = document.head || document.documentElement;
+    var root = document.body || document.documentElement;
+    if (!head || !root) return null;
+    var style = document.getElementById("rb-agent-style");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "rb-agent-style";
+      style.textContent =
+        "#rb-agent-cursor{position:fixed;left:0;top:0;width:24px;height:24px;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .12s ease-out,opacity .15s;will-change:transform}" +
+        "#rb-agent-cursor.rb-visible{opacity:1}" +
+        "#rb-agent-cursor svg{display:block;width:22px;height:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}" +
+        "#rb-agent-cursor .rb-label{position:absolute;left:18px;top:18px;padding:2px 5px;border-radius:4px;background:#22c55e;color:#04140b;font:600 10px/1.2 sans-serif;white-space:nowrap}" +
+        "#rb-agent-cursor.rb-typing .rb-label{background:#16a34a;color:white}" +
+        "#rb-agent-highlight{position:fixed;pointer-events:none;z-index:2147483646;display:none;border:2px solid #22c55e;background:rgba(34,197,94,.12);border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.4)}" +
+        "#rb-agent-ripple{position:fixed;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #22c55e;border-radius:50%;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .35s ease-out,opacity .35s ease-out}";
+      head.appendChild(style);
+    }
+    var cursor = document.getElementById("rb-agent-cursor");
+    if (!cursor) {
+      cursor = document.createElement("div");
+      cursor.id = "rb-agent-cursor";
+      cursor.innerHTML = '<svg viewBox="0 0 24 24" fill="#22c55e"><path d="M4 2l15 10-7 1.2L9.4 20 4 2z"/></svg><span class="rb-label">RushAgent</span>';
+      cursor.style.transform = "translate3d(24px,24px,0)";
+      cursor.classList.add("rb-visible");
+      root.appendChild(cursor);
+    }
+    var highlight = document.getElementById("rb-agent-highlight");
+    if (!highlight) {
+      highlight = document.createElement("div");
+      highlight.id = "rb-agent-highlight";
+      root.appendChild(highlight);
+    }
+    var ripple = document.getElementById("rb-agent-ripple");
+    if (!ripple) {
+      ripple = document.createElement("div");
+      ripple.id = "rb-agent-ripple";
+      root.appendChild(ripple);
+    }
+    dom = { cursor: cursor, highlight: highlight, ripple: ripple };
+    window.__rbAgentCursor = {
+      move: function (x, y) {
+        var elements = ensureDom();
+        if (!elements) return;
+        elements.cursor.style.transform = "translate3d(" + x + "px," + y + "px,0)";
+        elements.cursor.classList.add("rb-visible");
+      },
+      click: function (x, y) {
+        this.move(x, y);
+        var elements = ensureDom();
+        if (!elements) return;
+        elements.ripple.style.transform = "translate3d(" + x + "px," + y + "px,0) scale(2.4)";
+        elements.ripple.style.opacity = "0.9";
+        window.setTimeout(function () { elements.ripple.style.opacity = "0"; }, 60);
+      },
+      type: function () {
+        var elements = ensureDom();
+        if (!elements) return;
+        elements.cursor.classList.add("rb-typing");
+        window.setTimeout(function () { elements.cursor.classList.remove("rb-typing"); }, 700);
+      }
+    };
+    return dom;
+  }
+  ensureDom();
   function selectorOf(node) {
     var parts = [];
     while (node && node.nodeType === 1 && parts.length < 8) {
@@ -175,12 +207,13 @@ const AGENT_JS: &str = r##"(function () {
   function onMove(event) {
     if (!window.__rbAgentPickerEnabled) return;
     var node = document.elementFromPoint(event.clientX, event.clientY);
-    if (!node || node === highlight || node === cursor) return;
+    var elements = ensureDom();
+    if (!node || !elements || node === elements.highlight || node === elements.cursor) return;
     var rect = node.getBoundingClientRect();
-    highlight.style.display = "block";
-    highlight.style.transform = "translate3d(" + rect.x + "px," + rect.y + "px,0)";
-    highlight.style.width = rect.width + "px";
-    highlight.style.height = rect.height + "px";
+    elements.highlight.style.display = "block";
+    elements.highlight.style.transform = "translate3d(" + rect.x + "px," + rect.y + "px,0)";
+    elements.highlight.style.width = rect.width + "px";
+    elements.highlight.style.height = rect.height + "px";
     window.__rbAgentCursor.move(event.clientX, event.clientY);
   }
   function onClick(event) {
@@ -196,7 +229,8 @@ const AGENT_JS: &str = r##"(function () {
   }
   window.__rbAgentSetPicker = function (enabled) {
     window.__rbAgentPickerEnabled = !!enabled;
-    if (!window.__rbAgentPickerEnabled) highlight.style.display = "none";
+    var elements = ensureDom();
+    if (elements && !window.__rbAgentPickerEnabled) elements.highlight.style.display = "none";
   };
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("click", onClick, true);
@@ -315,6 +349,13 @@ impl WebViewRuntime {
                 .CoreWebView2()
                 .map_err(|error| error.to_string())?
         };
+
+        unsafe {
+            let script: Vec<u16> = AGENT_JS.encode_utf16().chain(Some(0)).collect();
+            let handler =
+                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(())));
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(PCWSTR(script.as_ptr()), &handler);
+        }
 
         unsafe {
             let settings = webview.Settings().map_err(|error| error.to_string())?;
@@ -655,32 +696,32 @@ impl WebViewHost {
         Ok(take_pwstr(uri))
     }
 
-    pub fn install_agent_helpers(&self) {
-        let script: Vec<u16> = AGENT_JS.encode_utf16().chain(Some(0)).collect();
+    fn execute_script(&self, script: &str) {
+        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
         let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
         unsafe {
-            let _ = self
-                .webview
-                .ExecuteScript(PCWSTR(script.as_ptr()), &handler);
+            let _ = self.webview.ExecuteScript(PCWSTR(wide.as_ptr()), &handler);
         }
+    }
+
+    pub fn install_agent_helpers(&self) {
+        self.execute_script(AGENT_JS);
     }
 
     pub fn move_cursor(&self, x: f64, y: f64) {
-        let script = format!("window.__rbAgentCursor.move({x},{y})");
-        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
-        unsafe {
-            let _ = self.webview.ExecuteScript(PCWSTR(wide.as_ptr()), &handler);
-        }
+        self.execute_script(&format!("window.__rbAgentCursor.move({x},{y})"));
+    }
+
+    pub fn cursor_click(&self, x: f64, y: f64) {
+        self.execute_script(&format!("window.__rbAgentCursor.click({x},{y})"));
+    }
+
+    pub fn cursor_type(&self) {
+        self.execute_script("window.__rbAgentCursor.type()");
     }
 
     pub fn set_picker(&self, enabled: bool) {
-        let script = format!("window.__rbAgentSetPicker({})", enabled);
-        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
-        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
-        unsafe {
-            let _ = self.webview.ExecuteScript(PCWSTR(wide.as_ptr()), &handler);
-        }
+        self.execute_script(&format!("window.__rbAgentSetPicker({})", enabled));
     }
 
     pub fn eval(&self, expression: &str, reply: mpsc::Sender<Result<Value, String>>) {
@@ -862,9 +903,8 @@ impl WebViewHost {
         Ok(())
     }
 
-    /// Menurunkan pemakaian memori WebView tab yang tidak tampil. Target memori
-    /// dibuat Low dan halaman di-suspend, kecuali tab yang sedang memutar audio
-    /// supaya musik/video tidak berhenti. Saat tab tampil lagi, keduanya dikembalikan.
+    /// Lower the memory target of hidden tabs without suspending them. Agent tool
+    /// calls must remain able to evaluate and snapshot any tab immediately.
     pub fn set_background(&self, background: bool) -> Result<(), String> {
         unsafe {
             if let Ok(webview19) = self.webview.cast::<ICoreWebView2_19>() {
@@ -877,29 +917,14 @@ impl WebViewHost {
                     .SetMemoryUsageTargetLevel(level)
                     .map_err(|error| error.to_string())?;
             }
+            if background {
+                return Ok(());
+            }
             if let Ok(webview3) = self.webview.cast::<ICoreWebView2_3>() {
-                if background {
-                    if self.is_playing_audio() {
-                        return Ok(());
-                    }
-                    let handler = TrySuspendCompletedHandler::create(Box::new(|_, _| Ok(())));
-                    webview3
-                        .TrySuspend(&handler)
-                        .map_err(|error| error.to_string())?;
-                } else {
-                    webview3.Resume().map_err(|error| error.to_string())?;
-                }
+                webview3.Resume().map_err(|error| error.to_string())?;
             }
         }
         Ok(())
-    }
-
-    fn is_playing_audio(&self) -> bool {
-        let Ok(webview8) = self.webview.cast::<ICoreWebView2_8>() else {
-            return false;
-        };
-        let mut playing = BOOL(0);
-        unsafe { webview8.IsDocumentPlayingAudio(&mut playing) }.is_ok() && playing.0 != 0
     }
 
     pub fn set_bounds(&self, rect: Rect) -> Result<(), String> {

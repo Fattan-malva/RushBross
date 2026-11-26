@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -147,6 +147,11 @@ pub fn tool_result(result: Result<Value, String>) -> Value {
     }
 }
 
+fn write_line(writer: &Arc<Mutex<BufWriter<TcpStream>>>, message: &str) -> bool {
+    let mut writer = writer.lock().unwrap_or_else(|error| error.into_inner());
+    writeln!(writer, "{message}").is_ok() && writer.flush().is_ok()
+}
+
 fn serve_client(
     stream: TcpStream,
     token: String,
@@ -158,7 +163,7 @@ fn serve_client(
         return;
     };
     let mut reader = BufReader::new(reader_stream);
-    let mut writer = BufWriter::new(stream);
+    let writer = Arc::new(Mutex::new(BufWriter::new(stream)));
     let mut line = String::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -176,8 +181,7 @@ fn serve_client(
         let value: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
             Err(_) => {
-                let _ = writeln!(writer, "{}", rpc_error(None, ERR_PARSE, "Parse error"));
-                let _ = writer.flush();
+                write_line(&writer, &rpc_error(None, ERR_PARSE, "Parse error"));
                 continue;
             }
         };
@@ -185,59 +189,58 @@ fn serve_client(
         let request: WireRequest = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(_) => {
-                let _ = writeln!(
-                    writer,
-                    "{}",
-                    rpc_error(id, ERR_INVALID_REQUEST, "Invalid Request")
+                write_line(
+                    &writer,
+                    &rpc_error(id, ERR_INVALID_REQUEST, "Invalid Request"),
                 );
-                let _ = writer.flush();
                 continue;
             }
         };
         if request.token.as_deref() != Some(token.as_str()) {
-            let _ = writeln!(
-                writer,
-                "{}",
-                rpc_error(id, ERR_INVALID_REQUEST, "invalid RushBross token")
+            write_line(
+                &writer,
+                &rpc_error(id, ERR_INVALID_REQUEST, "invalid RushBross token"),
             );
-            let _ = writer.flush();
             continue;
         }
         let notification = id.is_none();
         let is_tool_call = request.method == "tools/call";
-        let (reply, response) = mpsc::channel();
-        handler(AgentRequest {
-            id: id.clone(),
-            method: request.method,
-            params: request.params,
-            reply,
-        });
-        if notification {
-            continue;
-        }
-        let (message, closed) = match response.recv_timeout(timeout) {
-            Ok(message) => (message, false),
-            Err(error) => {
-                let closed = error == mpsc::RecvTimeoutError::Disconnected;
-                let text = if closed {
-                    "RushBross closed the request before it completed".to_string()
-                } else {
-                    format!(
-                        "RushBross did not respond within {} seconds",
-                        timeout.as_secs()
-                    )
-                };
-                let message = if is_tool_call {
-                    rpc_result(id, tool_result(Err(text)))
-                } else {
-                    rpc_error(id, ERR_INTERNAL, &text)
-                };
-                (message, closed)
+        let method = request.method;
+        let params = request.params;
+        let worker_handler = handler.clone();
+        let worker_writer = writer.clone();
+        let worker_id = id.clone();
+        thread::spawn(move || {
+            let (reply, response) = mpsc::channel();
+            worker_handler(AgentRequest {
+                id: worker_id.clone(),
+                method,
+                params,
+                reply,
+            });
+            if notification {
+                return;
             }
-        };
-        if writeln!(writer, "{message}").is_err() || writer.flush().is_err() || closed {
-            break;
-        }
+            let message = match response.recv_timeout(timeout) {
+                Ok(message) => message,
+                Err(error) => {
+                    let text = if error == mpsc::RecvTimeoutError::Disconnected {
+                        "RushBross closed the request before it completed".to_string()
+                    } else {
+                        format!(
+                            "RushBross did not respond within {} seconds",
+                            timeout.as_secs()
+                        )
+                    };
+                    if is_tool_call {
+                        rpc_result(worker_id, tool_result(Err(text)))
+                    } else {
+                        rpc_error(worker_id, ERR_INTERNAL, &text)
+                    }
+                }
+            };
+            write_line(&worker_writer, &message);
+        });
     }
 }
 
@@ -453,6 +456,44 @@ mod tests {
         );
         assert_eq!(value["id"], 9);
         assert_eq!(value["result"]["isError"], true);
+    }
+
+    #[test]
+    fn slow_request_does_not_block_the_next_request() {
+        let server = AgentServer::start_with_timeout(
+            "token".to_string(),
+            Duration::from_secs(2),
+            |request| {
+                let id = request
+                    .id
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                if id == 1 {
+                    thread::spawn(move || {
+                        let _hold = request.reply;
+                        thread::sleep(Duration::from_millis(500));
+                    });
+                } else {
+                    let _ = request.reply.send(rpc_result(request.id, json!({})));
+                }
+            },
+        )
+        .expect("server");
+        let mut stream = TcpStream::connect(server.addr).expect("connect");
+        let first = r#"{"token":"token","id":1,"method":"tools/call","params":{}}"#.to_string();
+        let second = r#"{"token":"token","id":2,"method":"ping","params":{}}"#.to_string();
+        writeln!(stream, "{first}").expect("write first");
+        writeln!(stream, "{second}").expect("write second");
+        let mut reader = BufReader::new(stream);
+        let mut first = String::new();
+        reader.read_line(&mut first).expect("read first");
+        let first: Value = serde_json::from_str(first.trim()).expect("first json");
+        assert_eq!(first["id"], 2, "fast request should be answered first");
+        let mut second = String::new();
+        reader.read_line(&mut second).expect("read second");
+        let second: Value = serde_json::from_str(second.trim()).expect("second json");
+        assert_eq!(second["id"], 1);
     }
 
     #[test]

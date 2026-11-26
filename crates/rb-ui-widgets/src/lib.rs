@@ -525,6 +525,7 @@ pub struct BrowserShell {
     split_drag: Option<usize>,
     terminal: Option<TerminalPane>,
     terminal_snapshot: Snapshot,
+    terminal_body_rect: Option<Rect>,
     terminal_drag: bool,
     terminal_selection: Option<(TerminalCell, TerminalCell)>,
     terminal_selecting: bool,
@@ -584,6 +585,7 @@ impl BrowserShell {
             split_drag: None,
             terminal: None,
             terminal_snapshot: Snapshot::default(),
+            terminal_body_rect: None,
             terminal_drag: false,
             terminal_selection: None,
             terminal_selecting: false,
@@ -806,6 +808,16 @@ impl BrowserShell {
             self.hit_at(point),
             Some((Element::TerminalPane | Element::TerminalPlaceholderButton, _))
         )
+    }
+
+    /// True bila titik berada di area isi terminal yang benar-benar digambar.
+    /// Dipakai untuk wheel agar tidak bergantung pada urutan hit-test popup.
+    pub fn terminal_scroll_at(&self, point: Vec2) -> bool {
+        self.terminal
+            .is_some()
+            && self
+                .terminal_body_rect
+                .is_some_and(|rect| rect.contains(point))
     }
 
     pub fn terminal_focused(&self) -> bool {
@@ -2488,6 +2500,7 @@ impl BrowserShell {
         let picker_is_open = split_picker.is_some();
 
         self.hits.clear();
+        self.terminal_body_rect = None;
         let mut frame = Frame::default();
         let base = &mut frame.base;
 
@@ -2876,6 +2889,7 @@ impl BrowserShell {
         let theme = self.theme;
         layer.push_rect(RectShape::filled(layout.pane, theme.background, 0.0));
         let body = layout.body;
+        self.terminal_body_rect = Some(body);
         layer.push_rect(RectShape::filled(
             body,
             Color::rgb(DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2]),
@@ -5187,6 +5201,15 @@ mod tests {
         shell.set_terminal_snapshot(snapshot);
 
         let frame = shell.render(1000.0, 800.0);
+        let body = shell
+            .terminal_layout(Rect::new(0.0, 0.0, 1000.0, 800.0))
+            .expect("terminal layout")
+            .body;
+        assert!(shell.terminal_scroll_at(rb_ui::Vec2::new(
+            body.x + body.width * 0.5,
+            body.y + body.height * 0.5
+        )));
+        assert!(!shell.terminal_scroll_at(rb_ui::Vec2::new(-10.0, -10.0)));
         let text = frame
             .base
             .texts
