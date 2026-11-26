@@ -66,6 +66,40 @@ fn tool_content(result: Result<Value, String>) -> Value {
     rb_agent::tool_result(result)
 }
 
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    unsafe {
+        OpenClipboard(Some(HWND::default())).map_err(|error| error.to_string())?;
+        let result = (|| {
+            EmptyClipboard().map_err(|error| error.to_string())?;
+            let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+            let handle =
+                GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(|error| error.to_string())?;
+            let pointer = GlobalLock(handle) as *mut u16;
+            if pointer.is_null() {
+                let _ = GlobalFree(Some(handle));
+                return Err("clipboard lock failed".to_string());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
+            let _ = GlobalUnlock(handle);
+            if let Err(error) = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(handle.0))) {
+                let _ = GlobalFree(Some(handle));
+                return Err(error.to_string());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
 /// Nama tool yang diiklankan lewat `tools/list`. Pemanggilan nama lain dibalas error protokol.
 fn is_known_tool(name: &str) -> bool {
     tool_definitions()
@@ -102,12 +136,12 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "browser_state",
-            "description": "Ambil URL, judul, dan viewport halaman aktif di RushBross.",
+            "description": "Get the URL, title, and viewport of the active RushBross page.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "browser_navigate",
-            "description": "Buka URL di tab aktif RushBross.",
+            "description": "Open a URL in the active RushBross tab.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "url": { "type": "string" } },
@@ -116,7 +150,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_snapshot",
-            "description": "Ambil ringkasan DOM halaman aktif.",
+            "description": "Get a DOM summary of the active page.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "selector": { "type": "string" } }
@@ -124,7 +158,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_click",
-            "description": "Klik elemen berdasarkan selector CSS atau koordinat viewport.",
+            "description": "Click an element by CSS selector or viewport coordinates.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -136,7 +170,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_type",
-            "description": "Ketik teks ke elemen yang dipilih, opsional tekan Enter setelahnya.",
+            "description": "Type text into the selected element, optionally pressing Enter afterwards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -149,7 +183,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_press",
-            "description": "Tekan satu tombol keyboard, misalnya Enter, Tab, atau Escape.",
+            "description": "Press a single keyboard key, such as Enter, Tab, or Escape.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "key": { "type": "string" } },
@@ -158,7 +192,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_scroll",
-            "description": "Scroll halaman aktif.",
+            "description": "Scroll the active page.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -170,12 +204,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_screenshot",
-            "description": "Ambil screenshot halaman aktif sebagai data URL PNG.",
+            "description": "Capture a screenshot of the active page as a PNG data URL.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "browser_select",
-            "description": "Aktifkan atau nonaktifkan mode pilih elemen.",
+            "description": "Enable or disable element picker mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "enabled": { "type": "boolean" } }
@@ -183,17 +217,39 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "browser_get_selection",
-            "description": "Ambil elemen terakhir yang dipilih lewat mode Select.",
+            "description": "Get the last element selected in Select mode.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "browser_tabs",
-            "description": "Lihat daftar tab atau buat tab baru.",
+            "description": "List tabs, create a new tab, activate a tab, or close the active tab.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new"] }
+                    "action": { "type": "string", "enum": ["list", "new", "activate", "close"] },
+                    "id": { "type": "integer" }
                 }
+            }
+        },
+        {
+            "name": "browser_hover",
+            "description": "Move the green cursor to an element or coordinates without clicking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                }
+            }
+        },
+        {
+            "name": "browser_eval",
+            "description": "Run a JavaScript expression on the active page and return the result.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "expression": { "type": "string" } },
+                "required": ["expression"]
             }
         }
     ])
@@ -252,7 +308,7 @@ fn upsert_json_config(
     let mut root = if path.exists() {
         let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
         serde_json::from_str(&text)
-            .map_err(|_| format!("{} bukan JSON murni", path.display()))?
+            .map_err(|_| format!("{} is not valid JSON", path.display()))?
     } else {
         json!({})
     };
@@ -260,20 +316,35 @@ fn upsert_json_config(
     for key in keys {
         let object = cursor
             .as_object_mut()
-            .ok_or_else(|| format!("{} tidak berupa objek", path.display()))?;
+            .ok_or_else(|| format!("{} is not an object", path.display()))?;
         cursor = object
             .entry((*key).to_string())
             .or_insert_with(|| json!({}));
     }
     cursor
         .as_object_mut()
-        .ok_or_else(|| format!("{} tidak berupa objek", path.display()))?
+        .ok_or_else(|| format!("{} is not an object", path.display()))?
         .insert(server_key.to_string(), server);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     std::fs::write(path, serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+fn prune_empty_objects(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let keys: Vec<String> = object.keys().cloned().collect();
+    for key in keys {
+        if let Some(child) = object.get_mut(&key) {
+            if prune_empty_objects(child) {
+                object.remove(&key);
+            }
+        }
+    }
+    object.is_empty()
 }
 
 fn remove_json_config(
@@ -286,7 +357,7 @@ fn remove_json_config(
     }
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut root: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("{} bukan JSON murni", path.display()))?;
+        .map_err(|_| format!("{} is not valid JSON", path.display()))?;
     let mut cursor = &mut root;
     for key in keys {
         let Some(next) = cursor.as_object_mut().and_then(|object| object.get_mut(*key)) else {
@@ -298,23 +369,27 @@ fn remove_json_config(
         .as_object_mut()
         .is_some_and(|object| object.remove(server_key).is_some());
     if removed {
-        std::fs::write(
-            path,
-            serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        if prune_empty_objects(&mut root) {
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+        } else {
+            std::fs::write(
+                path,
+                serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
     }
     Ok(removed)
 }
 
-/// Lokasi binary bridge stdio. Config tidak memuat token: bridge membaca sesi aktif
-/// dari `rushbross-agent.json` di folder temp, jadi config tetap valid setiap RushBross dibuka.
-fn bridge_command() -> Result<String, String> {
-    Ok(std::env::current_exe()
-        .map_err(|error| error.to_string())?
-        .with_file_name("rushbross-mcp.exe")
-        .to_string_lossy()
-        .into_owned())
+fn bridge_command() -> Result<(String, Vec<String>), String> {
+    Ok((
+        std::env::current_exe()
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned(),
+        vec!["--mcp".to_string()],
+    ))
 }
 
 fn user_home() -> Option<std::path::PathBuf> {
@@ -325,13 +400,22 @@ fn user_home() -> Option<std::path::PathBuf> {
 }
 
 /// Config JSON yang dikenali CLI agent. `keys` adalah jalur objek induknya.
-fn json_targets(cwd: &std::path::Path, home: Option<&std::path::Path>) -> Vec<(std::path::PathBuf, Vec<&'static str>, bool)> {
-    // Argumen ketiga: true bila formatnya `"command": [...]` (opencode/kilo), false bila `command` + `args`.
+fn json_targets(
+    folder: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<(std::path::PathBuf, Vec<&'static str>, bool)> {
     let mut targets = vec![
-        (cwd.join("opencode.json"), vec!["mcp"], true),
-        (cwd.join(".kilo").join("kilo.json"), vec!["mcp"], true),
-        (cwd.join(".mcp.json"), vec!["mcpServers"], false),
-        (cwd.join(".agents").join("mcp_config.json"), vec!["mcpServers"], false),
+        (folder.join("opencode.json"), vec!["mcp"], true),
+        (folder.join(".kilo").join("kilo.json"), vec!["mcp"], true),
+        (folder.join(".mcp.json"), vec!["mcpServers"], false),
+        (
+            folder.join(".agents").join("mcp_config.json"),
+            vec!["mcpServers"],
+            false,
+        ),
+        (folder.join(".cursor").join("mcp.json"), vec!["mcpServers"], false),
+        (folder.join(".vscode").join("mcp.json"), vec!["servers"], false),
+        (folder.join(".gemini").join("settings.json"), vec!["mcpServers"], false),
     ];
     if let Some(home) = home {
         targets.push((home.join(".claude.json"), vec!["mcpServers"], false));
@@ -345,50 +429,356 @@ fn codex_config(home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     home.map(|home| home.join(".codex").join("config.toml"))
 }
 
-fn write_agent_configs() -> Result<Vec<String>, String> {
-    let command = bridge_command()?;
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+const MCP_START: &str = "<!-- rushbross:mcp:start -->";
+const MCP_END: &str = "<!-- rushbross:mcp:end -->";
+
+const MCP_INSTRUCTIONS: &str = r#"Use the `rushbross` MCP server to control the RushBross browser in the same window as this terminal.
+
+Available tools:
+- `browser_state`: URL, title, viewport, and scroll position of the active page.
+- `browser_navigate`: open a URL in the active tab.
+- `browser_snapshot`: read the page DOM/text; use `selector` to limit the result.
+- `browser_click`: click an element by CSS selector or `x`/`y` coordinates.
+- `browser_type`: type text into a field; `submit: true` presses Enter afterwards.
+- `browser_press`: press Enter, Tab, Escape, or an arrow key.
+- `browser_scroll`: scroll the page relatively using `x`/`y`.
+- `browser_screenshot`: capture the page as a PNG data URL.
+- `browser_tabs`: `list`, `new`, `activate` (requires `id`), or `close`.
+- `browser_hover`: move the green cursor to a selector or coordinates without clicking.
+- `browser_eval`: run a JavaScript expression on the active page when other tools are insufficient.
+- `browser_select`: ask the user to pick an element with the green cursor.
+- `browser_get_selection`: get details of the last element selected by the user.
+
+Suggested flow: call `browser_state`, then `browser_snapshot`, perform the action, and verify with `browser_snapshot` or `browser_screenshot`. The green cursor marks agent actions. When the user selects an element in Select mode, a summary is also sent to this terminal automatically, but `browser_get_selection` returns full details. For ordinary web exploration, use these tools as freely as a person would use a browser; ask for confirmation only for destructive or paid actions."#;
+
+struct ManagedFile {
+    path: std::path::PathBuf,
+    body: String,
+    standalone: bool,
+}
+
+fn managed_section(body: &str) -> String {
+    format!("{MCP_START}\n{}\n{MCP_END}\n", body.trim())
+}
+
+fn managed_files(folder: &std::path::Path) -> Vec<ManagedFile> {
+    let section = |path: std::path::PathBuf| ManagedFile {
+        path,
+        body: MCP_INSTRUCTIONS.to_string(),
+        standalone: false,
+    };
+    let standalone = |path: std::path::PathBuf, frontmatter: &str| ManagedFile {
+        path,
+        body: format!("{}\n\n{}", frontmatter, managed_section(MCP_INSTRUCTIONS)),
+        standalone: true,
+    };
+    vec![
+        section(folder.join("AGENTS.md")),
+        section(folder.join("GEMINI.md")),
+        section(folder.join(".github").join("copilot-instructions.md")),
+        standalone(
+            folder.join(".cursor").join("rules").join("rushbross.mdc"),
+            "---\ndescription: Control the RushBross browser through MCP\nglobs: **\nalwaysApply: true\n---",
+        ),
+        standalone(
+            folder.join(".kilocode").join("rules").join("rushbross.mdc"),
+            "---\ndescription: Control the RushBross browser through MCP\nglobs: **\nalwaysApply: true\n---",
+        ),
+        standalone(
+            folder.join(".windsurf").join("rules").join("rushbross.md"),
+            "# RushBross",
+        ),
+        standalone(
+            folder
+                .join(".claude")
+                .join("skills")
+                .join("rushbross")
+                .join("SKILL.md"),
+            "---\nname: rushbross\ndescription: Control the RushBross browser through MCP while navigating, clicking, typing, or taking screenshots.\n---",
+        ),
+        standalone(
+            folder
+                .join(".agents")
+                .join("skills")
+                .join("rushbross")
+                .join("SKILL.md"),
+            "---\nname: rushbross\ndescription: Control the RushBross browser through MCP while navigating, clicking, typing, or taking screenshots.\n---",
+        ),
+    ]
+}
+
+fn upsert_managed_file(file: &ManagedFile) -> Result<bool, String> {
+    let existing = if file.path.exists() {
+        std::fs::read_to_string(&file.path).map_err(|error| error.to_string())?
+    } else {
+        String::new()
+    };
+    let block = if file.standalone {
+        file.body.clone()
+    } else {
+        managed_section(&file.body)
+    };
+    let updated = if let Some(begin) = existing.find(MCP_START) {
+        let end = existing[begin..]
+            .find(MCP_END)
+            .map(|offset| begin + offset + MCP_END.len())
+            .unwrap_or(existing.len());
+        format!(
+            "{}{}{}",
+            &existing[..begin],
+            block,
+            &existing[end..]
+        )
+    } else if existing.trim().is_empty() {
+        block
+    } else {
+        format!("{}\n\n{}", existing.trim_end(), block)
+    };
+    if updated == existing {
+        return Ok(false);
+    }
+    if let Some(parent) = file.path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(&file.path, updated).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn remove_managed_file(file: &ManagedFile) -> Result<bool, String> {
+    if !file.path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&file.path).map_err(|error| error.to_string())?;
+    if file.standalone && text.contains(MCP_START) {
+        std::fs::remove_file(&file.path).map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    let Some(begin) = text.find(MCP_START) else {
+        return Ok(false);
+    };
+    let end = text[begin..]
+        .find(MCP_END)
+        .map(|offset| begin + offset + MCP_END.len())
+        .unwrap_or(text.len());
+    let trimmed = format!("{}{}", &text[..begin], &text[end..]);
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        std::fs::remove_file(&file.path).map_err(|error| error.to_string())?;
+    } else {
+        std::fs::write(&file.path, format!("{trimmed}\n")).map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
+
+fn mcp_manifest_path(folder: &std::path::Path) -> std::path::PathBuf {
+    folder.join(".rushbross").join("mcp-manifest.json")
+}
+
+fn mcp_target_paths(
+    folder: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = json_targets(folder, home)
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .collect();
+    if let Some(path) = codex_config(home) {
+        paths.push(path);
+    }
+    paths.extend(managed_files(folder).into_iter().map(|file| file.path));
+    paths
+}
+
+fn snapshot_mcp_files(paths: &[std::path::PathBuf]) -> Result<Vec<Value>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let content = if path.exists() {
+                Some(std::fs::read_to_string(path).map_err(|error| error.to_string())?)
+            } else {
+                None
+            };
+            Ok(json!({
+                "path": path.to_string_lossy(),
+                "existed": content.is_some(),
+                "content": content,
+            }))
+        })
+        .collect()
+}
+
+fn write_mcp_manifest(folder: &std::path::Path, files: &[Value]) -> Result<(), String> {
+    let path = mcp_manifest_path(folder);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let manifest = json!({ "version": 1, "files": files });
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn prune_empty_dirs(folder: &std::path::Path, paths: &[std::path::PathBuf]) {
+    let mut dirs: Vec<std::path::PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    dirs.push(mcp_manifest_path(folder).parent().unwrap().to_path_buf());
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        let mut current = dir;
+        loop {
+            if current == folder || !current.starts_with(folder) {
+                break;
+            }
+            if std::fs::remove_dir(&current).is_err() {
+                break;
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent.to_path_buf();
+        }
+    }
+}
+
+fn restore_mcp_manifest(
+    folder: &std::path::Path,
+    removed: &mut Vec<String>,
+    failures: &mut Vec<String>,
+) -> bool {
+    let manifest_path = mcp_manifest_path(folder);
+    if !manifest_path.exists() {
+        return false;
+    }
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) => {
+            failures.push(error.to_string());
+            return false;
+        }
+    };
+    let manifest: Value = match serde_json::from_str(&text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            failures.push(error.to_string());
+            return false;
+        }
+    };
+    let Some(entries) = manifest.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let Some(value) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = std::path::PathBuf::from(value);
+        paths.push(path.clone());
+        let existed = entry.get("existed").and_then(Value::as_bool).unwrap_or(false);
+        let result = if !existed {
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    failures.push(error.to_string());
+                    continue;
+                }
+            }
+            let content = entry
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            std::fs::write(&path, content).map_err(|error| error.to_string())
+        };
+        match result {
+            Ok(()) => removed.push(path.display().to_string()),
+            Err(error) => failures.push(error),
+        }
+    }
+    let _ = std::fs::remove_file(&manifest_path);
+    paths.push(manifest_path);
+    prune_empty_dirs(folder, &paths);
+    true
+}
+
+fn write_agent_configs(folder: &std::path::Path) -> Result<Vec<String>, String> {
+    let (command, args) = bridge_command()?;
     let home = user_home();
+    let command_with_args: Vec<String> = std::iter::once(command.clone())
+        .chain(args.iter().cloned())
+        .collect();
 
     let local_server = json!({
         "type": "local",
-        "command": [command.clone()],
+        "command": command_with_args,
         "enabled": true,
         "timeout": 30000
     });
     let stdio_server = json!({
         "type": "stdio",
         "command": command.clone(),
-        "args": []
+        "args": args.clone()
     });
+
+    let all_paths = mcp_target_paths(folder, home.as_deref());
+    let snapshot = snapshot_mcp_files(&all_paths)?;
 
     let mut written = Vec::new();
     let mut failures = Vec::new();
-    for (path, keys, is_local) in json_targets(&cwd, home.as_deref()) {
-        let server = if is_local { local_server.clone() } else { stdio_server.clone() };
+    for (path, keys, is_local) in json_targets(folder, home.as_deref()) {
+        let server = if is_local {
+            local_server.clone()
+        } else {
+            stdio_server.clone()
+        };
         match upsert_json_config(&path, &keys, "rushbross", server) {
             Ok(()) => written.push(path.display().to_string()),
             Err(error) => failures.push(error),
         }
     }
     if let Some(path) = codex_config(home.as_deref()) {
-        match upsert_toml_server(&path, &command) {
+        match upsert_toml_server(&path, &command, &args) {
             Ok(()) => written.push(path.display().to_string()),
+            Err(error) => failures.push(error),
+        }
+    }
+    for file in managed_files(folder) {
+        match upsert_managed_file(&file) {
+            Ok(true) => written.push(file.path.display().to_string()),
+            Ok(false) => {}
             Err(error) => failures.push(error),
         }
     }
     if written.is_empty() {
         return Err(failures.join("; "));
     }
+    if let Err(error) = write_mcp_manifest(folder, &snapshot) {
+        failures.push(error);
+    }
+    if !failures.is_empty() && written.is_empty() {
+        return Err(failures.join("; "));
+    }
     Ok(written)
 }
 
-fn remove_agent_configs() -> Result<Vec<String>, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+fn remove_agent_configs(folder: &std::path::Path) -> Result<Vec<String>, String> {
     let home = user_home();
     let mut removed = Vec::new();
     let mut failures = Vec::new();
-    for (path, keys, _) in json_targets(&cwd, home.as_deref()) {
+    if restore_mcp_manifest(folder, &mut removed, &mut failures) {
+        if removed.is_empty() && !failures.is_empty() {
+            return Err(failures.join("; "));
+        }
+        return Ok(removed);
+    }
+    for (path, keys, _) in json_targets(folder, home.as_deref()) {
         match remove_json_config(&path, &keys, "rushbross") {
             Ok(true) => removed.push(path.display().to_string()),
             Ok(false) => {}
@@ -402,24 +792,37 @@ fn remove_agent_configs() -> Result<Vec<String>, String> {
             Err(error) => failures.push(error),
         }
     }
+    for file in managed_files(folder) {
+        match remove_managed_file(&file) {
+            Ok(true) => removed.push(file.path.display().to_string()),
+            Ok(false) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    prune_empty_dirs(folder, &mcp_target_paths(folder, home.as_deref()));
     if removed.is_empty() && !failures.is_empty() {
         return Err(failures.join("; "));
     }
     Ok(removed)
 }
 
-fn upsert_toml_server(path: &std::path::Path, command: &str) -> Result<(), String> {
+fn upsert_toml_server(
+    path: &std::path::Path,
+    command: &str,
+    args: &[String],
+) -> Result<(), String> {
     let text = if path.exists() {
         std::fs::read_to_string(path).map_err(|error| error.to_string())?
     } else {
         String::new()
     };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let updated = rb_agent::toml_upsert_server(
         &text,
         "mcp_servers.rushbross",
         &[
             ("command", rb_agent::TomlValue::Str(command)),
-            ("args", rb_agent::TomlValue::StrArray(&[])),
+            ("args", rb_agent::TomlValue::StrArray(&args)),
         ],
     );
     if let Some(parent) = path.parent() {
@@ -435,7 +838,12 @@ fn remove_toml_server(path: &std::path::Path) -> Result<bool, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     match rb_agent::toml_remove_server(&text, "mcp_servers.rushbross") {
         Some(updated) => {
-            std::fs::write(path, updated).map_err(|error| format!("{}: {error}", path.display()))?;
+            if updated.trim().is_empty() {
+                std::fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
+            } else {
+                std::fs::write(path, updated)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            }
             Ok(true)
         }
         None => Ok(false),
@@ -470,6 +878,7 @@ struct State {
     /// Bounds WebView terakhir per tab, supaya SetBounds tidak dipanggil tiap frame.
     last_webview_bounds: HashMap<TabId, (i32, i32, i32, i32)>,
     _agent_server: Option<AgentServer>,
+    mcp_folder: Option<std::path::PathBuf>,
     agent_selection: Option<Value>,
     select_mode: bool,
     window_shown: bool,
@@ -519,6 +928,7 @@ impl State {
             visible_webviews: Vec::new(),
             last_webview_bounds: HashMap::new(),
             _agent_server: Some(agent_server),
+            mcp_folder: None,
             agent_selection: None,
             select_mode: false,
             window_shown: false,
@@ -596,10 +1006,10 @@ impl State {
                 self.terminal = Some(terminal);
                 self.shell.open_terminal(folder);
                 self.shell.set_agent_actions_enabled(true);
-                self.shell.show_toast("RushAgent siap");
+                self.shell.show_toast("RushAgent is ready");
                 self.window.focus_window();
             }
-            Err(error) => self.shell.show_toast(format!("RushAgent gagal: {error}")),
+            Err(error) => self.shell.show_toast(format!("RushAgent failed: {error}")),
         }
         self.redraw();
     }
@@ -608,13 +1018,32 @@ impl State {
         self.terminal.as_mut().is_some_and(|terminal| terminal.exited())
     }
 
+    fn disconnect_mcp(&mut self, quiet: bool) {
+        let folder = self.mcp_folder.take();
+        self.shell.set_agent_connected(false);
+        let Some(folder) = folder else {
+            return;
+        };
+        match remove_agent_configs(&folder) {
+            Ok(paths) if !quiet => self.shell.show_toast(format!(
+                "MCP disconnected ({} configuration files cleaned up)",
+                paths.len()
+            )),
+            Err(error) if !quiet => {
+                self.shell
+                    .show_toast(format!("Failed to disconnect MCP: {error}"))
+            }
+            _ => {}
+        }
+    }
+
     fn stop_terminal(&mut self) {
+        self.disconnect_mcp(true);
         if let Some(mut terminal) = self.terminal.take() {
             terminal.kill();
         }
         self.shell.close_terminal();
         self.shell.set_agent_actions_enabled(false);
-        self.shell.set_agent_connected(false);
         self.select_mode = false;
         self.shell.set_select_mode(false);
     }
@@ -680,6 +1109,23 @@ impl State {
 
     /// Gulir riwayat terminal saat pointer di atas pane. Mengembalikan false bila tidak ada
     /// yang digulir, sehingga roda tetap dipakai oleh halaman atau daftar folder.
+    fn terminal_body(&self) -> Option<Rect> {
+        self.shell
+            .terminal_layout(self.inset_content_rect())
+            .map(|layout| layout.body)
+    }
+
+    fn copy_terminal_selection(&mut self) {
+        let text = self.shell.terminal_selected_text();
+        if text.trim().is_empty() {
+            return;
+        }
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.shell.show_toast("Selected text copied"),
+            Err(error) => self.shell.show_toast(format!("Copy failed: {error}")),
+        }
+    }
+
     fn scroll_terminal(&mut self, delta: winit::event::MouseScrollDelta, point: rb_ui::Vec2) -> bool {
         if self.terminal.is_none() || !self.shell.terminal_pane_at(point) {
             return false;
@@ -710,7 +1156,7 @@ impl State {
                             "prompts": { "listChanged": false }
                         },
                         "serverInfo": { "name": "rushbross", "version": env!("CARGO_PKG_VERSION") },
-                        "instructions": "Gunakan tool browser_* untuk mengendalikan RushBross. Kursor hijau menandai aksi agent. browser_get_selection mengembalikan elemen yang dipilih pengguna lewat mode Select."
+                        "instructions": "Use the browser_* tools to control RushBross like a real browser: state, navigate, snapshot, click, type, press, scroll, screenshot, tabs, hover, eval, select, and get_selection. The green cursor marks agent actions. browser_get_selection returns the element selected by the user in Select mode."
                     })),
                 )
             }
@@ -727,7 +1173,7 @@ impl State {
                     rb_agent::rpc_error(
                         id,
                         rb_agent::ERR_INVALID_PARAMS,
-                        &format!("tool tidak dikenal: {name}"),
+                        &format!("unknown tool: {name}"),
                     )
                 } else {
                     match self.start_tool(&request.params, request.reply.clone(), id.clone()) {
@@ -743,7 +1189,7 @@ impl State {
             other => rb_agent::rpc_error(
                 id,
                 rb_agent::ERR_METHOD_NOT_FOUND,
-                &format!("method tidak dikenal: {other}"),
+                &format!("unknown method: {other}"),
             ),
         };
         let _ = request.reply.send(response);
@@ -764,20 +1210,38 @@ impl State {
         match name {
             "browser_tabs" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-                if action == "new" {
-                    self.shell.new_tab();
-                    self.redraw();
-                    return ok(json!({ "ok": true }));
+                match action {
+                    "new" => {
+                        self.shell.new_tab();
+                        self.redraw();
+                        ok(json!({ "ok": true }))
+                    }
+                    "activate" => {
+                        let Some(id) = args.get("id").and_then(Value::as_u64) else {
+                            return Some(Err("id is required".to_string()));
+                        };
+                        if self.shell.activate_tab_by_id(TabId(id)) {
+                            self.redraw();
+                            ok(json!({ "ok": true }))
+                        } else {
+                            Some(Err(format!("tab {id} not found")))
+                        }
+                    }
+                    "close" => {
+                        self.shell.close_active_tab();
+                        self.redraw();
+                        ok(json!({ "ok": true }))
+                    }
+                    _ => {
+                        let tabs: Vec<Value> = self
+                            .shell
+                            .tab_infos()
+                            .into_iter()
+                            .map(|(id, title, url)| json!({ "id": id.0, "title": title, "url": url }))
+                            .collect();
+                        ok(json!({ "tabs": tabs }))
+                    }
                 }
-                let tabs: Vec<Value> = self
-                    .shell
-                    .tab_infos()
-                    .into_iter()
-                    .map(|(id, title, url)| {
-                        json!({ "id": id.0, "title": title, "url": url })
-                    })
-                    .collect();
-                ok(json!({ "tabs": tabs }))
             }
             "browser_get_selection" => match &self.agent_selection {
                 Some(selection) => ok(selection.clone()),
@@ -794,16 +1258,16 @@ impl State {
                     host.set_picker(enabled);
                 }
                 self.shell.show_toast(if enabled {
-                    "Select element aktif"
+                    "Select element on"
                 } else {
-                    "Select element dimatikan"
+                    "Select element off"
                 });
                 self.redraw();
                 ok(json!({ "ok": true, "enabled": enabled }))
             }
             "browser_navigate" => {
                 let Some(url) = args.get("url").and_then(Value::as_str) else {
-                    return Some(Err("url wajib diisi".to_string()));
+                    return Some(Err("url is required".to_string()));
                 };
                 self.shell.navigate_active(url.to_string());
                 self.redraw();
@@ -811,10 +1275,10 @@ impl State {
             }
             "browser_state" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 host.eval(
                     r#"({ url: location.href, title: document.title, readyState: document.readyState, viewport: [innerWidth, innerHeight], scroll: [scrollX, scrollY] })"#,
@@ -824,10 +1288,10 @@ impl State {
             }
             "browser_snapshot" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 let selector = args.get("selector").and_then(Value::as_str).unwrap_or("");
                 let expression = format!(
@@ -840,10 +1304,10 @@ impl State {
             }
             "browser_click" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 if let Some(selector) = args.get("selector").and_then(Value::as_str) {
                     let expression = format!(
@@ -861,13 +1325,13 @@ impl State {
             }
             "browser_type" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 let Some(text) = args.get("text").and_then(Value::as_str) else {
-                    return Some(Err("text wajib diisi".to_string()));
+                    return Some(Err("text is required".to_string()));
                 };
                 let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
                 let mut inserted = text.to_string();
@@ -888,23 +1352,23 @@ impl State {
             }
             "browser_press" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 let Some(key) = args.get("key").and_then(Value::as_str) else {
-                    return Some(Err("key wajib diisi".to_string()));
+                    return Some(Err("key is required".to_string()));
                 };
                 host.press_key(key, tool_channel(reply, id));
                 None
             }
             "browser_scroll" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
                 let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
@@ -914,10 +1378,10 @@ impl State {
             }
             "browser_screenshot" => {
                 let Some(tab_id) = self.shell.focused_tab_id() else {
-                    return Some(Err("tidak ada tab aktif".to_string()));
+                    return Some(Err("no active tab".to_string()));
                 };
                 let Some(host) = self.webviews.get(&tab_id) else {
-                    return Some(Err("WebView tab belum siap".to_string()));
+                    return Some(Err("WebView tab is not ready".to_string()));
                 };
                 host.cdp(
                     "Page.captureScreenshot",
@@ -926,30 +1390,63 @@ impl State {
                 );
                 None
             }
-            _ => Some(Err(format!("tool tidak dikenal: {name}"))),
+            "browser_hover" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("no active tab".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab is not ready".to_string()));
+                };
+                if let Some(selector) = args.get("selector").and_then(Value::as_str) {
+                    let expression = format!(
+                        "(function(){{var el=document.querySelector({}); if(!el)return false; var r=el.getBoundingClientRect(); window.__rbAgentCursor.move(r.x+r.width/2,r.y+r.height/2); return true;}})()",
+                        js_string(selector)
+                    );
+                    host.eval(&expression, tool_channel(reply, id));
+                } else {
+                    let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                    let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                    host.move_cursor(x, y);
+                    let _ = tool_channel(reply, id).send(Ok(json!({ "ok": true })));
+                }
+                None
+            }
+            "browser_eval" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("no active tab".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab is not ready".to_string()));
+                };
+                let Some(expression) = args.get("expression").and_then(Value::as_str) else {
+                    return Some(Err("expression is required".to_string()));
+                };
+                host.eval(expression, tool_channel(reply, id));
+                None
+            }
+            _ => Some(Err(format!("unknown tool: {name}"))),
         }
     }
 
     fn connect_agent(&mut self) {
         if self.shell.agent_connected() {
-            match remove_agent_configs() {
+            self.disconnect_mcp(false);
+        } else {
+            let Some(folder) = self.shell.terminal_folder().map(std::path::PathBuf::from) else {
+                self.shell.show_toast("Choose a RushAgent folder first");
+                self.redraw();
+                return;
+            };
+            match write_agent_configs(&folder) {
                 Ok(paths) => {
-                    self.shell.set_agent_connected(false);
+                    self.mcp_folder = Some(folder);
+                    self.shell.set_agent_connected(true);
                     self.shell.show_toast(format!(
-                        "Connect MCP dinonaktifkan ({} config dibersihkan)",
+                        "MCP connected in this folder ({} config & skill files)",
                         paths.len()
                     ));
                 }
-                Err(error) => self.shell.show_toast(format!("MCP gagal dinonaktifkan: {error}")),
-            }
-        } else {
-            match write_agent_configs() {
-                Ok(paths) => {
-                    self.shell.set_agent_connected(true);
-                    self.shell
-                        .show_toast(format!("MCP tersambung ({} config)", paths.len()));
-                }
-                Err(error) => self.shell.show_toast(format!("MCP gagal: {error}")),
+                Err(error) => self.shell.show_toast(format!("MCP failed: {error}")),
             }
         }
         self.redraw();
@@ -963,9 +1460,9 @@ impl State {
             host.set_picker(enabled);
         }
         self.shell.show_toast(if enabled {
-            "Select element aktif"
+            "Select element on"
         } else {
-            "Select element dimatikan"
+            "Select element off"
         });
         self.redraw();
     }
@@ -989,11 +1486,11 @@ impl State {
                 terminal.send(&text);
                 Ok(())
             }
-            None => Err("terminal RushAgent belum dibuka".to_string()),
+            None => Err("RushAgent terminal is not open".to_string()),
         };
         match sent {
-            Ok(()) => self.shell.show_toast("Elemen dikirim ke agent"),
-            Err(error) => self.shell.show_toast(format!("Elemen gagal dikirim: {error}")),
+            Ok(()) => self.shell.show_toast("Element sent to agent"),
+            Err(error) => self.shell.show_toast(format!("Failed to send element: {error}")),
         }
         self.redraw();
     }
@@ -1010,19 +1507,19 @@ impl State {
         if self.terminal_exited() {
             self.stop_terminal();
         }
-        let agent_ready = self.terminal.is_some();
+        let agent_ready = self.shell.terminal_folder().is_some();
         if self.shell.take_agent_connect() {
             if agent_ready {
                 self.connect_agent();
             } else {
-                self.shell.show_toast("Buka RushAgent dulu");
+                self.shell.show_toast("Open RushAgent first");
             }
         }
         if self.shell.take_select_element() {
             if agent_ready {
                 self.toggle_select();
             } else {
-                self.shell.show_toast("Buka RushAgent dulu");
+                self.shell.show_toast("Open RushAgent first");
             }
         }
         self.shell.set_maximized(self.window.is_maximized());
@@ -1547,11 +2044,21 @@ impl State {
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
 
+        let copy_shortcut = ctrl
+            && shift
+            && matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("c"));
+        if copy_shortcut && self.shell.terminal_has_selection() {
+            self.copy_terminal_selection();
+            self.redraw();
+            return;
+        }
+
         // Saat terminal fokus, semua ketikan (termasuk Ctrl+huruf dan tombol panah) menjadi
         // input shell. Ctrl+Tab tetap milik aplikasi untuk pindah tab.
         if self.shell.terminal_focused() && self.terminal.is_some() {
             let app_shortcut = ctrl && matches!(&event.logical_key, Key::Named(NamedKey::Tab));
             if !app_shortcut {
+                self.shell.clear_terminal_selection();
                 let mods = Mods { ctrl, alt, shift };
                 if self.send_terminal_key(event, mods) {
                     self.pump_terminal();
@@ -1793,7 +2300,12 @@ impl ApplicationHandler<UserEvent> for App {
                 state.cursor = point;
                 let dirty = state.shell.pointer_moved(point);
                 state.update_cursor();
-                if dirty {
+                if state.shell.terminal_is_selecting() {
+                    if let Some(body) = state.terminal_body() {
+                        state.shell.extend_terminal_selection(body, point);
+                    }
+                    state.redraw();
+                } else if dirty {
                     state.redraw();
                 }
             }
@@ -1818,6 +2330,15 @@ impl ApplicationHandler<UserEvent> for App {
                 match button {
                     MouseButton::Left => match pressed {
                         ElementState::Pressed => {
+                            if state.terminal.is_some() && state.shell.terminal_pane_at(state.cursor) {
+                                if let Some(body) = state.terminal_body() {
+                                    state.shell.begin_terminal_selection(body, state.cursor);
+                                    state.shell.focus_terminal();
+                                    state.window.focus_window();
+                                    state.redraw();
+                                    return;
+                                }
+                            }
                             if !state.shell.is_fullscreen() && !state.window.is_maximized() {
                                 if let Some(direction) = resize_direction(state.cursor, state.size)
                                 {
@@ -1843,7 +2364,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 return;
                             }
                         }
-                        ElementState::Released => state.shell.left_released(state.cursor),
+                        ElementState::Released => {
+                            if state.shell.terminal_is_selecting() {
+                                state.shell.finish_terminal_selection();
+                                state.copy_terminal_selection();
+                                state.redraw();
+                                return;
+                            }
+                            state.shell.left_released(state.cursor)
+                        }
                     },
                     MouseButton::Right if pressed == ElementState::Pressed => {
                         if !state.shell.is_fullscreen()
@@ -1966,7 +2495,51 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+fn run_mcp_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    let (addr, token) = match (
+        std::env::var("RUSHBROSS_MCP_ADDR"),
+        std::env::var("RUSHBROSS_MCP_TOKEN"),
+    ) {
+        (Ok(addr), Ok(token)) if !addr.is_empty() && !token.is_empty() => (addr, token),
+        _ => {
+            let path = std::env::temp_dir().join("rushbross-agent.json");
+            let Ok(text) = std::fs::read_to_string(path) else {
+                eprintln!("rushbross --mcp: no active RushBross session found");
+                std::process::exit(1);
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                eprintln!("rushbross --mcp: RushBross session file is corrupt");
+                std::process::exit(1);
+            };
+            (
+                value
+                    .get("addr")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                value
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        }
+    };
+    if addr.is_empty() || token.is_empty() {
+        eprintln!("rushbross --mcp: address or token is empty");
+        std::process::exit(1);
+    }
+    if let Err(error) = rb_agent::serve_stdio(&addr, &token) {
+        eprintln!("rushbross --mcp: {error}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().any(|arg| arg.to_string_lossy() == "--mcp") {
+        return run_mcp_stdio();
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let mut app = App {
         state: None,
@@ -2097,5 +2670,79 @@ mod tests {
         assert_eq!(rgba.len(), (width * height * 4) as usize);
         assert!(rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0));
         assert!(rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 128));
+    }
+
+    #[test]
+    fn bridge_command_uses_current_executable_with_mcp_flag() {
+        let (command, args) = bridge_command().expect("bridge command");
+        assert!(std::path::Path::new(&command).exists());
+        assert_eq!(args, vec!["--mcp".to_string()]);
+    }
+
+    #[test]
+    fn managed_skill_files_are_created_and_fully_removed() {
+        let folder = std::env::temp_dir().join(format!("rushbross-mcp-{}", new_session_token()));
+        std::fs::create_dir_all(&folder).expect("temp folder");
+        let files = managed_files(&folder);
+        assert!(files.len() >= 6);
+        for file in &files {
+            assert!(upsert_managed_file(file).expect("write"));
+            let text = std::fs::read_to_string(&file.path).expect("read");
+            assert!(text.contains(MCP_START));
+            assert!(text.contains("browser_eval"));
+        }
+        for file in &files {
+            assert!(remove_managed_file(file).expect("remove"));
+            assert!(!file.path.exists());
+        }
+        std::fs::remove_dir_all(&folder).expect("cleanup");
+    }
+
+    #[test]
+    fn managed_section_preserves_existing_instructions() {
+        let folder = std::env::temp_dir().join(format!("rushbross-mcp-{}", new_session_token()));
+        std::fs::create_dir_all(&folder).expect("temp folder");
+        let path = folder.join("AGENTS.md");
+        std::fs::write(&path, "user instructions\n").expect("seed");
+        let file = ManagedFile {
+            path: path.clone(),
+            body: MCP_INSTRUCTIONS.to_string(),
+            standalone: false,
+        };
+        assert!(upsert_managed_file(&file).expect("write"));
+        assert!(remove_managed_file(&file).expect("remove"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "user instructions\n"
+        );
+        std::fs::remove_dir_all(&folder).expect("cleanup");
+    }
+
+    #[test]
+    fn mcp_manifest_restores_existing_files_and_removes_created_ones() {
+        let folder = std::env::temp_dir().join(format!("rushbross-mcp-{}", new_session_token()));
+        std::fs::create_dir_all(&folder).expect("temp folder");
+        let existing = folder.join("AGENTS.md");
+        let created = folder.join(".cursor/rules/rushbross.mdc");
+        std::fs::write(&existing, "user instructions\n").expect("seed");
+        let paths = vec![existing.clone(), created.clone()];
+        let snapshot = snapshot_mcp_files(&paths).expect("snapshot");
+        write_mcp_manifest(&folder, &snapshot).expect("manifest");
+        std::fs::write(&existing, "changed by MCP\n").expect("change");
+        std::fs::create_dir_all(created.parent().unwrap()).expect("created dir");
+        std::fs::write(&created, "created by MCP\n").expect("created file");
+        let mut removed = Vec::new();
+        let mut failures = Vec::new();
+        assert!(restore_mcp_manifest(&folder, &mut removed, &mut failures));
+        assert!(failures.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("restored"),
+            "user instructions\n"
+        );
+        assert!(!created.exists());
+        assert!(!mcp_manifest_path(&folder).exists());
+        assert!(!created.parent().unwrap().exists());
+        assert!(!mcp_manifest_path(&folder).parent().unwrap().exists());
+        std::fs::remove_dir_all(&folder).expect("cleanup");
     }
 }

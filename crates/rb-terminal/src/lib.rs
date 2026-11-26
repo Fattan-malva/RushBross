@@ -150,7 +150,7 @@ impl PtyTerminal {
     pub fn start(folder: &str, on_output: impl Fn() + Send + 'static) -> Result<Self, String> {
         let cwd = Path::new(folder);
         if !cwd.is_dir() {
-            return Err(format!("Folder tidak ditemukan: {folder}"));
+            return Err(format!("Folder not found: {folder}"));
         }
         let (program, args) = default_shell();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -184,7 +184,7 @@ impl PtyTerminal {
         let child = pair
             .slave
             .spawn_command(command)
-            .map_err(|error| format!("gagal menjalankan {program}: {error}"))?;
+            .map_err(|error| format!("failed to start {program}: {error}"))?;
         drop(pair.slave);
 
         let mut reader = pair
@@ -772,7 +772,7 @@ mod tests {
         });
         assert!(
             ok,
-            "output tidak tampil: {:?}",
+            "output not visible: {:?}",
             text_of(terminal.snapshot())
         );
         terminal.kill();
@@ -792,7 +792,7 @@ mod tests {
                 .flatten()
                 .any(|run| run.text.contains("red") && run.fg == ANSI[1])
         });
-        assert!(ok, "warna merah tidak terbawa: {:?}", terminal.snapshot());
+        assert!(ok, "red color was not preserved: {:?}", terminal.snapshot());
         let snapshot = terminal.snapshot();
         assert!(snapshot.cursor.is_some(), "kursor harus terlihat");
         terminal.kill();
@@ -815,7 +815,7 @@ mod tests {
         });
         assert!(
             ok,
-            "DSR tidak dijawab atau output tertelan: {:?}",
+            "DSR was not answered or output was swallowed: {:?}",
             text_of(terminal.snapshot())
         );
         terminal.kill();
@@ -842,7 +842,7 @@ mod tests {
         });
         assert!(
             ok,
-            "ketikan tidak sampai ke shell: {:?}",
+            "keystrokes did not reach the shell: {:?}",
             text_of(terminal.snapshot())
         );
         terminal.kill();
@@ -882,7 +882,7 @@ mod cursor_alignment_tests {
                 assert_eq!(cur_row, row, "kursor harus di baris prompt");
                 break;
             }
-            assert!(Instant::now() < deadline, "prompt tidak muncul");
+            assert!(Instant::now() < deadline, "prompt did not appear");
             thread::sleep(Duration::from_millis(20));
         }
         terminal.kill();

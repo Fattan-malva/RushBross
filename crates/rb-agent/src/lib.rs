@@ -220,10 +220,10 @@ fn serve_client(
             Err(error) => {
                 let closed = error == mpsc::RecvTimeoutError::Disconnected;
                 let text = if closed {
-                    "RushBross menutup permintaan sebelum selesai".to_string()
+                    "RushBross closed the request before it completed".to_string()
                 } else {
                     format!(
-                        "RushBross tidak merespons dalam {} detik",
+                        "RushBross did not respond within {} seconds",
                         timeout.as_secs()
                     )
                 };
@@ -295,7 +295,7 @@ pub fn serve_stdio(addr: &str, token: &str) -> io::Result<()> {
             .and_then(|_| writer.flush())
             .is_err()
         {
-            let _ = out_tx.send(rpc_error(id, ERR_INTERNAL, "RushBross tidak tersambung"));
+            let _ = out_tx.send(rpc_error(id, ERR_INTERNAL, "RushBross is not connected"));
             break;
         }
     }
@@ -468,9 +468,9 @@ mod tests {
 
     #[test]
     fn tool_errors_are_results_with_is_error() {
-        let value = tool_result(Err("url wajib diisi".to_string()));
+        let value = tool_result(Err("url is required".to_string()));
         assert_eq!(value["isError"], true);
-        assert_eq!(value["content"][0]["text"], "url wajib diisi");
+        assert_eq!(value["content"][0]["text"], "url is required");
     }
 
     #[test]

@@ -348,9 +348,16 @@ struct SplitPicker {
 pub const TERMINAL_PADDING_X: f32 = 8.0;
 pub const TERMINAL_PADDING_Y: f32 = 4.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalCell {
+    row: usize,
+    col: usize,
+}
+
 #[derive(Clone, Debug)]
 struct TerminalPane {
     title: String,
+    folder: String,
     ratio: f32,
     /// True saat RushAgent dibuka tapi folder belum dipilih.
     placeholder: bool,
@@ -519,6 +526,9 @@ pub struct BrowserShell {
     terminal: Option<TerminalPane>,
     terminal_snapshot: Snapshot,
     terminal_drag: bool,
+    terminal_selection: Option<(TerminalCell, TerminalCell)>,
+    terminal_selecting: bool,
+    terminal_selection_moved: bool,
     pending_rush_agent: bool,
     pending_agent_connect: bool,
     pending_select_element: bool,
@@ -553,7 +563,7 @@ impl Default for BrowserShell {
 impl BrowserShell {
     pub fn new() -> Self {
         let mut tabs = TabManager::new();
-        tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
+        tabs.open("New tab", Some(NEW_TAB_URL.to_string()));
         let mut shell = Self {
             theme: Theme::dark(),
             tabs,
@@ -575,6 +585,9 @@ impl BrowserShell {
             terminal: None,
             terminal_snapshot: Snapshot::default(),
             terminal_drag: false,
+            terminal_selection: None,
+            terminal_selecting: false,
+            terminal_selection_moved: false,
             pending_rush_agent: false,
             pending_agent_connect: false,
             pending_select_element: false,
@@ -630,24 +643,28 @@ impl BrowserShell {
             .find(|part| !part.is_empty())
             .unwrap_or("RushAgent")
             .to_string();
-        self.show_terminal_pane(title, false);
+        self.show_terminal_pane(title, folder, false);
         // Terminal langsung menerima ketikan, seperti terminal sungguhan.
         self.focus_terminal();
     }
 
     /// Tampilkan pane RushAgent kosong sebelum folder dipilih.
     pub fn open_terminal_placeholder(&mut self) {
-        self.show_terminal_pane("RushAgent".to_string(), true);
+        self.show_terminal_pane("RushAgent".to_string(), String::new(), true);
     }
 
-    fn show_terminal_pane(&mut self, title: String, placeholder: bool) {
+    fn show_terminal_pane(&mut self, title: String, folder: String, placeholder: bool) {
         self.terminal = Some(TerminalPane {
             title,
+            folder,
             ratio: TERMINAL_RATIO,
             placeholder,
         });
         self.terminal_snapshot = Snapshot::default();
         self.terminal_drag = false;
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.terminal_selection_moved = false;
         self.pending_terminal_close = false;
         self.show_bookmarks = false;
         self.editing = None;
@@ -661,6 +678,9 @@ impl BrowserShell {
         self.terminal = None;
         self.terminal_snapshot = Snapshot::default();
         self.terminal_drag = false;
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.terminal_selection_moved = false;
         self.pending_terminal_close = false;
         if self.focus == Some(Focus::Terminal) {
             self.focus = None;
@@ -669,6 +689,13 @@ impl BrowserShell {
 
     pub fn terminal_is_open(&self) -> bool {
         self.terminal.is_some()
+    }
+
+    pub fn terminal_folder(&self) -> Option<&str> {
+        self.terminal
+            .as_ref()
+            .filter(|terminal| !terminal.placeholder && !terminal.folder.is_empty())
+            .map(|terminal| terminal.folder.as_str())
     }
 
     pub fn take_rush_agent(&mut self) -> bool {
@@ -743,7 +770,7 @@ impl BrowserShell {
             if folder.is_dir() {
                 self.pending_folder_selection = Some(folder.to_string_lossy().into_owned());
                 self.close_folder_picker();
-                self.show_toast("Folder dipilih untuk RushAgent");
+                self.show_toast("Folder selected for RushAgent");
             }
         }
     }
@@ -783,6 +810,154 @@ impl BrowserShell {
 
     pub fn terminal_focused(&self) -> bool {
         self.focus == Some(Focus::Terminal)
+    }
+
+    fn terminal_cell_at(&self, body: Rect, point: Vec2) -> Option<TerminalCell> {
+        let col = ((point.x - body.x - TERMINAL_PADDING_X) / CELL_WIDTH).floor();
+        let row = ((point.y - body.y - TERMINAL_PADDING_Y) / LINE_HEIGHT).floor();
+        if col < 0.0 || row < 0.0 {
+            return None;
+        }
+        let cols = self.terminal_snapshot.cols.max(1);
+        let rows = self.terminal_snapshot.rows.max(1);
+        Some(TerminalCell {
+            row: (row as usize).min(rows - 1),
+            col: (col as usize).min(cols - 1),
+        })
+    }
+
+    pub fn begin_terminal_selection(&mut self, body: Rect, point: Vec2) -> bool {
+        let Some(cell) = self.terminal_cell_at(body, point) else {
+            return false;
+        };
+        self.terminal_selection = Some((cell, cell));
+        self.terminal_selecting = true;
+        self.terminal_selection_moved = false;
+        true
+    }
+
+    pub fn extend_terminal_selection(&mut self, body: Rect, point: Vec2) {
+        if !self.terminal_selecting {
+            return;
+        }
+        if let (Some((start, _)), Some(end)) = (self.terminal_selection, self.terminal_cell_at(body, point)) {
+            if (end.row, end.col) != (start.row, start.col) {
+                self.terminal_selection_moved = true;
+            }
+            self.terminal_selection = Some((start, end));
+        }
+    }
+
+    pub fn finish_terminal_selection(&mut self) {
+        self.terminal_selecting = false;
+        if !self.terminal_selection_moved {
+            self.terminal_selection = None;
+        }
+    }
+
+    pub fn terminal_is_selecting(&self) -> bool {
+        self.terminal_selecting
+    }
+
+    pub fn terminal_has_selection(&self) -> bool {
+        self.terminal_selection.is_some()
+    }
+
+    pub fn clear_terminal_selection(&mut self) {
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.terminal_selection_moved = false;
+    }
+
+    fn terminal_line_chars(&self, row: usize) -> Vec<char> {
+        let Some(line) = self.terminal_snapshot.lines.get(row) else {
+            return Vec::new();
+        };
+        let mut cols = self.terminal_snapshot.cols;
+        for run in line {
+            cols = cols.max(run.col + run.text.chars().count());
+        }
+        let mut cells = vec![' '; cols];
+        for run in line {
+            for (offset, ch) in run.text.chars().enumerate() {
+                let col = run.col + offset;
+                if col < cells.len() {
+                    cells[col] = ch;
+                }
+            }
+        }
+        cells
+    }
+
+    fn terminal_selection_range(&self) -> Option<(TerminalCell, TerminalCell)> {
+        self.terminal_selection.map(|(first, second)| {
+            if (first.row, first.col) <= (second.row, second.col) {
+                (first, second)
+            } else {
+                (second, first)
+            }
+        })
+    }
+
+    pub fn terminal_selected_text(&self) -> String {
+        let Some((start, end)) = self.terminal_selection_range() else {
+            return String::new();
+        };
+        let mut lines = Vec::new();
+        for row in start.row..=end.row {
+            let cells = self.terminal_line_chars(row);
+            let from = if row == start.row {
+                start.col.min(cells.len())
+            } else {
+                0
+            };
+            let to = if row == end.row {
+                (end.col + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            if from < to {
+                lines.push(cells[from..to].iter().collect::<String>().trim_end().to_string());
+            } else {
+                lines.push(String::new());
+            }
+        }
+        lines.join("\n")
+    }
+
+    pub fn terminal_selection_rects(&self, body: Rect) -> Vec<Rect> {
+        let Some((start, end)) = self.terminal_selection_range() else {
+            return Vec::new();
+        };
+        let mut rects = Vec::new();
+        for row in start.row..=end.row {
+            let cells = self.terminal_line_chars(row);
+            let from = if row == start.row {
+                start.col.min(cells.len())
+            } else {
+                0
+            };
+            let to = if row == end.row {
+                (end.col + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            if from >= to {
+                continue;
+            }
+            let x = body.x + TERMINAL_PADDING_X + from as f32 * CELL_WIDTH;
+            let y = body.y + TERMINAL_PADDING_Y + row as f32 * LINE_HEIGHT;
+            if x >= body.right() || y >= body.bottom() {
+                continue;
+            }
+            rects.push(Rect::new(
+                x,
+                y,
+                ((to - from) as f32 * CELL_WIDTH).min(body.right() - x),
+                LINE_HEIGHT.min(body.bottom() - y),
+            ));
+        }
+        rects
     }
 
     pub fn set_select_mode(&mut self, enabled: bool) {
@@ -1239,11 +1414,11 @@ impl BrowserShell {
     }
 
     pub fn new_tab(&mut self) {
-        let id = self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
+        let id = self.tabs.open("New tab", Some(NEW_TAB_URL.to_string()));
         self.begin_load(
             id,
             NEW_TAB_URL.to_string(),
-            "Tab baru".to_string(),
+            "New tab".to_string(),
             NavigationKind::Load,
         );
         self.activate_tab(id);
@@ -1557,6 +1732,14 @@ impl BrowserShell {
         self.focus = None;
     }
 
+    pub fn activate_tab_by_id(&mut self, id: TabId) -> bool {
+        if self.tabs.tab(id).is_none() {
+            return false;
+        }
+        self.activate_tab(id);
+        true
+    }
+
     /// Menyamakan pane aktif setiap grup dengan tab yang aktif di tab strip.
     fn sync_active_pane(&mut self) {
         let active = self.tabs.active_id();
@@ -1680,14 +1863,14 @@ impl BrowserShell {
     }
 
     fn new_tab_after(&mut self, id: TabId) {
-        let new_id = self.tabs.open("Tab baru", Some(NEW_TAB_URL.to_string()));
+        let new_id = self.tabs.open("New tab", Some(NEW_TAB_URL.to_string()));
         if let Some(index) = self.tabs.index_of(id) {
             self.tabs.move_to(new_id, index + 1);
         }
         self.begin_load(
             new_id,
             NEW_TAB_URL.to_string(),
-            "Tab baru".to_string(),
+            "New tab".to_string(),
             NavigationKind::Load,
         );
         self.activate_tab(new_id);
@@ -2581,6 +2764,14 @@ impl BrowserShell {
             }
         }
 
+        for rect in self.terminal_selection_rects(body) {
+            layer.push_rect(RectShape::filled(
+                rect,
+                Color::rgba(0x3a, 0x82, 0xf2, 0x70),
+                0.0,
+            ));
+        }
+
         for (row, runs) in snapshot.lines.iter().enumerate() {
             let y = origin_y + row as f32 * LINE_HEIGHT;
             if y >= body_bottom {
@@ -2626,7 +2817,7 @@ impl BrowserShell {
         let text_y = body.y + body.height / 2.0 - 40.0;
         layer.push_text(
             TextShape::new(
-                "Pilih folder untuk memulai RushAgent",
+                "Choose a folder to start RushAgent",
                 body.x + 16.0,
                 text_y,
                 13.0,
@@ -2650,7 +2841,7 @@ impl BrowserShell {
         ));
         layer.push_text(
             TextShape::new(
-                "Pilih folder",
+                "Choose folder",
                 button.x,
                 button.y + 8.0,
                 13.0,
@@ -3481,7 +3672,7 @@ impl BrowserShell {
         if address.is_empty() {
             layer.push_text(
                 TextShape::new(
-                    "Cari atau ketik alamat",
+                    "Search or type an address",
                     text_x,
                     text_y,
                     ADDRESS_FONT_SIZE,
@@ -3587,7 +3778,7 @@ impl BrowserShell {
         let strip_right = manage_rect.x - 8.0;
 
         if bookmarks.is_empty() {
-            let message = "Belum ada bookmark. Klik bintang di alamat untuk menyimpan halaman.";
+            let message = "No bookmarks yet. Click the star in the address bar to save a page.";
             let width_est = approx_text_width(message, 11.0);
             let text_rect = Rect::new(strip_left, bar.y + 8.0, width_est, 16.0);
             let is_hover = hover == Some(Element::BookmarkHint);
@@ -3790,7 +3981,7 @@ impl BrowserShell {
         );
         layer.push_text(
             TextShape::new(
-                format!("{} tersimpan", bookmarks.len()),
+                format!("{} saved", bookmarks.len()),
                 popover.x + 16.0,
                 header_y + 1.0,
                 10.0,
@@ -3804,7 +3995,7 @@ impl BrowserShell {
         if bookmarks.is_empty() {
             layer.push_text(
                 TextShape::new(
-                    "Belum ada bookmark.",
+                    "No bookmarks yet.",
                     popover.x,
                     list_y + 16.0,
                     12.0,
@@ -3903,7 +4094,7 @@ impl BrowserShell {
                 edit.title.text(),
                 edit.title.cursor(),
                 focus == Some(Focus::BookmarkTitle),
-                "Nama bookmark",
+                "Bookmark name",
                 Element::EditTitle,
             );
 
@@ -3947,7 +4138,7 @@ impl BrowserShell {
             layer.push_rect(RectShape::filled(save_rect, save_bg, 6.0));
             layer.push_text(
                 TextShape::new(
-                    "Simpan",
+                    "Save",
                     save_rect.x,
                     save_rect.y + 6.0,
                     12.0,
@@ -4040,7 +4231,7 @@ impl BrowserShell {
         ));
         self.push_hit(Element::PopoverArea, panel);
         layer.push_text(TextShape::new(
-            "Pilih folder project".to_string(),
+            "Choose project folder".to_string(),
             panel.x + 16.0,
             panel.y + 12.0,
             13.0,
@@ -4048,7 +4239,7 @@ impl BrowserShell {
         ));
         layer.push_text(
             TextShape::new(
-                "Pilih partisi lalu telusuri folder yang diinginkan.".to_string(),
+                "Choose a partition, then browse to the desired folder.".to_string(),
                 panel.x + 16.0,
                 panel.y + 30.0,
                 10.0,
@@ -4062,7 +4253,7 @@ impl BrowserShell {
         if picker.history.is_empty() {
             layer.push_text(
                 TextShape::new(
-                    "Partisi".to_string(),
+                    "Partitions".to_string(),
                     crumb_x,
                     panel.y + 54.0,
                     11.0,
@@ -4084,7 +4275,7 @@ impl BrowserShell {
             let partition_rect = Rect::new(crumb_x, panel.y + 54.0, 48.0, 20.0);
             layer.push_text(
                 TextShape::new(
-                    "Partisi".to_string(),
+                    "Partitions".to_string(),
                     crumb_x,
                     panel.y + 54.0,
                     11.0,
@@ -4147,7 +4338,7 @@ impl BrowserShell {
         if search_value.is_empty() {
             layer.push_text(
                 TextShape::new(
-                    "Cari folder...",
+                    "Search folders...",
                     search_rect.x + 34.0,
                     search_text_y,
                     12.0,
@@ -4247,7 +4438,7 @@ impl BrowserShell {
                 ));
                 layer.push_text(
                     TextShape::new(
-                        "Pilih".to_string(),
+                        "Choose".to_string(),
                         rect.right() - 40.0,
                         rect.y + 6.0,
                         11.0,
@@ -4280,7 +4471,7 @@ impl BrowserShell {
         let open_rect = Rect::new(panel.right() - 150.0, panel.bottom() - 44.0, 134.0, 30.0);
         for (rect, label, element) in [
             (cancel_rect, "Batal", Element::FolderCancel),
-            (open_rect, "Pilih folder ini", Element::FolderOpen),
+            (open_rect, "Choose this folder", Element::FolderOpen),
         ] {
             let active = hover == Some(element);
             layer.push_rect(RectShape::filled(
@@ -4346,7 +4537,7 @@ impl BrowserShell {
         ));
         self.push_hit(Element::ContextArea, rect);
 
-        let labels = ["Buka", "Edit", "Hapus"];
+        let labels = ["Open", "Edit", "Delete"];
         let elements = [
             Element::ContextOpen,
             Element::ContextEdit,
@@ -4549,7 +4740,7 @@ impl BrowserShell {
 
         layer.push_text(
             TextShape::new(
-                "Pilih tab untuk split (maks. 3)".to_string(),
+                "Select a tab to split (max 3)".to_string(),
                 rect.x + 12.0,
                 rect.y + 9.0,
                 12.0,
@@ -4862,14 +5053,14 @@ fn percent_encode(value: &str) -> String {
 
 fn host_from_url(value: &str) -> String {
     if value.is_empty() {
-        return "Tab baru".to_string();
+        return "New tab".to_string();
     }
     match url::Url::parse(value) {
         Ok(parsed) => parsed
             .host_str()
             .map(|host| host.trim_start_matches("www.").to_string())
-            .unwrap_or_else(|| "Tab baru".to_string()),
-        Err(_) => "Tab baru".to_string(),
+            .unwrap_or_else(|| "New tab".to_string()),
+        Err(_) => "New tab".to_string(),
     }
 }
 
@@ -5012,6 +5203,47 @@ mod tests {
             (shape.rect.width - CELL_WIDTH).abs() < 0.001
                 && (shape.rect.height - LINE_HEIGHT).abs() < 0.001
         }));
+    }
+
+    #[test]
+    fn terminal_drag_selection_extracts_text_across_rows() {
+        let mut shell = BrowserShell::new();
+        shell.open_terminal("C:/Projects/RushBross");
+        let run = |col: usize, text: &str| rb_terminal::Run {
+            col,
+            text: text.to_string(),
+            fg: [0xd4, 0xd4, 0xd4],
+            bg: None,
+            bold: false,
+        };
+        shell.set_terminal_snapshot(Snapshot {
+            cols: 12,
+            rows: 4,
+            lines: vec![vec![run(0, "abcdef")], vec![run(0, "ghijkl")]],
+            cursor: Some((1, 6)),
+            scrolled: false,
+        });
+        let body = shell
+            .terminal_layout(Rect::new(0.0, 0.0, 1000.0, 800.0))
+            .unwrap()
+            .body;
+        let point = |row: f32, col: f32| {
+            Vec2::new(
+                body.x + TERMINAL_PADDING_X + col * CELL_WIDTH + 0.1,
+                body.y + TERMINAL_PADDING_Y + row * LINE_HEIGHT + 0.1,
+            )
+        };
+        assert!(shell.begin_terminal_selection(body, point(0.0, 1.0)));
+        shell.finish_terminal_selection();
+        assert!(!shell.terminal_has_selection());
+        assert!(shell.terminal_selected_text().is_empty());
+        assert!(shell.begin_terminal_selection(body, point(0.0, 1.0)));
+        shell.extend_terminal_selection(body, point(1.0, 2.0));
+        shell.finish_terminal_selection();
+        assert_eq!(shell.terminal_selected_text(), "bcdef\nghi");
+        assert_eq!(shell.terminal_selection_rects(body).len(), 2);
+        shell.clear_terminal_selection();
+        assert!(shell.terminal_selected_text().is_empty());
     }
 
     #[test]
@@ -5335,7 +5567,7 @@ mod tests {
         assert_eq!(
             index(c),
             index(b) + 1,
-            "grup tidak boleh terbelah: {order:?}"
+            "splits must not straddle groups: {order:?}"
         );
         assert_eq!(index(a), 0);
         assert!(index(d) < index(b) || index(d) > index(c));

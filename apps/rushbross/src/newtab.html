@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="id">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tab baru</title>
+<title>New tab</title>
 <style>
 @font-face {
   font-family: "Manrope";
@@ -262,12 +262,12 @@ body::-webkit-scrollbar { display: none; }
   <form class="search" id="search" autocomplete="off">
     <label class="search-box">
       <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" /></svg>
-      <input id="query" name="q" type="text" placeholder="Cari atau ketik alamat" spellcheck="false" autofocus>
+      <input id="query" name="q" type="text" placeholder="Search or type an address" spellcheck="false" autofocus>
       <span class="hint" aria-hidden="true">Enter</span>
     </label>
   </form>
 
-  <nav class="shortcuts" aria-label="Pintasan">
+  <nav class="shortcuts" aria-label="Shortcuts">
     <a class="card" href="https://www.youtube.com">
       <span class="shine"></span>
       <span class="tile"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" /></svg></span>
@@ -324,7 +324,7 @@ body::-webkit-scrollbar { display: none; }
     if (target) window.location.href = target;
   });
 
-  // Tilt 3D dan shine hanya untuk card.
+  // 3D tilt and shine apply only to cards.
   function attachTilt(element, lift) {
     var frame = 0;
 
@@ -357,7 +357,7 @@ body::-webkit-scrollbar { display: none; }
   document.querySelectorAll(".card").forEach(function (card) {
     attachTilt(card, true);
   });
-  // Highlight per huruf: huruf dekat kursor menyala dan naik sedikit, seperti sorotan pada card.
+  // Per-letter highlight: letters near the cursor light up and lift slightly, like the card glow.
   var wordmark = document.querySelector(".wordmark");
   if (wordmark) {
     var letters = Array.prototype.slice.call(wordmark.querySelectorAll(".ch"));
