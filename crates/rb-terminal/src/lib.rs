@@ -308,7 +308,28 @@ impl PtyTerminal {
         }
         if changed {
             self.refresh();
+            if std::env::var_os("RUSHBROSS_TERM_DEBUG").is_some() {
+                self.log_snapshot();
+            }
         }
+    }
+
+    /// Log diagnostik (aktif bila env `RUSHBROSS_TERM_DEBUG` diset): posisi kursor dan
+    /// baris terakhir yang tidak kosong, untuk memeriksa kursor sejajar dengan prompt.
+    fn log_snapshot(&self) {
+        let last_text = self
+            .snapshot
+            .lines
+            .iter()
+            .rposition(|runs| runs.iter().any(|run| !run.text.trim().is_empty()));
+        eprintln!(
+            "[rb-terminal] cursor={:?} last_text_row={:?} rows={} cols={} scrolled={}",
+            self.snapshot.cursor,
+            last_text,
+            self.snapshot.rows,
+            self.snapshot.cols,
+            self.snapshot.scrolled
+        );
     }
 
     /// Keadaan layar terakhir yang sudah dihitung.
@@ -821,6 +842,46 @@ mod tests {
             "ketikan tidak sampai ke shell: {:?}",
             text_of(terminal.snapshot())
         );
+        terminal.kill();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cursor_alignment_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cursor_sits_on_prompt_after_resize() {
+        let mut terminal = PtyTerminal::spawn(
+            "/bin/sh",
+            &["-c", "sleep 0.3; printf 'C:\\\\FATTAN>'; sleep 3"],
+            &std::env::temp_dir(),
+            || {},
+        )
+        .expect("spawn");
+        terminal.resize(60, 40);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            terminal.pump();
+            let found = terminal
+                .snapshot()
+                .lines
+                .iter()
+                .position(|runs| runs.iter().any(|run| run.text.contains("FATTAN")));
+            if let Some(row) = found {
+                let snap = terminal.snapshot();
+                let (cur_row, cur_col) = snap.cursor.expect("cursor");
+                eprintln!(
+                    "prompt row={row} cursor=({cur_row},{cur_col}) rows={} cols={}",
+                    snap.rows, snap.cols
+                );
+                assert_eq!(cur_row, row, "kursor harus di baris prompt");
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt tidak muncul");
+            thread::sleep(Duration::from_millis(20));
+        }
         terminal.kill();
     }
 }

@@ -2456,13 +2456,14 @@ impl BrowserShell {
             .as_ref()
             .filter(|(_, until)| Instant::now() < *until)
         {
+            // Toast di pojok kanan atas, tepat di bawah toolbar. Saat terminal terbuka,
+            // turun sejajar header pane agar tidak menutupi tombol tutup.
             let toast_width = (approx_text_width(text, 12.0) + 24.0).min(width - 24.0);
-            let rect = Rect::new(
-                (width - toast_width) * 0.5,
-                height - 46.0,
-                toast_width,
-                28.0,
-            );
+            let top = TAB_STRIP_HEIGHT
+                + TOOLBAR_HEIGHT
+                + 8.0
+                + if self.terminal.is_some() { SPLIT_HEADER_HEIGHT } else { 0.0 };
+            let rect = Rect::new(width - toast_width - 16.0, top, toast_width, 28.0);
             frame.overlay.push_rect(RectShape::filled(rect, theme.popover, 6.0));
             frame.overlay.push_text(
                 TextShape::new(
