@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 mod chrome;
@@ -49,10 +50,19 @@ const BOOKMARK_BAR_HEIGHT: f32 = 32.0;
 const BOOKMARK_CHIP_HEIGHT: f32 = 24.0;
 const POPOVER_WIDTH: f32 = 320.0;
 const POPOVER_MAX_LIST_HEIGHT: f32 = 240.0;
+const FOLDER_PICKER_WIDTH: f32 = 420.0;
+const FOLDER_PICKER_HEIGHT: f32 = 440.0;
+const FOLDER_ROW_HEIGHT: f32 = 28.0;
+const FOLDER_VISIBLE_ROWS: usize = 9;
+const FOLDER_SCAN_LIMIT: usize = 2000;
+const FOLDER_KEEP_LIMIT: usize = 400;
 const ROW_HEIGHT: f32 = 36.0;
 const CONTEXT_WIDTH: f32 = 160.0;
 const NAV_BUTTON_SIZE: f32 = 32.0;
 const NAV_GAP: f32 = 6.0;
+const AGENT_BUTTON_WIDTH: f32 = 104.0;
+const CONNECT_BUTTON_WIDTH: f32 = 118.0;
+const AGENT_ICON_SIZE: f32 = 18.0;
 const FULLSCREEN_BAR_HEIGHT: f32 = 56.0;
 const ADDRESS_FONT_SIZE: f32 = 14.0;
 const WINDOW_BORDER_RADIUS: f32 = 10.0;
@@ -61,11 +71,21 @@ const WINDOW_BORDER_RADIUS: f32 = 10.0;
 /// address bar, dan host WebView memuat halaman beranda lokal untuknya.
 pub const NEW_TAB_URL: &str = "rushbross://newtab";
 
+static RUSH_AGENT_ICON: OnceLock<Arc<[u8]>> = OnceLock::new();
+
+fn rush_agent_icon() -> Arc<[u8]> {
+    RUSH_AGENT_ICON
+        .get_or_init(|| Arc::from(include_bytes!("../../../assets/rb-agent.png").as_slice()))
+        .clone()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Address,
     BookmarkTitle,
     BookmarkUrl,
+    FolderSearch,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +107,8 @@ enum Element {
     Profile,
     ToolbarMore,
     RushAgent,
+    AgentConnect,
+    Select,
     TerminalPane,
     TerminalDivider,
     TerminalClose,
@@ -105,6 +127,14 @@ enum Element {
     EditUrl,
     EditCancel,
     EditSave,
+    FolderSearch,
+    FolderDrive(usize),
+    FolderBreadcrumb(usize),
+    FolderPartition,
+    FolderRow(usize),
+    FolderBack,
+    FolderOpen,
+    FolderCancel,
     ContextArea,
     ContextOpen,
     ContextEdit,
@@ -141,6 +171,14 @@ impl Element {
                 | Element::EditUrl
                 | Element::EditCancel
                 | Element::EditSave
+                | Element::FolderSearch
+                | Element::FolderDrive(_)
+                | Element::FolderBreadcrumb(_)
+                | Element::FolderPartition
+                | Element::FolderRow(_)
+                | Element::FolderBack
+                | Element::FolderOpen
+                | Element::FolderCancel
         )
     }
 
@@ -186,6 +224,104 @@ struct BookmarkEdit {
     id: BookmarkId,
     title: TextInput,
     url: TextInput,
+}
+
+#[derive(Clone, Debug)]
+struct FolderPicker {
+    drives: Vec<PathBuf>,
+    history: Vec<PathBuf>,
+    search: TextInput,
+    folders: Vec<PathBuf>,
+    filtered: Vec<PathBuf>,
+    selected: Option<usize>,
+    scroll: usize,
+}
+
+fn logical_drives() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+        (0..26)
+            .filter(|index| mask & (1u32 << index) != 0)
+            .map(|index| PathBuf::from(format!("{}:\\", (b'A' + index) as char)))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+impl FolderPicker {
+    fn current(&self) -> Option<&PathBuf> {
+        self.history.last()
+    }
+
+    fn refresh(&mut self) {
+        let query = self.search.text().trim().to_ascii_lowercase();
+        if let Some(current) = self.current().cloned() {
+            let mut folders = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&current) {
+                for entry in entries.flatten().take(FOLDER_SCAN_LIMIT) {
+                    if folders.len() >= FOLDER_KEEP_LIMIT {
+                        break;
+                    }
+                    if let Ok(kind) = entry.file_type() {
+                        if kind.is_dir() {
+                            folders.push(entry.path());
+                        }
+                    }
+                }
+            }
+            folders.sort_by_key(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default()
+            });
+            self.folders = folders;
+            self.filtered = self
+                .folders
+                .iter()
+                .filter(|path| {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    query.is_empty() || name.contains(&query)
+                })
+                .take(FOLDER_KEEP_LIMIT)
+                .cloned()
+                .collect();
+        } else {
+            self.filtered = self.drives.clone();
+        }
+        self.scroll = 0;
+        self.selected = if self.filtered.is_empty() {
+            None
+        } else {
+            Some(self.selected.unwrap_or(0).min(self.filtered.len() - 1))
+        };
+    }
+
+    fn enter(&mut self) {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(path) = self.filtered.get(index).cloned() else {
+            return;
+        };
+        self.history.push(path);
+        self.search.clear();
+        self.selected = Some(0);
+        self.refresh();
+    }
+
+    fn back(&mut self) {
+        self.history.pop();
+        self.search.clear();
+        self.selected = Some(0);
+        self.refresh();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -363,6 +499,9 @@ pub struct BrowserShell {
     fullscreen: bool,
     show_bookmarks: bool,
     editing: Option<BookmarkEdit>,
+    folder_picker: Option<FolderPicker>,
+    pending_cd: Option<String>,
+    pending_folder_cancel: bool,
     context_menu: Option<ContextMenu>,
     tab_context_menu: Option<TabContextMenu>,
     split_picker: Option<SplitPicker>,
@@ -370,8 +509,15 @@ pub struct BrowserShell {
     splits: Vec<SplitView>,
     split_drag: Option<usize>,
     terminal: Option<TerminalPane>,
+    terminal_lines: Vec<String>,
     terminal_drag: bool,
     pending_rush_agent: bool,
+    pending_agent_connect: bool,
+    pending_select_element: bool,
+    agent_connected: bool,
+    agent_actions_enabled: bool,
+    select_mode: bool,
+    toast: Option<(String, Instant)>,
     pending_terminal_close: bool,
     pointer: Vec2,
     hover: Option<Element>,
@@ -410,14 +556,24 @@ impl BrowserShell {
             fullscreen: false,
             show_bookmarks: false,
             editing: None,
+            folder_picker: None,
+            pending_cd: None,
+            pending_folder_cancel: false,
             context_menu: None,
             tab_context_menu: None,
             split_picker: None,
             splits: Vec::new(),
             split_drag: None,
             terminal: None,
+            terminal_lines: Vec::new(),
             terminal_drag: false,
             pending_rush_agent: false,
+            pending_agent_connect: false,
+            pending_select_element: false,
+            agent_connected: false,
+            agent_actions_enabled: false,
+            select_mode: false,
+            toast: None,
             pending_terminal_close: false,
             pointer: Vec2::new(-1000.0, -1000.0),
             hover: None,
@@ -482,8 +638,12 @@ impl BrowserShell {
 
     pub fn close_terminal(&mut self) {
         self.terminal = None;
+        self.terminal_lines.clear();
         self.terminal_drag = false;
         self.pending_terminal_close = false;
+        if self.focus == Some(Focus::Terminal) {
+            self.focus = None;
+        }
     }
 
     pub fn terminal_is_open(&self) -> bool {
@@ -492,6 +652,116 @@ impl BrowserShell {
 
     pub fn take_rush_agent(&mut self) -> bool {
         std::mem::take(&mut self.pending_rush_agent)
+    }
+
+    pub fn open_folder_picker(&mut self) {
+        let mut drives = logical_drives();
+        drives.sort();
+        let mut picker = FolderPicker {
+            drives,
+            history: Vec::new(),
+            search: TextInput::new(),
+            folders: Vec::new(),
+            filtered: Vec::new(),
+            selected: None,
+            scroll: 0,
+        };
+        picker.refresh();
+        self.folder_picker = Some(picker);
+        self.focus = None;
+        self.show_bookmarks = false;
+        self.editing = None;
+        self.context_menu = None;
+        self.tab_context_menu = None;
+        self.split_picker = None;
+    }
+
+    pub fn folder_picker_scroll(&mut self, lines: f32) -> bool {
+        let Some(picker) = self.folder_picker.as_mut() else {
+            return false;
+        };
+        let max = picker.filtered.len().saturating_sub(FOLDER_VISIBLE_ROWS);
+        let next = (picker.scroll as isize + lines.round() as isize).clamp(0, max as isize) as usize;
+        if next == picker.scroll {
+            return false;
+        }
+        picker.scroll = next;
+        true
+    }
+
+    pub fn focus_terminal(&mut self) {
+        if self.terminal.is_some() {
+            self.focus = Some(Focus::Terminal);
+        }
+    }
+
+    pub fn take_cd(&mut self) -> Option<String> {
+        self.pending_cd.take()
+    }
+
+    pub fn take_folder_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.pending_folder_cancel)
+    }
+
+    pub fn close_folder_picker(&mut self) {
+        self.folder_picker = None;
+        self.focus = None;
+    }
+
+    fn confirm_folder_picker(&mut self) {
+        let mut folder = None;
+        if let Some(picker) = self.folder_picker.as_ref() {
+            if let Some(index) = picker.selected {
+                folder = picker.filtered.get(index).cloned();
+            }
+            if folder.is_none() {
+                folder = picker.current().cloned();
+            }
+        }
+        if let Some(folder) = folder {
+            if folder.is_dir() {
+                self.pending_cd = Some(folder.to_string_lossy().into_owned());
+                self.close_folder_picker();
+                self.focus_terminal();
+                self.show_toast("RushAgent siap di folder ini");
+            }
+        }
+    }
+
+    pub fn take_agent_connect(&mut self) -> bool {
+        std::mem::take(&mut self.pending_agent_connect)
+    }
+
+    pub fn take_select_element(&mut self) -> bool {
+        std::mem::take(&mut self.pending_select_element)
+    }
+
+    pub fn set_agent_connected(&mut self, connected: bool) {
+        self.agent_connected = connected;
+    }
+
+    pub fn set_agent_actions_enabled(&mut self, enabled: bool) {
+        self.agent_actions_enabled = enabled;
+    }
+
+    pub fn set_terminal_lines(&mut self, lines: &[String]) {
+        self.terminal_lines = lines.to_vec();
+    }
+
+    pub fn terminal_focused(&self) -> bool {
+        self.focus == Some(Focus::Terminal)
+    }
+
+    pub fn set_select_mode(&mut self, enabled: bool) {
+        self.select_mode = enabled;
+    }
+
+    pub fn select_mode(&self) -> bool {
+        self.select_mode
+    }
+
+    pub fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), Instant::now() + Duration::from_secs(3)));
     }
 
     pub fn take_terminal_close(&mut self) -> bool {
@@ -697,6 +967,21 @@ impl BrowserShell {
             return;
         }
 
+        if let Some((Element::FolderSearch, rect)) = hit {
+            let text = self
+                .folder_picker
+                .as_ref()
+                .map(|picker| picker.search.text().to_string())
+                .unwrap_or_default();
+            let offset = (position.x - rect.x - 10.0).max(0.0);
+            let index = index_at_offset(&text, offset, 12.0);
+            self.focus = Some(Focus::FolderSearch);
+            if let Some(picker) = self.folder_picker.as_mut() {
+                picker.search.set_caret(index);
+            }
+            return;
+        }
+
         if let Some(element) = hit.map(|(element, _)| element) {
             if self.context_menu.is_some() && !element.is_context() {
                 self.context_menu = None;
@@ -709,8 +994,14 @@ impl BrowserShell {
                 self.editing = None;
                 self.blur();
             }
+            if self.folder_picker.is_some() && !element.is_popover() {
+                return;
+            }
             self.activate(element);
         } else {
+            if self.folder_picker.is_some() {
+                return;
+            }
             self.context_menu = None;
             self.tab_context_menu = None;
             self.split_picker = None;
@@ -810,7 +1101,12 @@ impl BrowserShell {
             .find(|(_, rect)| rect.contains(position))
             .map(|(element, _)| *element)
         {
-            Some(Element::Address | Element::EditTitle | Element::EditUrl) => CursorRole::Text,
+            Some(
+                Element::Address
+                | Element::EditTitle
+                | Element::EditUrl
+                | Element::FolderSearch,
+            ) => CursorRole::Text,
             Some(Element::WindowDrag) => CursorRole::Default,
             Some(_) => CursorRole::Pointer,
             None => CursorRole::Default,
@@ -830,88 +1126,23 @@ impl BrowserShell {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        match self.focus {
-            Some(Focus::Address) => self.address.insert_text(text),
-            Some(Focus::BookmarkTitle) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.title.insert_text(text);
-                }
-            }
-            Some(Focus::BookmarkUrl) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.url.insert_text(text);
-                }
-            }
-            None => {}
-        }
+        self.field_mut(|field| field.insert_text(text));
     }
 
     pub fn backspace(&mut self) {
-        match self.focus {
-            Some(Focus::Address) => self.address.backspace(),
-            Some(Focus::BookmarkTitle) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.title.backspace();
-                }
-            }
-            Some(Focus::BookmarkUrl) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.url.backspace();
-                }
-            }
-            None => {}
-        }
+        self.field_mut(|field| field.backspace());
     }
 
     pub fn delete_forward(&mut self) {
-        match self.focus {
-            Some(Focus::Address) => self.address.delete_forward(),
-            Some(Focus::BookmarkTitle) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.title.delete_forward();
-                }
-            }
-            Some(Focus::BookmarkUrl) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.url.delete_forward();
-                }
-            }
-            None => {}
-        }
+        self.field_mut(|field| field.delete_forward());
     }
 
     pub fn move_left(&mut self, word: bool) {
-        match self.focus {
-            Some(Focus::Address) => self.address.move_left(word),
-            Some(Focus::BookmarkTitle) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.title.move_left(word);
-                }
-            }
-            Some(Focus::BookmarkUrl) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.url.move_left(word);
-                }
-            }
-            None => {}
-        }
+        self.field_mut(|field| field.move_left(word));
     }
 
     pub fn move_right(&mut self, word: bool) {
-        match self.focus {
-            Some(Focus::Address) => self.address.move_right(word),
-            Some(Focus::BookmarkTitle) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.title.move_right(word);
-                }
-            }
-            Some(Focus::BookmarkUrl) => {
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.url.move_right(word);
-                }
-            }
-            None => {}
-        }
+        self.field_mut(|field| field.move_right(word));
     }
 
     pub fn move_home(&mut self) {
@@ -932,6 +1163,10 @@ impl BrowserShell {
     }
 
     pub fn submit(&mut self) {
+        if self.folder_picker.is_some() {
+            self.confirm_folder_picker();
+            return;
+        }
         let raw = self.address.text().trim().to_string();
         if raw.is_empty() {
             return;
@@ -943,6 +1178,9 @@ impl BrowserShell {
     }
 
     pub fn escape(&mut self) {
+        if self.folder_picker.is_some() {
+            return;
+        }
         if self.split_picker.is_some() {
             self.split_picker = None;
             return;
@@ -1033,6 +1271,18 @@ impl BrowserShell {
 
     pub fn active_tab_id(&self) -> Option<TabId> {
         self.tabs.active_id()
+    }
+
+    pub fn tab_infos(&self) -> Vec<(TabId, String, Option<String>)> {
+        self.tabs
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id, tab.title.clone(), tab.url.clone()))
+            .collect()
+    }
+
+    pub fn navigate_active(&mut self, url: String) {
+        self.navigate(url, String::new());
     }
 
     /// Tab yang sedang difokuskan WebView. Dalam split view ini adalah pane aktif.
@@ -1444,7 +1694,11 @@ impl BrowserShell {
 
     /// Spinner harus terus beranimasi selama halaman dimuat dan sesaat setelahnya.
     pub fn has_animation(&self) -> bool {
-        self.spin_start
+        self.folder_picker.is_some()
+            || self.toast
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() < *until)
+            || self.spin_start
             .is_some_and(|start| start.elapsed() < Duration::from_millis(900))
             || self.tabs.tabs().iter().any(|tab| tab.loading)
             || self
@@ -1587,6 +1841,7 @@ impl BrowserShell {
     }
 
     fn field_mut(&mut self, action: impl FnOnce(&mut TextInput)) {
+        let refresh = matches!(self.focus, Some(Focus::FolderSearch));
         match self.focus {
             Some(Focus::Address) => action(&mut self.address),
             Some(Focus::BookmarkTitle) => {
@@ -1599,7 +1854,17 @@ impl BrowserShell {
                     action(&mut edit.url);
                 }
             }
-            None => {}
+            Some(Focus::FolderSearch) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    action(&mut picker.search);
+                }
+            }
+            Some(Focus::Terminal) | None => {}
+        }
+        if refresh {
+            if let Some(picker) = self.folder_picker.as_mut() {
+                picker.refresh();
+            }
         }
     }
 
@@ -1639,7 +1904,26 @@ impl BrowserShell {
                 self.split_picker = None;
                 self.blur();
             }
-            Element::TerminalPane | Element::TerminalDivider => {}
+            Element::AgentConnect => {
+                self.pending_agent_connect = true;
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.context_menu = None;
+                self.tab_context_menu = None;
+                self.split_picker = None;
+                self.blur();
+            }
+            Element::Select => {
+                self.pending_select_element = true;
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.context_menu = None;
+                self.tab_context_menu = None;
+                self.split_picker = None;
+                self.blur();
+            }
+            Element::TerminalPane => self.focus = Some(Focus::Terminal),
+            Element::TerminalDivider => {}
             Element::TerminalClose => self.pending_terminal_close = true,
             Element::FullscreenClose => {
                 self.pending_fullscreen_exit = true;
@@ -1719,6 +2003,50 @@ impl BrowserShell {
                 self.focus = None;
             }
             Element::EditSave => self.save_bookmark_edit(),
+            Element::FolderSearch => self.focus = Some(Focus::FolderSearch),
+            Element::FolderDrive(index) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.selected = Some(index);
+                    picker.enter();
+                }
+                self.focus = Some(Focus::FolderSearch);
+            }
+            Element::FolderPartition => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.history.clear();
+                    picker.search.clear();
+                    picker.selected = None;
+                    picker.refresh();
+                }
+                self.focus = None;
+            }
+            Element::FolderBreadcrumb(index) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.history.truncate(index + 1);
+                    picker.search.clear();
+                    picker.selected = Some(0);
+                    picker.refresh();
+                }
+                self.focus = Some(Focus::FolderSearch);
+            }
+            Element::FolderRow(index) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.selected = Some(index);
+                    picker.enter();
+                }
+                self.focus = Some(Focus::FolderSearch);
+            }
+            Element::FolderBack => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.back();
+                }
+                self.focus = Some(Focus::FolderSearch);
+            }
+            Element::FolderOpen => self.confirm_folder_picker(),
+            Element::FolderCancel => {
+                self.pending_folder_cancel = true;
+                self.close_folder_picker();
+            }
             Element::ContextArea => {}
             Element::ContextOpen => {
                 if let Some(menu) = self.context_menu {
@@ -1934,6 +2262,7 @@ impl BrowserShell {
         let address_cursor = self.address.cursor();
         let focus = self.focus;
         let editing = self.editing.clone();
+        let folder_picker = self.folder_picker.clone();
         let hover = self.hover;
         let show_bookmarks = self.show_bookmarks;
         let context_menu = self.context_menu;
@@ -2028,6 +2357,9 @@ impl BrowserShell {
                 &mut frame, width, height, &bookmarks, &editing, focus, hover,
             );
         }
+        if let Some(picker) = folder_picker.as_ref() {
+            self.build_folder_picker(&mut frame, width, height, picker, focus, hover);
+        }
 
         if let Some(menu) = context_menu {
             self.build_context_menu(&mut frame, width, height, &bookmarks, menu, hover);
@@ -2055,6 +2387,7 @@ impl BrowserShell {
             })
             .filter(|(_, _, text)| !text.is_empty());
         frame.popup_open = show_bookmarks
+            || folder_picker.is_some()
             || context_menu.is_some()
             || tab_context_menu.is_some()
             || picker_is_open;
@@ -2080,6 +2413,32 @@ impl BrowserShell {
                     theme.popover_foreground,
                 )
                 .width(rect.width - 16.0)
+                .ellipsis(),
+            );
+        }
+
+        if let Some((text, _)) = self
+            .toast
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+        {
+            let toast_width = (approx_text_width(text, 12.0) + 24.0).min(width - 24.0);
+            let rect = Rect::new(
+                (width - toast_width) * 0.5,
+                height - 46.0,
+                toast_width,
+                28.0,
+            );
+            frame.overlay.push_rect(RectShape::filled(rect, theme.popover, 6.0));
+            frame.overlay.push_text(
+                TextShape::new(
+                    text.clone(),
+                    rect.x + 12.0,
+                    rect.y + 7.0,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width(rect.width - 24.0)
                 .ellipsis(),
             );
         }
@@ -2180,6 +2539,23 @@ impl BrowserShell {
             Color::rgb(0x0c, 0x0c, 0x0c),
             0.0,
         ));
+        let line_height = 16.0;
+        let visible_lines = (layout.body.height / line_height).floor().max(0.0) as usize;
+        let start = self.terminal_lines.len().saturating_sub(visible_lines);
+        for (index, line) in self.terminal_lines[start..].iter().enumerate() {
+            layer.push_text(
+                TextShape::new(
+                    line.clone(),
+                    layout.body.x + 8.0,
+                    layout.body.y + 4.0 + index as f32 * line_height,
+                    12.0,
+                    Color::rgb(0xd4, 0xd4, 0xd4),
+                )
+                .width((layout.body.width - 16.0).max(0.0))
+                .line_height(line_height)
+                .ellipsis(),
+            );
+        }
         self.push_hit(Element::TerminalPane, layout.pane);
 
         let divider = Rect::new(
@@ -2670,9 +3046,21 @@ impl BrowserShell {
             NAV_BUTTON_SIZE,
         );
         let agent_rect = Rect::new(
-            menu_rect.x - gap - NAV_BUTTON_SIZE,
+            menu_rect.x - gap - AGENT_BUTTON_WIDTH,
+            button_y,
+            AGENT_BUTTON_WIDTH,
+            NAV_BUTTON_SIZE,
+        );
+        let select_rect = Rect::new(
+            agent_rect.x - gap - NAV_BUTTON_SIZE,
             button_y,
             NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
+        let connect_rect = Rect::new(
+            select_rect.x - gap - CONNECT_BUTTON_WIDTH,
+            button_y,
+            CONNECT_BUTTON_WIDTH,
             NAV_BUTTON_SIZE,
         );
         self.layout.manage_button = more_rect;
@@ -2680,7 +3068,7 @@ impl BrowserShell {
         let form = Rect::new(
             reload_rect.right() + gap,
             toolbar.y + 6.0,
-            (agent_rect.x - gap - reload_rect.right() - gap).max(1.0),
+            (connect_rect.x - gap - reload_rect.right() - gap).max(1.0),
             ADDRESS_HEIGHT,
         );
 
@@ -2741,12 +3129,90 @@ impl BrowserShell {
             has_url,
             self.spin_rotation(),
         );
+        let agent_enabled = self.agent_actions_enabled;
+        let agent_hover = hover == Some(Element::RushAgent);
+        layer.push_rect(RectShape::filled(
+            agent_rect,
+            if agent_hover {
+                theme.accent
+            } else {
+                theme.muted
+            },
+            agent_rect.height * 0.5,
+        ));
+        layer.push_image(ImageShape::new(
+            rush_agent_icon(),
+            Rect::new(
+                agent_rect.x + 8.0,
+                button_y + (NAV_BUTTON_SIZE - AGENT_ICON_SIZE) * 0.5,
+                AGENT_ICON_SIZE,
+                AGENT_ICON_SIZE,
+            ),
+        ));
+        layer.push_text(
+            TextShape::new(
+                "RushAgent".to_string(),
+                agent_rect.x + 32.0,
+                button_y + 9.0,
+                12.0,
+                theme.foreground,
+            )
+            .width(agent_rect.width - 40.0)
+            .ellipsis(),
+        );
+        if agent_enabled && self.select_mode {
+            layer.push_rect(RectShape::filled(
+                select_rect,
+                theme.accent,
+                NAV_BUTTON_SIZE * 0.5,
+            ));
+        }
+        let connected = self.agent_connected;
+        let connect_hover = hover == Some(Element::AgentConnect) && agent_enabled;
+        let connect_color = if !agent_enabled {
+            theme.muted_foreground.with_alpha(0.35)
+        } else if connected {
+            Color::rgb(0x22, 0xc5, 0x5e)
+        } else {
+            theme.foreground
+        };
+        layer.push_rect(RectShape::filled(
+            connect_rect,
+            if connect_hover {
+                theme.accent
+            } else {
+                theme.muted
+            },
+            connect_rect.height * 0.5,
+        ));
+        layer.push_icon(IconShape::new(
+            Icon::AgentConnect,
+            icon_rect(
+                rb_ui::Vec2::new(
+                    connect_rect.x + 17.0,
+                    button_y + NAV_BUTTON_SIZE * 0.5,
+                ),
+                16.0,
+            ),
+            connect_color,
+        ));
+        layer.push_text(
+            TextShape::new(
+                "Connect MCP".to_string(),
+                connect_rect.x + 30.0,
+                button_y + 9.0,
+                12.0,
+                connect_color,
+            )
+            .width(connect_rect.width - 38.0)
+            .ellipsis(),
+        );
         nav_button(
             layer,
-            agent_rect,
-            Icon::RushAgent,
-            Element::RushAgent,
-            true,
+            select_rect,
+            Icon::SelectElement,
+            Element::Select,
+            agent_enabled,
             0.0,
         );
         nav_button(
@@ -2777,6 +3243,10 @@ impl BrowserShell {
         self.push_hit(Element::Forward, forward_rect);
         self.push_hit(Element::Reload, reload_rect);
         self.push_hit(Element::RushAgent, agent_rect);
+        if agent_enabled {
+            self.push_hit(Element::AgentConnect, connect_rect);
+            self.push_hit(Element::Select, select_rect);
+        }
         self.push_hit(Element::ToolbarMenu, menu_rect);
         self.push_hit(Element::Profile, profile_rect);
         self.push_hit(Element::ToolbarMore, more_rect);
@@ -3397,6 +3867,248 @@ impl BrowserShell {
             );
         }
         self.push_hit(element, rect);
+    }
+
+    fn build_folder_picker(
+        &mut self,
+        frame: &mut Frame,
+        width: f32,
+        height: f32,
+        picker: &FolderPicker,
+        focus: Option<Focus>,
+        hover: Option<Element>,
+    ) {
+        let theme = self.theme;
+        let panel = Rect::new(
+            ((width - FOLDER_PICKER_WIDTH) * 0.5).max(8.0),
+            ((height - FOLDER_PICKER_HEIGHT) * 0.5).max(8.0),
+            FOLDER_PICKER_WIDTH,
+            FOLDER_PICKER_HEIGHT,
+        );
+        let layer = &mut frame.popup;
+        layer.push_rect(RectShape::bordered(
+            panel,
+            theme.popover,
+            10.0,
+            1.0,
+            theme.border,
+        ));
+        self.push_hit(Element::PopoverArea, panel);
+        layer.push_text(TextShape::new(
+            "Pilih folder project".to_string(),
+            panel.x + 16.0,
+            panel.y + 12.0,
+            13.0,
+            theme.foreground,
+        ));
+        layer.push_text(
+            TextShape::new(
+                "Pilih partisi lalu telusuri folder yang diinginkan.".to_string(),
+                panel.x + 16.0,
+                panel.y + 30.0,
+                10.0,
+                theme.muted_foreground,
+            )
+            .width(panel.width - 32.0)
+            .ellipsis(),
+        );
+
+        let mut crumb_x = panel.x + 16.0;
+        if picker.history.is_empty() {
+            layer.push_text(
+                TextShape::new(
+                    "Partisi".to_string(),
+                    crumb_x,
+                    panel.y + 54.0,
+                    11.0,
+                    theme.foreground,
+                ),
+            );
+        } else {
+            let back_rect = Rect::new(crumb_x, panel.y + 52.0, 24.0, 22.0);
+            if hover == Some(Element::FolderBack) {
+                layer.push_rect(RectShape::filled(back_rect, theme.accent, 4.0));
+            }
+            layer.push_icon(IconShape::new(
+                Icon::ArrowLeft,
+                icon_rect(back_rect.center(), 12.0),
+                theme.foreground,
+            ));
+            self.push_hit(Element::FolderBack, back_rect);
+            crumb_x += 30.0;
+            let partition_rect = Rect::new(crumb_x, panel.y + 54.0, 48.0, 20.0);
+            layer.push_text(
+                TextShape::new(
+                    "Partisi".to_string(),
+                    crumb_x,
+                    panel.y + 54.0,
+                    11.0,
+                    theme.muted_foreground,
+                )
+                .width(partition_rect.width)
+                .ellipsis(),
+            );
+            self.push_hit(Element::FolderPartition, partition_rect);
+            crumb_x += 54.0;
+            for (index, part) in picker.history.iter().enumerate() {
+                let name = part
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| part.to_string_lossy().into_owned());
+                let label_width = (approx_text_width(&name, 11.0) + 12.0).min(110.0);
+                layer.push_icon(IconShape::new(
+                    Icon::ChevronRight,
+                    icon_rect(Vec2::new(crumb_x + 6.0, panel.y + 64.0), 10.0),
+                    theme.muted_foreground,
+                ));
+                crumb_x += 14.0;
+                let rect = Rect::new(crumb_x, panel.y + 54.0, label_width, 20.0);
+                layer.push_text(
+                    TextShape::new(
+                        name,
+                        crumb_x,
+                        panel.y + 54.0,
+                        11.0,
+                        if index + 1 == picker.history.len() {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        },
+                    )
+                    .width(label_width)
+                    .ellipsis(),
+                );
+                self.push_hit(Element::FolderBreadcrumb(index), rect);
+                crumb_x += label_width + 4.0;
+            }
+        }
+
+        let search_rect = Rect::new(panel.x + 16.0, panel.y + 82.0, panel.width - 32.0, 32.0);
+        self.build_edit_input(
+            layer,
+            search_rect,
+            picker.search.text(),
+            picker.search.cursor(),
+            focus == Some(Focus::FolderSearch),
+            "Cari folder...",
+            Element::FolderSearch,
+        );
+
+        let list_y = search_rect.bottom() + 10.0;
+        let total = picker.filtered.len();
+        let offset = picker.scroll.min(total.saturating_sub(FOLDER_VISIBLE_ROWS));
+        let rows = total.saturating_sub(offset).min(FOLDER_VISIBLE_ROWS);
+        for row in 0..rows {
+            let index = offset + row;
+            let rect = Rect::new(
+                panel.x + 16.0,
+                list_y + row as f32 * FOLDER_ROW_HEIGHT,
+                panel.width - 32.0,
+                FOLDER_ROW_HEIGHT - 2.0,
+            );
+            let is_drive = picker.history.is_empty();
+            let element = if is_drive {
+                Element::FolderDrive(index)
+            } else {
+                Element::FolderRow(index)
+            };
+            let selected = picker.selected == Some(index);
+            let row_hover = hover == Some(element);
+            layer.push_rect(RectShape::filled(
+                rect,
+                if selected || row_hover {
+                    theme.accent
+                } else {
+                    theme.background
+                },
+                4.0,
+            ));
+            let path = &picker.filtered[index];
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            layer.push_icon(IconShape::new(
+                if is_drive {
+                    Icon::HardDrive
+                } else {
+                    Icon::Folder
+                },
+                icon_rect(Vec2::new(rect.x + 14.0, rect.center().y), 14.0),
+                theme.muted_foreground,
+            ));
+            layer.push_text(
+                TextShape::new(
+                    name,
+                    rect.x + 26.0,
+                    rect.y + 6.0,
+                    12.0,
+                    if selected {
+                        theme.foreground
+                    } else {
+                        theme.popover_foreground
+                    },
+                )
+                .width(rect.width - 90.0)
+                .ellipsis(),
+            );
+            if row_hover {
+                layer.push_text(
+                    TextShape::new(
+                        "Pilih".to_string(),
+                        rect.right() - 48.0,
+                        rect.y + 6.0,
+                        11.0,
+                        theme.foreground,
+                    ),
+                );
+            }
+            self.push_hit(element, rect);
+        }
+        if total > FOLDER_VISIBLE_ROWS {
+            let track = Rect::new(
+                panel.right() - 12.0,
+                list_y,
+                3.0,
+                FOLDER_VISIBLE_ROWS as f32 * FOLDER_ROW_HEIGHT,
+            );
+            layer.push_rect(RectShape::filled(track, theme.muted, 1.5));
+            let max = total - FOLDER_VISIBLE_ROWS;
+            let thumb_height = (track.height * FOLDER_VISIBLE_ROWS as f32 / total as f32).max(24.0);
+            let thumb_y = track.y
+                + (track.height - thumb_height) * offset as f32 / max as f32;
+            layer.push_rect(RectShape::filled(
+                Rect::new(track.x, thumb_y, track.width, thumb_height),
+                theme.accent,
+                1.5,
+            ));
+        }
+
+        let cancel_rect = Rect::new(panel.x + 16.0, panel.bottom() - 44.0, 110.0, 30.0);
+        let open_rect = Rect::new(panel.right() - 150.0, panel.bottom() - 44.0, 134.0, 30.0);
+        for (rect, label, element) in [
+            (cancel_rect, "Batal", Element::FolderCancel),
+            (open_rect, "Pilih folder ini", Element::FolderOpen),
+        ] {
+            let active = hover == Some(element);
+            layer.push_rect(RectShape::filled(
+                rect,
+                if active { theme.accent } else { theme.muted },
+                6.0,
+            ));
+            layer.push_text(
+                TextShape::new(
+                    label.to_string(),
+                    rect.x + 12.0,
+                    rect.y + 8.0,
+                    12.0,
+                    theme.foreground,
+                )
+                .width(rect.width - 24.0)
+                .ellipsis(),
+            );
+            self.push_hit(element, rect);
+        }
     }
 
     fn build_context_menu(
@@ -4448,5 +5160,32 @@ mod tests {
         shell.tabs.toggle_pin(original);
         assert_eq!(shell.tabs.tabs()[0].id, original);
         assert!(shell.tabs.is_pinned(original));
+    }
+
+    #[test]
+    fn folder_picker_cd_and_cancel() {
+        let mut shell = BrowserShell::new();
+        shell.open_folder_picker();
+        assert!(shell.folder_picker.is_some());
+        shell.submit();
+        assert!(shell.take_cd().is_some());
+        assert!(shell.folder_picker.is_none());
+        shell.activate(Element::FolderCancel);
+        assert!(shell.take_folder_cancel());
+        assert!(shell.folder_picker.is_none());
+    }
+
+    #[test]
+    fn folder_picker_scrolls_long_lists() {
+        let mut shell = BrowserShell::new();
+        shell.open_folder_picker();
+        let picker = shell.folder_picker.as_mut().unwrap();
+        picker.filtered = (0..30)
+            .map(|index| PathBuf::from(format!("C:\\folder{index}")))
+            .collect();
+        assert!(shell.folder_picker_scroll(3.0));
+        assert_eq!(shell.folder_picker.as_ref().unwrap().scroll, 3);
+        assert!(shell.folder_picker_scroll(-100.0));
+        assert_eq!(shell.folder_picker.as_ref().unwrap().scroll, 0);
     }
 }

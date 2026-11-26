@@ -2,9 +2,11 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
+use rb_agent::AgentRequest;
 use rb_tabs::TabId;
 use rb_ui::Rect;
 use rb_ui_widgets::NEW_TAB_URL;
+use serde_json::{json, Value};
 use webview2_com::{
     take_pwstr,
     Microsoft::Web::WebView2::Win32::{
@@ -17,12 +19,13 @@ use webview2_com::{
     },
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
-    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
-    DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
-    GetFaviconCompletedHandler, IsDocumentPlayingAudioChangedEventHandler,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
-    TrySuspendCompletedHandler,
+    AcceleratorKeyPressedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
+    ContainsFullScreenElementChangedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
+    ExecuteScriptCompletedHandler, FaviconChangedEventHandler, GetFaviconCompletedHandler,
+    IsDocumentPlayingAudioChangedEventHandler, NavigationCompletedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, TrySuspendCompletedHandler,
+    WebMessageReceivedEventHandler,
 };
 use windows::core::{Interface, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, RECT};
@@ -43,6 +46,7 @@ pub enum WebViewEvent {
     /// Tab sedang memutar audio; dipakai untuk ikon speaker di tab.
     PlayingAudio(TabId, bool),
     NewWindowRequested(String),
+    WebMessage(String),
     FullScreenChanged(TabId, bool),
     Accelerator {
         tab_id: TabId,
@@ -53,9 +57,9 @@ pub enum WebViewEvent {
     },
 }
 
-#[derive(Debug)]
 pub enum UserEvent {
     WebView(WebViewEvent),
+    Agent(AgentRequest),
 }
 
 struct Tokens {
@@ -67,6 +71,7 @@ struct Tokens {
     new_window: i64,
     fullscreen: i64,
     accelerator: i64,
+    web_message: i64,
 }
 
 /// Halaman tab baru: beranda lokal yang dimuat langsung ke WebView2.
@@ -80,6 +85,120 @@ const PAGE_BACKGROUND: COREWEBVIEW2_COLOR = COREWEBVIEW2_COLOR {
 };
 /// Alamat yang dilaporkan WebView2 untuk konten yang dimuat dengan NavigateToString.
 const ABOUT_BLANK: &str = "about:blank";
+
+const AGENT_JS: &str = r##"(function () {
+  if (window.__rbAgentReady) {
+    window.__rbAgentSetPicker(window.__rbAgentPickerEnabled);
+    return;
+  }
+  window.__rbAgentReady = true;
+  window.__rbAgentPickerEnabled = false;
+  function esc(value) {
+    if (window.CSS && CSS.escape) return CSS.escape(value);
+    return String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+  }
+  var style = document.createElement("style");
+  style.id = "rb-agent-style";
+  style.textContent =
+    "#rb-agent-cursor{position:fixed;left:0;top:0;width:24px;height:24px;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .12s ease-out,opacity .15s;will-change:transform}" +
+    "#rb-agent-cursor.rb-visible{opacity:1}" +
+    "#rb-agent-cursor svg{display:block;width:22px;height:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}" +
+    "#rb-agent-cursor .rb-label{position:absolute;left:18px;top:18px;padding:2px 5px;border-radius:4px;background:#22c55e;color:#04140b;font:600 10px/1.2 sans-serif;white-space:nowrap}" +
+    "#rb-agent-cursor.rb-typing .rb-label{background:#16a34a;color:white}" +
+    "#rb-agent-highlight{position:fixed;pointer-events:none;z-index:2147483646;display:none;border:2px solid #22c55e;background:rgba(34,197,94,.12);border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,.4)}" +
+    "#rb-agent-ripple{position:fixed;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #22c55e;border-radius:50%;pointer-events:none;z-index:2147483647;opacity:0;transition:transform .35s ease-out,opacity .35s ease-out}";
+  (document.head || document.documentElement).appendChild(style);
+  var cursor = document.createElement("div");
+  cursor.id = "rb-agent-cursor";
+  cursor.innerHTML = '<svg viewBox="0 0 24 24" fill="#22c55e"><path d="M4 2l15 10-7 1.2L9.4 20 4 2z"/></svg><span class="rb-label">RushAgent</span>';
+  (document.body || document.documentElement).appendChild(cursor);
+  var highlight = document.createElement("div");
+  highlight.id = "rb-agent-highlight";
+  (document.body || document.documentElement).appendChild(highlight);
+  var ripple = document.createElement("div");
+  ripple.id = "rb-agent-ripple";
+  (document.body || document.documentElement).appendChild(ripple);
+  window.__rbAgentCursor = {
+    move: function (x, y) {
+      cursor.style.transform = "translate3d(" + x + "px," + y + "px,0)";
+      cursor.classList.add("rb-visible");
+    },
+    click: function (x, y) {
+      this.move(x, y);
+      ripple.style.transform = "translate3d(" + x + "px," + y + "px,0) scale(2.4)";
+      ripple.style.opacity = "0.9";
+      window.setTimeout(function () { ripple.style.opacity = "0"; }, 60);
+    },
+    type: function () {
+      cursor.classList.add("rb-typing");
+      window.setTimeout(function () { cursor.classList.remove("rb-typing"); }, 700);
+    }
+  };
+  function selectorOf(node) {
+    var parts = [];
+    while (node && node.nodeType === 1 && parts.length < 8) {
+      var tag = node.tagName.toLowerCase();
+      if (node.id) {
+        parts.unshift("#" + esc(node.id));
+        break;
+      }
+      var classes = "";
+      if (typeof node.className === "string") {
+        classes = node.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).map(function (name) { return "." + esc(name); }).join("");
+      }
+      var parent = node.parentElement;
+      var suffix = "";
+      if (parent) {
+        var siblings = Array.prototype.filter.call(parent.children, function (child) { return child.tagName === node.tagName; });
+        if (siblings.length > 1) suffix = ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")";
+      }
+      parts.unshift(tag + classes + suffix);
+      node = parent;
+    }
+    return parts.join(" > ");
+  }
+  function describe(node) {
+    var rect = node.getBoundingClientRect();
+    return {
+      type: "rb-element-selected",
+      selector: selectorOf(node),
+      tag: node.tagName.toLowerCase(),
+      text: (node.innerText || node.textContent || "").trim().slice(0, 300),
+      html: (node.outerHTML || "").slice(0, 2000),
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      url: location.href,
+      title: document.title
+    };
+  }
+  function onMove(event) {
+    if (!window.__rbAgentPickerEnabled) return;
+    var node = document.elementFromPoint(event.clientX, event.clientY);
+    if (!node || node === highlight || node === cursor) return;
+    var rect = node.getBoundingClientRect();
+    highlight.style.display = "block";
+    highlight.style.transform = "translate3d(" + rect.x + "px," + rect.y + "px,0)";
+    highlight.style.width = rect.width + "px";
+    highlight.style.height = rect.height + "px";
+    window.__rbAgentCursor.move(event.clientX, event.clientY);
+  }
+  function onClick(event) {
+    if (!window.__rbAgentPickerEnabled) return;
+    var node = event.target;
+    if (!node || node.nodeType !== 1) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.__rbAgentSetPicker(false);
+    if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+      window.chrome.webview.postMessage(describe(node));
+    }
+  }
+  window.__rbAgentSetPicker = function (enabled) {
+    window.__rbAgentPickerEnabled = !!enabled;
+    if (!window.__rbAgentPickerEnabled) highlight.style.display = "none";
+  };
+  document.addEventListener("mousemove", onMove, true);
+  document.addEventListener("click", onClick, true);
+})();"##;
 
 const VK_TAB: u32 = 0x09;
 const VK_LEFT: u32 = 0x25;
@@ -433,6 +552,27 @@ impl WebViewRuntime {
                 .map_err(|error| error.to_string())?;
         }
 
+        let mut web_message_token = 0i64;
+        let proxy_message = proxy.clone();
+        unsafe {
+            webview
+                .add_WebMessageReceived(
+                    &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                        let mut message = PWSTR::null();
+                        args.WebMessageAsJson(&mut message)?;
+                        let _ = proxy_message.send_event(UserEvent::WebView(
+                            WebViewEvent::WebMessage(take_pwstr(message)),
+                        ));
+                        Ok(())
+                    })),
+                    &mut web_message_token,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         Ok(WebViewHost {
             controller,
             webview,
@@ -445,6 +585,7 @@ impl WebViewRuntime {
                 new_window: new_window_token,
                 fullscreen: fullscreen_token,
                 accelerator: accelerator_token,
+                web_message: web_message_token,
             },
             showing_new_tab: Cell::new(false),
         })
@@ -510,6 +651,204 @@ impl WebViewHost {
                 .map_err(|error| error.to_string())?;
         }
         Ok(take_pwstr(uri))
+    }
+
+    pub fn install_agent_helpers(&self) {
+        let script: Vec<u16> = AGENT_JS.encode_utf16().chain(Some(0)).collect();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+        unsafe {
+            let _ = self
+                .webview
+                .ExecuteScript(PCWSTR(script.as_ptr()), &handler);
+        }
+    }
+
+    pub fn move_cursor(&self, x: f64, y: f64) {
+        let script = format!("window.__rbAgentCursor.move({x},{y})");
+        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+        unsafe {
+            let _ = self.webview.ExecuteScript(PCWSTR(wide.as_ptr()), &handler);
+        }
+    }
+
+    pub fn set_picker(&self, enabled: bool) {
+        let script = format!("window.__rbAgentSetPicker({})", enabled);
+        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+        unsafe {
+            let _ = self.webview.ExecuteScript(PCWSTR(wide.as_ptr()), &handler);
+        }
+    }
+
+    pub fn eval(&self, expression: &str, reply: mpsc::Sender<Result<Value, String>>) {
+        let script = format!("JSON.stringify((function(){{ return ({expression}); }})())");
+        let wide: Vec<u16> = script.encode_utf16().chain(Some(0)).collect();
+        let error_reply = reply.clone();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |error_code, result| {
+            if error_code.is_ok() {
+                let value = serde_json::from_str(&result).unwrap_or(Value::Null);
+                let _ = reply.send(Ok(value));
+            } else {
+                let _ = reply.send(Err(error_code.err().map(|error| error.to_string()).unwrap_or_default()));
+            }
+            Ok(())
+        }));
+        if let Err(error) = unsafe {
+            self.webview
+                .ExecuteScript(PCWSTR(wide.as_ptr()), &handler)
+                .map_err(|error| error.to_string())
+        } {
+            let _ = error_reply.send(Err(error));
+        }
+    }
+
+    pub fn cdp(
+        &self,
+        method: &str,
+        params: &Value,
+        reply: mpsc::Sender<Result<Value, String>>,
+    ) {
+        let method_wide: Vec<u16> = method.encode_utf16().chain(Some(0)).collect();
+        let params_wide: Vec<u16> = params
+            .to_string()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let error_reply = reply.clone();
+        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| {
+                if error_code.is_ok() {
+                    let value = serde_json::from_str(&result).unwrap_or(Value::Null);
+                    let _ = reply.send(Ok(value));
+                } else {
+                    let _ = reply.send(Err(error_code.err().map(|error| error.to_string()).unwrap_or_default()));
+                }
+                Ok(())
+            },
+        ));
+        if let Err(error) = unsafe {
+            self.webview.CallDevToolsProtocolMethod(
+                PCWSTR(method_wide.as_ptr()),
+                PCWSTR(params_wide.as_ptr()),
+                &handler,
+            )
+        } {
+            let _ = error_reply.send(Err(error.to_string()));
+        }
+    }
+
+    fn cdp_pair(
+        &self,
+        method: &str,
+        first: Value,
+        second: Value,
+        reply: mpsc::Sender<Result<Value, String>>,
+    ) {
+        let webview = self.webview.clone();
+        let method_wide: Vec<u16> = method.encode_utf16().chain(Some(0)).collect();
+        let second_params = second.to_string();
+        let error_reply = reply.clone();
+        let first_error_reply = error_reply.clone();
+        let second_handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| {
+                if error_code.is_ok() {
+                    let value = serde_json::from_str(&result).unwrap_or(Value::Null);
+                    let _ = reply.send(Ok(value));
+                } else {
+                    let _ = reply.send(Err(error_code.err().map(|error| error.to_string()).unwrap_or_default()));
+                }
+                Ok(())
+            },
+        ));
+        let first_handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| {
+                if error_code.is_err() {
+                    let _ = first_error_reply.send(Err(error_code.err().map(|error| error.to_string()).unwrap_or_default()));
+                    return Ok(());
+                }
+                let method: Vec<u16> = method_wide.clone();
+                let params: Vec<u16> = second_params
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                unsafe {
+                    let _ = webview.CallDevToolsProtocolMethod(
+                        PCWSTR(method.as_ptr()),
+                        PCWSTR(params.as_ptr()),
+                        &second_handler,
+                    );
+                }
+                let _ = result;
+                Ok(())
+            },
+        ));
+        let first_params: Vec<u16> = first
+            .to_string()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let method_wide: Vec<u16> = method.encode_utf16().chain(Some(0)).collect();
+        if let Err(error) = unsafe {
+            self.webview.CallDevToolsProtocolMethod(
+                PCWSTR(method_wide.as_ptr()),
+                PCWSTR(first_params.as_ptr()),
+                &first_handler,
+            )
+        } {
+            let _ = error_reply.send(Err(error.to_string()));
+        }
+    }
+
+    pub fn click_at(&self, x: f64, y: f64, reply: mpsc::Sender<Result<Value, String>>) {
+        let pressed = json!({
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1
+        });
+        let released = json!({
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1
+        });
+        self.cdp_pair("Input.dispatchMouseEvent", pressed, released, reply);
+    }
+
+    pub fn insert_text(&self, text: &str, reply: mpsc::Sender<Result<Value, String>>) {
+        self.cdp("Input.insertText", &json!({ "text": text }), reply);
+    }
+
+    pub fn press_key(&self, key: &str, reply: mpsc::Sender<Result<Value, String>>) {
+        let (code, text, name) = match key.to_ascii_lowercase().as_str() {
+            "enter" | "return" => (13u32, "\r", "Enter"),
+            "tab" => (9, "\t", "Tab"),
+            "escape" | "esc" => (27, "", "Escape"),
+            "backspace" => (8, "", "Backspace"),
+            "delete" => (46, "", "Delete"),
+            "space" => (32, " ", " "),
+            _ => (0, key, key),
+        };
+        let down = json!({
+            "type": "keyDown",
+            "key": name,
+            "code": name,
+            "windowsVirtualKeyCode": code,
+            "nativeVirtualKeyCode": code,
+            "text": text,
+            "unmodifiedText": text
+        });
+        let up = json!({
+            "type": "keyUp",
+            "key": name,
+            "code": name,
+            "windowsVirtualKeyCode": code,
+            "nativeVirtualKeyCode": code
+        });
+        self.cdp_pair("Input.dispatchKeyEvent", down, up, reply);
     }
 
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -598,6 +937,9 @@ impl Drop for WebViewHost {
             let _ = self
                 .webview
                 .remove_ContainsFullScreenElementChanged(self.tokens.fullscreen);
+            let _ = self
+                .webview
+                .remove_WebMessageReceived(self.tokens.web_message);
             let _ = self
                 .controller
                 .remove_AcceleratorKeyPressed(self.tokens.accelerator);

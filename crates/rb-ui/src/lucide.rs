@@ -35,6 +35,10 @@ pub enum Icon {
     /// Keluar dari split view dan kembali ke satu tab penuh.
     Unsplit,
     RushAgent,
+    AgentConnect,
+    SelectElement,
+    Folder,
+    HardDrive,
     Terminal,
 }
 
@@ -71,6 +75,10 @@ impl Icon {
             Self::Globe => Some(LucideIcon::Globe),
             Self::Unsplit => Some(LucideIcon::Maximize2),
             Self::RushAgent => Some(LucideIcon::SquareTerminal),
+            Self::AgentConnect => Some(LucideIcon::PlugZap),
+            Self::SelectElement => Some(LucideIcon::MousePointer2),
+            Self::Folder => Some(LucideIcon::Folder),
+            Self::HardDrive => Some(LucideIcon::HardDrive),
             Self::Terminal => Some(LucideIcon::Terminal),
         }
     }
@@ -114,6 +122,10 @@ mod tests {
             Icon::Globe,
             Icon::Unsplit,
             Icon::RushAgent,
+            Icon::AgentConnect,
+            Icon::SelectElement,
+            Icon::Folder,
+            Icon::HardDrive,
             Icon::Terminal,
         ];
         for icon in icons {

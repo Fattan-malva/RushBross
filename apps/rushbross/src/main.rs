@@ -1,17 +1,22 @@
 #![windows_subsystem = "windows"]
 
+mod terminal;
 mod webview;
 
 mod app_icon;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rb_agent::{AgentRequest, AgentServer};
+use terminal::PtyTerminal;
 use rb_tabs::TabId;
 use rb_ui::{Frame, Rect, RectShape};
 use rb_ui_renderer::{RenderError, Renderer};
 use rb_ui_widgets::{BrowserShell, ChromeAction, ChromeElement, CursorRole};
+use serde_json::{json, Value};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
@@ -24,29 +29,9 @@ use winit::window::{
 };
 
 use webview::{UserEvent, WebViewHost, WebViewRuntime};
-use windows::core::{w, BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
-};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
-};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-};
-use windows::Win32::System::Threading::{
-    CreateProcessW, WaitForSingleObject, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTUPINFOW,
-};
-use windows::Win32::UI::Shell::{
-    IFileOpenDialog, IShellItem, FileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
-    FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW, SetParent,
-    SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, WM_CLOSE,
-    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const VK_TAB: u32 = 0x09;
@@ -71,32 +56,274 @@ struct OverlayState {
     cursor_icon: CursorIcon,
 }
 
-struct TerminalHost {
-    hwnd: HWND,
-    process: HANDLE,
-    thread: HANDLE,
-    last_bounds: Option<(i32, i32, i32, i32)>,
+fn json_rpc(id: Option<u64>, result: Result<Value, String>) -> String {
+    match result {
+        Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string(),
+        Err(error) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32603, "message": error }
+        })
+        .to_string(),
+    }
 }
 
-struct ConsoleWindowSearch<'a> {
-    token: &'a str,
-    found: Option<HWND>,
+fn tool_content(result: Result<Value, String>) -> Value {
+    match result {
+        Ok(value) => json!({
+            "content": [{ "type": "text", "text": value.to_string() }],
+            "isError": false
+        }),
+        Err(error) => json!({
+            "content": [{ "type": "text", "text": error }],
+            "isError": true
+        }),
+    }
 }
 
-unsafe extern "system" fn enum_console_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let search = unsafe { &mut *(lparam.0 as *mut ConsoleWindowSearch<'_>) };
-    let length = unsafe { GetWindowTextLengthW(hwnd) };
-    if length <= 0 {
-        return BOOL(1);
+fn tool_channel(reply: Sender<String>, id: Option<u64>) -> mpsc::Sender<Result<Value, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(result) = receiver.recv() {
+            let _ = reply.send(json_rpc(id, Ok(tool_content(result))));
+        }
+    });
+    sender
+}
+
+fn tool_definitions() -> Value {
+    json!([
+        {
+            "name": "browser_state",
+            "description": "Ambil URL, judul, dan viewport halaman aktif di RushBross.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "browser_navigate",
+            "description": "Buka URL di tab aktif RushBross.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string" } },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "browser_snapshot",
+            "description": "Ambil ringkasan DOM halaman aktif.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "selector": { "type": "string" } }
+            }
+        },
+        {
+            "name": "browser_click",
+            "description": "Klik elemen berdasarkan selector CSS atau koordinat viewport.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                }
+            }
+        },
+        {
+            "name": "browser_type",
+            "description": "Ketik teks ke elemen yang dipilih, opsional tekan Enter setelahnya.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" },
+                    "submit": { "type": "boolean" }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "browser_press",
+            "description": "Tekan satu tombol keyboard, misalnya Enter, Tab, atau Escape.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "key": { "type": "string" } },
+                "required": ["key"]
+            }
+        },
+        {
+            "name": "browser_scroll",
+            "description": "Scroll halaman aktif.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                },
+                "required": ["y"]
+            }
+        },
+        {
+            "name": "browser_screenshot",
+            "description": "Ambil screenshot halaman aktif sebagai data URL PNG.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "browser_select",
+            "description": "Aktifkan atau nonaktifkan mode pilih elemen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "enabled": { "type": "boolean" } }
+            }
+        },
+        {
+            "name": "browser_get_selection",
+            "description": "Ambil elemen terakhir yang dipilih lewat mode Select.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "browser_tabs",
+            "description": "Lihat daftar tab atau buat tab baru.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "new"] }
+                }
+            }
+        }
+    ])
+}
+
+fn js_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn wheel_lines(delta: winit::event::MouseScrollDelta) -> f32 {
+    match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+        winit::event::MouseScrollDelta::PixelDelta(position) => position.y as f32 / 16.0,
     }
-    let mut buffer = vec![0u16; length as usize + 1];
-    unsafe { GetWindowTextW(hwnd, &mut buffer) };
-    let title = String::from_utf16_lossy(&buffer[..length as usize]);
-    if title.contains(search.token) {
-        search.found = Some(hwnd);
-        return BOOL(0);
+}
+
+fn upsert_json_config(
+    path: &std::path::Path,
+    keys: &[&str],
+    server_key: &str,
+    server: Value,
+) -> Result<(), String> {
+    let mut root = if path.exists() {
+        let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        serde_json::from_str(&text)
+            .map_err(|_| format!("{} bukan JSON murni", path.display()))?
+    } else {
+        json!({})
+    };
+    let mut cursor = &mut root;
+    for key in keys {
+        let object = cursor
+            .as_object_mut()
+            .ok_or_else(|| format!("{} tidak berupa objek", path.display()))?;
+        cursor = object
+            .entry((*key).to_string())
+            .or_insert_with(|| json!({}));
     }
-    BOOL(1)
+    cursor
+        .as_object_mut()
+        .ok_or_else(|| format!("{} tidak berupa objek", path.display()))?
+        .insert(server_key.to_string(), server);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?)
+        .map_err(|error| error.to_string())
+}
+
+fn write_agent_configs() -> Result<Vec<String>, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .with_file_name("rushbross-mcp.exe");
+    let command = exe.to_string_lossy().into_owned();
+    let addr = std::env::var("RUSHBROSS_MCP_ADDR").map_err(|error| error.to_string())?;
+    let token = std::env::var("RUSHBROSS_MCP_TOKEN").map_err(|error| error.to_string())?;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+
+    let local_server = json!({
+        "type": "local",
+        "command": [command.clone()],
+        "environment": {
+            "RUSHBROSS_MCP_ADDR": addr,
+            "RUSHBROSS_MCP_TOKEN": token
+        },
+        "enabled": true,
+        "timeout": 30000
+    });
+    let stdio_server = json!({
+        "type": "stdio",
+        "command": command,
+        "args": [],
+        "env": {
+            "RUSHBROSS_MCP_ADDR": addr.clone(),
+            "RUSHBROSS_MCP_TOKEN": token.clone()
+        }
+    });
+
+    let targets = [
+        (cwd.join("opencode.json"), vec!["mcp", "servers"], local_server.clone()),
+        (cwd.join(".mcp.json"), vec!["mcpServers"], stdio_server.clone()),
+        (
+            cwd.join(".kilo").join("kilo.json"),
+            vec!["mcp"],
+            local_server,
+        ),
+        (
+            cwd.join(".agents").join("mcp_config.json"),
+            vec!["mcpServers"],
+            stdio_server,
+        ),
+    ];
+    let mut written = Vec::new();
+    let mut failures = Vec::new();
+    for (path, keys, server) in targets {
+        match upsert_json_config(&path, &keys, "rushbross", server) {
+            Ok(()) => written.push(path.display().to_string()),
+            Err(error) => failures.push(error),
+        }
+    }
+    if !home.is_empty() {
+        let global = std::path::Path::new(&home)
+            .join(".claude.json");
+        if let Err(error) = upsert_json_config(&global, &["mcpServers"], "rushbross", json!({
+            "type": "stdio",
+            "command": exe.to_string_lossy().into_owned(),
+            "args": [],
+            "env": {
+                "RUSHBROSS_MCP_ADDR": std::env::var("RUSHBROSS_MCP_ADDR").unwrap_or_default(),
+                "RUSHBROSS_MCP_TOKEN": std::env::var("RUSHBROSS_MCP_TOKEN").unwrap_or_default()
+            }
+        })) {
+            failures.push(error);
+        } else {
+            written.push(global.display().to_string());
+        }
+    }
+    if written.is_empty() {
+        return Err(failures.join("; "));
+    }
+    Ok(written)
+}
+
+fn element_message(selection: &Value) -> String {
+    let get = |key: &str| selection.get(key).and_then(Value::as_str).unwrap_or("");
+    let rect = selection.get("rect").map(Value::to_string).unwrap_or_default();
+    format!(
+        "[RushBross selected element]\nURL: {}\nTitle: {}\nSelector: {}\nTag: {}\nText: {}\nHTML: {}\nRect: {}\n\nGunakan elemen ini sebagai konteks untuk tugas berikutnya.",
+        get("url"),
+        get("title"),
+        get("selector"),
+        get("tag"),
+        get("text"),
+        get("html"),
+        rect
+    )
 }
 
 struct State {
@@ -110,11 +337,14 @@ struct State {
     /// Satu WebView per tab: tab background tetap hidup sehingga audio/video tidak berhenti.
     webviews: HashMap<TabId, WebViewHost>,
     ready: HashSet<TabId>,
-    terminal: Option<TerminalHost>,
+    terminal: Option<PtyTerminal>,
     /// Semua pane yang sedang tampil (satu tab biasa, atau hingga tiga pane split).
     visible_webviews: Vec<TabId>,
     /// Bounds WebView terakhir per tab, supaya SetBounds tidak dipanggil tiap frame.
     last_webview_bounds: HashMap<TabId, (i32, i32, i32, i32)>,
+    _agent_server: Option<AgentServer>,
+    agent_selection: Option<Value>,
+    select_mode: bool,
     window_shown: bool,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
@@ -135,6 +365,29 @@ impl State {
             physical.height as f32 / scale,
         );
         let shell = BrowserShell::new();
+        let agent_proxy = proxy.clone();
+        let token = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let agent_server = AgentServer::start(token, move |request| {
+            let _ = agent_proxy.send_event(UserEvent::Agent(request));
+        })
+        .map_err(|error| format!("start agent server: {error}"))?;
+        std::env::set_var("RUSHBROSS_MCP_ADDR", agent_server.endpoint());
+        std::env::set_var("RUSHBROSS_MCP_TOKEN", &agent_server.token);
+        let session = json!({
+            "addr": agent_server.endpoint(),
+            "token": agent_server.token
+        });
+        let _ = std::fs::write(
+            std::env::temp_dir().join("rushbross-agent.json"),
+            session.to_string(),
+        );
         Ok(Self {
             window,
             renderer,
@@ -148,6 +401,9 @@ impl State {
             terminal: None,
             visible_webviews: Vec::new(),
             last_webview_bounds: HashMap::new(),
+            _agent_server: Some(agent_server),
+            agent_selection: None,
+            select_mode: false,
             window_shown: false,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
             size,
@@ -205,57 +461,46 @@ impl State {
     }
 
     fn open_rush_agent(&mut self) {
-        let Ok(hwnd) = self.parent_hwnd() else {
-            return;
-        };
-        let Some(folder) = pick_folder(hwnd) else {
-            return;
-        };
+        let folder = std::env::current_dir()
+            .or_else(|_| std::env::var("USERPROFILE").map(std::path::PathBuf::from))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "C:\\".to_string());
+        self.start_rush_agent(folder);
+        self.shell.open_folder_picker();
+        self.redraw();
+    }
+
+    fn start_rush_agent(&mut self, folder: String) {
         self.stop_terminal();
-        match start_terminal(&folder, hwnd) {
+        match PtyTerminal::start(&folder) {
             Ok(terminal) => {
                 self.terminal = Some(terminal);
                 self.shell.open_terminal(folder);
+                self.shell.set_agent_actions_enabled(true);
+                self.shell.show_toast("RushAgent siap");
             }
-            Err(error) => eprintln!("start RushAgent terminal: {error}"),
+            Err(error) => self.shell.show_toast(format!("RushAgent gagal: {error}")),
         }
         self.redraw();
     }
 
-    fn terminal_bounds(&self) -> Option<Rect> {
-        let body = self
-            .shell
-            .terminal_layout(self.inset_content_rect())?
-            .body;
-        let scale = self.window.scale_factor() as f32;
-        Some(Rect::new(
-            body.x * scale,
-            body.y * scale,
-            body.width * scale,
-            body.height * scale,
-        ))
-    }
-
-    fn terminal_exited(&self) -> bool {
-        let Some(terminal) = self.terminal.as_ref() else {
-            return false;
-        };
-        unsafe { WaitForSingleObject(terminal.process, 0) == WAIT_OBJECT_0 }
+    fn terminal_exited(&mut self) -> bool {
+        self.terminal.as_mut().is_some_and(|terminal| terminal.exited())
     }
 
     fn stop_terminal(&mut self) {
-        if let Some(terminal) = self.terminal.take() {
-            unsafe {
-                let _ = PostMessageW(Some(terminal.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                let _ = CloseHandle(terminal.thread);
-                let _ = CloseHandle(terminal.process);
-            }
+        if let Some(mut terminal) = self.terminal.take() {
+            terminal.kill();
         }
         self.shell.close_terminal();
+        self.shell.set_agent_actions_enabled(false);
+        self.shell.set_agent_connected(false);
+        self.select_mode = false;
+        self.shell.set_select_mode(false);
     }
 
-    fn sync_terminal(&mut self) {
-        if self.terminal.is_some() && self.terminal_exited() {
+    fn pump_terminal(&mut self) {
+        if self.terminal.as_mut().is_some_and(|terminal| terminal.exited()) {
             self.stop_terminal();
             return;
         }
@@ -263,33 +508,276 @@ impl State {
             self.stop_terminal();
             return;
         }
-        let Some(bounds) = self.terminal_bounds() else {
+        let Some(body) = self.shell.terminal_layout(self.inset_content_rect()) else {
             return;
         };
-        let Some(terminal) = self.terminal.as_mut() else {
+        let scale = self.window.scale_factor() as f32;
+        let cols = ((body.body.width * scale) / 8.0).round().max(20.0) as u16;
+        let rows = ((body.body.height * scale) / 16.0).round().max(4.0) as u16;
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.resize(cols, rows);
+            terminal.pump();
+            self.shell.set_terminal_lines(terminal.lines());
+        }
+    }
+
+    fn handle_agent_request(&mut self, request: AgentRequest) {
+        let id = request.id;
+        let result = match request.method.as_str() {
+            "initialize" => Ok(json!({
+                "protocolVersion": rb_agent::PROTOCOL_VERSION,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "rushbross", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": "Gunakan tool browser_* untuk mengendalikan RushBross. Kursor hijau menandai aksi agent."
+            })),
+            "notifications/initialized" => return,
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+            "tools/call" => {
+                match self.start_tool(&request.params, request.reply.clone(), id) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
+            _ => Err(format!("method tidak dikenal: {}", request.method)),
+        };
+        let _ = request.reply.send(json_rpc(id, result));
+    }
+
+    fn start_tool(
+        &mut self,
+        params: &Value,
+        reply: Sender<String>,
+        id: Option<u64>,
+    ) -> Option<Result<Value, String>> {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let ok = |value: Value| Some(Ok(tool_content(Ok(value))));
+        match name {
+            "browser_tabs" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                if action == "new" {
+                    self.shell.new_tab();
+                    self.redraw();
+                    return ok(json!({ "ok": true }));
+                }
+                let tabs: Vec<Value> = self
+                    .shell
+                    .tab_infos()
+                    .into_iter()
+                    .map(|(id, title, url)| {
+                        json!({ "id": id.0, "title": title, "url": url })
+                    })
+                    .collect();
+                ok(json!({ "tabs": tabs }))
+            }
+            "browser_get_selection" => match &self.agent_selection {
+                Some(selection) => ok(selection.clone()),
+                None => ok(json!({ "selected": false })),
+            },
+            "browser_select" => {
+                let enabled = args
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(!self.select_mode);
+                self.select_mode = enabled;
+                self.shell.set_select_mode(enabled);
+                for host in self.webviews.values() {
+                    host.set_picker(enabled);
+                }
+                self.shell.show_toast(if enabled {
+                    "Select element aktif"
+                } else {
+                    "Select element dimatikan"
+                });
+                self.redraw();
+                ok(json!({ "ok": true, "enabled": enabled }))
+            }
+            "browser_navigate" => {
+                let Some(url) = args.get("url").and_then(Value::as_str) else {
+                    return Some(Err("url wajib diisi".to_string()));
+                };
+                self.shell.navigate_active(url.to_string());
+                self.redraw();
+                ok(json!({ "ok": true, "url": url }))
+            }
+            "browser_state" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                host.eval(
+                    r#"({ url: location.href, title: document.title, readyState: document.readyState, viewport: [innerWidth, innerHeight], scroll: [scrollX, scrollY] })"#,
+                    tool_channel(reply, id),
+                );
+                None
+            }
+            "browser_snapshot" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                let selector = args.get("selector").and_then(Value::as_str).unwrap_or("");
+                let expression = format!(
+                    "(function(){{var root={} ? document.querySelector({}) : document.body; if(!root)return null; return {{tag:root.tagName.toLowerCase(),html:root.outerHTML.slice(0,12000),text:(root.innerText||root.textContent||'').slice(0,12000)}};}})()",
+                    if selector.is_empty() { "false" } else { "true" },
+                    js_string(selector)
+                );
+                host.eval(&expression, tool_channel(reply, id));
+                None
+            }
+            "browser_click" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                if let Some(selector) = args.get("selector").and_then(Value::as_str) {
+                    let expression = format!(
+                        "(function(){{var el=document.querySelector({}); if(!el)return false; var r=el.getBoundingClientRect(); window.__rbAgentCursor.move(r.x+r.width/2,r.y+r.height/2); window.__rbAgentCursor.click(r.x+r.width/2,r.y+r.height/2); el.click(); return true;}})()",
+                        js_string(selector)
+                    );
+                    host.eval(&expression, tool_channel(reply, id));
+                } else {
+                    let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                    let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                    host.move_cursor(x, y);
+                    host.click_at(x, y, tool_channel(reply, id));
+                }
+                None
+            }
+            "browser_type" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                let Some(text) = args.get("text").and_then(Value::as_str) else {
+                    return Some(Err("text wajib diisi".to_string()));
+                };
+                let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
+                let mut inserted = text.to_string();
+                if submit {
+                    inserted.push('\r');
+                }
+                if let Some(selector) = args.get("selector").and_then(Value::as_str) {
+                    let expression = format!(
+                        "(function(){{var el=document.querySelector({}); if(!el)return false; el.focus(); window.__rbAgentCursor.type(); document.execCommand('insertText',false,{}); return true;}})()",
+                        js_string(selector),
+                        js_string(&inserted)
+                    );
+                    host.eval(&expression, tool_channel(reply, id));
+                } else {
+                    host.insert_text(text, tool_channel(reply, id));
+                }
+                None
+            }
+            "browser_press" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                let Some(key) = args.get("key").and_then(Value::as_str) else {
+                    return Some(Err("key wajib diisi".to_string()));
+                };
+                host.press_key(key, tool_channel(reply, id));
+                None
+            }
+            "browser_scroll" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                let x = args.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = args.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                let expression = format!("window.scrollBy({x},{y}); true");
+                host.eval(&expression, tool_channel(reply, id));
+                None
+            }
+            "browser_screenshot" => {
+                let Some(tab_id) = self.shell.focused_tab_id() else {
+                    return Some(Err("tidak ada tab aktif".to_string()));
+                };
+                let Some(host) = self.webviews.get(&tab_id) else {
+                    return Some(Err("WebView tab belum siap".to_string()));
+                };
+                host.cdp(
+                    "Page.captureScreenshot",
+                    &json!({ "format": "png", "fromSurface": true }),
+                    tool_channel(reply, id),
+                );
+                None
+            }
+            _ => Some(Err(format!("tool tidak dikenal: {name}"))),
+        }
+    }
+
+    fn connect_agent(&mut self) {
+        match write_agent_configs() {
+            Ok(paths) => {
+                self.shell.set_agent_connected(true);
+                self.shell
+                    .show_toast(format!("MCP tersambung ({} config)", paths.len()));
+            }
+            Err(error) => self.shell.show_toast(format!("MCP gagal: {error}")),
+        }
+        self.redraw();
+    }
+
+    fn toggle_select(&mut self) {
+        let enabled = !self.select_mode;
+        self.select_mode = enabled;
+        self.shell.set_select_mode(enabled);
+        for host in self.webviews.values() {
+            host.set_picker(enabled);
+        }
+        self.shell.show_toast(if enabled {
+            "Select element aktif"
+        } else {
+            "Select element dimatikan"
+        });
+        self.redraw();
+    }
+
+    fn handle_element_message(&mut self, message: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(message) else {
             return;
         };
-        let key = (
-            bounds.x.round() as i32,
-            bounds.y.round() as i32,
-            bounds.width.round() as i32,
-            bounds.height.round() as i32,
-        );
-        if terminal.last_bounds == Some(key) {
+        if value.get("type").and_then(Value::as_str) != Some("rb-element-selected") {
             return;
         }
-        unsafe {
-            let _ = SetWindowPos(
-                terminal.hwnd,
-                None,
-                key.0,
-                key.1,
-                key.2,
-                key.3,
-                SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            );
+        self.agent_selection = Some(value.clone());
+        self.select_mode = false;
+        self.shell.set_select_mode(false);
+        for host in self.webviews.values() {
+            host.set_picker(false);
         }
-        terminal.last_bounds = Some(key);
+        let text = element_message(&value);
+        let sent = match self.terminal.as_mut() {
+            Some(terminal) => {
+                terminal.send(&text);
+                Ok(())
+            }
+            None => Err("terminal RushAgent belum dibuka".to_string()),
+        };
+        match sent {
+            Ok(()) => self.shell.show_toast("Elemen dikirim ke agent"),
+            Err(error) => self.shell.show_toast(format!("Elemen gagal dikirim: {error}")),
+        }
+        self.redraw();
     }
 
     fn draw(&mut self) {
@@ -297,8 +785,33 @@ impl State {
         if width <= 1.0 || height <= 1.0 {
             return;
         }
-        if self.terminal.is_some() && self.terminal_exited() {
+        if self.shell.take_folder_cancel() {
             self.stop_terminal();
+        }
+        if let Some(path) = self.shell.take_cd() {
+            if let Some(terminal) = self.terminal.as_mut() {
+                terminal.send(&format!("cd /d \"{path}\"\r"));
+                self.shell.focus_terminal();
+                self.shell.show_toast("Folder diterapkan ke RushAgent");
+            }
+        }
+        if self.terminal_exited() {
+            self.stop_terminal();
+        }
+        let agent_ready = self.terminal.is_some();
+        if self.shell.take_agent_connect() {
+            if agent_ready {
+                self.connect_agent();
+            } else {
+                self.shell.show_toast("Buka RushAgent dulu");
+            }
+        }
+        if self.shell.take_select_element() {
+            if agent_ready {
+                self.toggle_select();
+            } else {
+                self.shell.show_toast("Buka RushAgent dulu");
+            }
         }
         self.shell.set_maximized(self.window.is_maximized());
         let frame = self.shell.render(width, height);
@@ -323,7 +836,7 @@ impl State {
             self.window.set_visible(true);
         }
         self.sync_active_tab();
-        self.sync_terminal();
+        self.pump_terminal();
     }
 
     fn hide_overlay(&mut self) {
@@ -469,6 +982,12 @@ impl State {
                 self.shell.pointer_moved(rb_ui::Vec2::new(-1000.0, -1000.0));
                 self.draw();
                 self.draw_overlay();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.shell.folder_picker_scroll(wheel_lines(delta)) {
+                    self.draw();
+                    self.draw_overlay();
+                }
             }
             WindowEvent::MouseInput {
                 state: pressed,
@@ -793,6 +1312,18 @@ impl State {
         self.redraw();
     }
 
+    fn insert_text(&mut self, text: &str) {
+        if self.shell.terminal_focused() {
+            if let Some(terminal) = self.terminal.as_mut() {
+                terminal.send(text);
+                self.pump_terminal();
+                self.redraw();
+                return;
+            }
+        }
+        self.shell.insert_text(text);
+    }
+
     fn handle_key(&mut self, event: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
         if event.state != ElementState::Pressed {
             return;
@@ -801,6 +1332,24 @@ impl State {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
+
+        if self.shell.terminal_focused() {
+            let sequence = match &event.logical_key {
+                Key::Named(NamedKey::Enter) => Some("\r"),
+                Key::Named(NamedKey::Backspace) => Some("\x7f"),
+                Key::Named(NamedKey::Tab) => Some("\t"),
+                Key::Named(NamedKey::Escape) => Some("\x1b"),
+                _ => None,
+            };
+            if let Some(sequence) = sequence {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.send(sequence);
+                    self.pump_terminal();
+                    self.redraw();
+                    return;
+                }
+            }
+        }
 
         match &event.logical_key {
             Key::Named(NamedKey::Tab) if ctrl => {
@@ -841,7 +1390,7 @@ impl State {
             Key::Named(NamedKey::Space) if !ctrl && !alt => {
                 if let Some(text) = &event.text {
                     if text.is_ascii() {
-                        self.shell.insert_text(text);
+                        self.insert_text(text);
                     }
                 }
                 self.redraw();
@@ -1044,6 +1593,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state.update_cursor();
                 state.redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if state.shell.folder_picker_scroll(wheel_lines(delta)) {
+                    state.redraw();
+                }
+            }
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
@@ -1108,7 +1662,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => state.handle_key(&event, event_loop),
             WindowEvent::Ime(Ime::Commit(text)) => {
-                state.shell.insert_text(&text);
+                state.insert_text(&text);
                 state.redraw();
             }
             _ => {}
@@ -1123,6 +1677,13 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::WebView(webview::WebViewEvent::Loaded(tab_id)) => {
                 state.ready.insert(tab_id);
+                let select_mode = state.select_mode;
+                if let Some(host) = state.webviews.get(&tab_id) {
+                    host.install_agent_helpers();
+                    if select_mode {
+                        host.set_picker(true);
+                    }
+                }
                 state.shell.webview_loaded(tab_id);
                 state.sync_webview_visibility();
             }
@@ -1157,6 +1718,14 @@ impl ApplicationHandler<UserEvent> for App {
                 state.handle_accelerator(tab_id, key, ctrl, alt, shift, event_loop);
                 return;
             }
+            UserEvent::WebView(webview::WebViewEvent::WebMessage(message)) => {
+                state.handle_element_message(&message);
+                return;
+            }
+            UserEvent::Agent(request) => {
+                state.handle_agent_request(request);
+                return;
+            }
         }
         state.pump_navigation();
         state.redraw();
@@ -1164,7 +1733,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = self.state.as_mut() {
-            if state.terminal.is_some() && state.terminal_exited() {
+            if state.terminal_exited() {
                 state.stop_terminal();
                 state.redraw();
             }
@@ -1173,112 +1742,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
-}
-
-fn pick_folder(parent: HWND) -> Option<String> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
-        dialog
-            .SetOptions(FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM)
-            .ok()?;
-        dialog.SetTitle(w!("Pilih folder untuk RushAgent")).ok()?;
-        dialog.Show(Some(parent)).ok()?;
-        let item: IShellItem = dialog.GetResult().ok()?;
-        let path: PWSTR = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let folder = path.to_string().ok()?;
-        CoTaskMemFree(Some(path.0 as *const c_void));
-        Some(folder)
-    }
-}
-
-fn start_terminal(folder: &str, parent: HWND) -> Result<TerminalHost, String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let token = format!("RushAgent-{}-{}", std::process::id(), nonce);
-    let mut command: Vec<u16> = format!("cmd.exe /K title {token} && cd /d \"{folder}\"")
-        .encode_utf16()
-        .collect();
-    command.push(0);
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut info = PROCESS_INFORMATION::default();
-    unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NEW_CONSOLE,
-            None,
-            PCWSTR::null(),
-            &startup,
-            &mut info,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    let mut hwnd = None;
-    for _ in 0..40 {
-        hwnd = find_console_window(&token);
-        if hwnd.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let Some(hwnd) = hwnd else {
-        unsafe {
-            let _ = CloseHandle(info.hThread);
-            let _ = CloseHandle(info.hProcess);
-        }
-        return Err("jendela console tidak ditemukan".into());
-    };
-    unsafe {
-        let _ = SetParent(hwnd, Some(parent));
-        let old_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let remove = (WS_POPUP
-            | WS_CAPTION
-            | WS_THICKFRAME
-            | WS_SYSMENU
-            | WS_MAXIMIZEBOX
-            | WS_MINIMIZEBOX)
-            .0 as isize;
-        let add = (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN).0 as isize;
-        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (old_style & !remove) | add);
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            1,
-            1,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-    }
-    Ok(TerminalHost {
-        hwnd,
-        process: info.hProcess,
-        thread: info.hThread,
-        last_bounds: None,
-    })
-}
-
-fn find_console_window(token: &str) -> Option<HWND> {
-    let mut search = ConsoleWindowSearch {
-        token,
-        found: None,
-    };
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_console_window),
-            LPARAM(&mut search as *mut ConsoleWindowSearch<'_> as isize),
-        );
-    }
-    search.found
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

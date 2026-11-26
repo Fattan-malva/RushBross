@@ -7,6 +7,8 @@ members = [
     "crates/rb-ui",
     "crates/rb-ui-widgets",
     "crates/rb-ui-renderer",
+    "crates/rb-agent",
+    "apps/rushbross-mcp",
 ]
 
 [workspace.package]
@@ -20,6 +22,9 @@ rb-bookmarks = { path = "crates/rb-bookmarks" }
 rb-ui = { path = "crates/rb-ui" }
 rb-ui-widgets = { path = "crates/rb-ui-widgets" }
 rb-ui-renderer = { path = "crates/rb-ui-renderer" }
+rb-agent = { path = "crates/rb-agent" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 winit = "0.30.12"
 wgpu = "30.0.2"
@@ -29,6 +34,7 @@ pollster = "0.4"
 png = "0.17"
 bytemuck = { version = "1.21", features = ["derive"] }
 url = "2.5"
+portable-pty = "0.9"
 
 [profile.release]
 opt-level = "z"
