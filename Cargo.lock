@@ -1970,7 +1970,6 @@ version = "0.1.0"
 dependencies = [
  "rb-bookmarks",
  "rb-tabs",
- "rb-terminal",
  "rb-ui",
  "url",
  "windows",
@@ -2096,7 +2095,6 @@ dependencies = [
  "pollster",
  "rb-agent",
  "rb-tabs",
- "rb-terminal",
  "rb-ui",
  "rb-ui-renderer",
  "rb-ui-widgets",

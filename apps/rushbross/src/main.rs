@@ -1,6 +1,6 @@
 #![windows_subsystem = "windows"]
 
-mod terminal;
+mod console_host;
 mod webview;
 
 mod app_icon;
@@ -10,9 +10,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 
 use rb_agent::{AgentRequest, AgentServer};
-use rb_terminal::{Key as TermKey, Mods, CELL_WIDTH, LINE_HEIGHT};
-use rb_ui_widgets::{TERMINAL_PADDING_X, TERMINAL_PADDING_Y};
-use terminal::PtyTerminal;
+use console_host::{default_shell, ConsoleHost};
 use rb_tabs::TabId;
 use rb_ui::{Frame, Rect, RectShape};
 use rb_ui_renderer::{RenderError, Renderer};
@@ -203,39 +201,6 @@ fn tool_definitions() -> Value {
 
 fn js_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
-}
-
-/// Terjemahkan tombol navigasi dan fungsi winit ke tombol terminal.
-fn named_to_terminal_key(named: NamedKey) -> Option<TermKey> {
-    Some(match named {
-        NamedKey::Enter => TermKey::Enter,
-        NamedKey::Backspace => TermKey::Backspace,
-        NamedKey::Tab => TermKey::Tab,
-        NamedKey::Escape => TermKey::Escape,
-        NamedKey::ArrowUp => TermKey::Up,
-        NamedKey::ArrowDown => TermKey::Down,
-        NamedKey::ArrowLeft => TermKey::Left,
-        NamedKey::ArrowRight => TermKey::Right,
-        NamedKey::Home => TermKey::Home,
-        NamedKey::End => TermKey::End,
-        NamedKey::PageUp => TermKey::PageUp,
-        NamedKey::PageDown => TermKey::PageDown,
-        NamedKey::Insert => TermKey::Insert,
-        NamedKey::Delete => TermKey::Delete,
-        NamedKey::F1 => TermKey::F(1),
-        NamedKey::F2 => TermKey::F(2),
-        NamedKey::F3 => TermKey::F(3),
-        NamedKey::F4 => TermKey::F(4),
-        NamedKey::F5 => TermKey::F(5),
-        NamedKey::F6 => TermKey::F(6),
-        NamedKey::F7 => TermKey::F(7),
-        NamedKey::F8 => TermKey::F(8),
-        NamedKey::F9 => TermKey::F(9),
-        NamedKey::F10 => TermKey::F(10),
-        NamedKey::F11 => TermKey::F(11),
-        NamedKey::F12 => TermKey::F(12),
-        _ => return None,
-    })
 }
 
 fn wheel_lines(delta: winit::event::MouseScrollDelta) -> f32 {
@@ -466,7 +431,7 @@ struct State {
     /// Satu WebView per tab: tab background tetap hidup sehingga audio/video tidak berhenti.
     webviews: HashMap<TabId, WebViewHost>,
     ready: HashSet<TabId>,
-    terminal: Option<PtyTerminal>,
+    terminal: Option<ConsoleHost>,
     /// Semua pane yang sedang tampil (satu tab biasa, atau hingga tiga pane split).
     visible_webviews: Vec<TabId>,
     /// Bounds WebView terakhir per tab, supaya SetBounds tidak dipanggil tiap frame.
@@ -590,10 +555,19 @@ impl State {
 
     fn start_rush_agent(&mut self, folder: String) {
         self.stop_terminal();
-        let window = self.window.clone();
-        match PtyTerminal::start(&folder, move || window.request_redraw()) {
-            Ok(terminal) => {
-                self.terminal = Some(terminal);
+        let parent = match self.parent_hwnd() {
+            Ok(parent) => parent,
+            Err(error) => {
+                self.shell.show_toast(format!("RushAgent gagal: {error}"));
+                self.redraw();
+                return;
+            }
+        };
+        let rect = self.terminal_physical_rect();
+        let program = default_shell();
+        match ConsoleHost::spawn(parent, &program, &[], std::path::Path::new(&folder), rect) {
+            Ok(host) => {
+                self.terminal = Some(host);
                 self.shell.open_terminal(folder);
                 self.shell.set_agent_actions_enabled(true);
                 self.shell.show_toast("RushAgent siap");
@@ -618,6 +592,21 @@ impl State {
         self.shell.set_select_mode(false);
     }
 
+    /// Posisi body pane RushAgent dalam piksel fisik, relatif ke client area jendela.
+    fn terminal_physical_rect(&self) -> (i32, i32, i32, i32) {
+        let scale = self.window.scale_factor() as f32;
+        match self.shell.terminal_layout(self.inset_content_rect()) {
+            Some(layout) => (
+                (layout.body.x * scale).round() as i32,
+                (layout.body.y * scale).round() as i32,
+                (layout.body.width * scale).round() as i32,
+                (layout.body.height * scale).round() as i32,
+            ),
+            None => (0, 0, 0, 0),
+        }
+    }
+
+    /// Sinkronkan konsol dengan layout dan fokus shell. Dipanggil setiap frame.
     fn pump_terminal(&mut self) {
         if self.terminal.as_mut().is_some_and(|terminal| terminal.exited()) {
             self.stop_terminal();
@@ -627,69 +616,18 @@ impl State {
             self.stop_terminal();
             return;
         }
-        let Some(body) = self.shell.terminal_layout(self.inset_content_rect()) else {
-            return;
-        };
-        // Ukuran grid dihitung dari metrik sel yang sama dengan penggambaran (logical px).
-        let usable_width = (body.body.width - TERMINAL_PADDING_X * 2.0).max(0.0);
-        let usable_height = (body.body.height - TERMINAL_PADDING_Y * 2.0).max(0.0);
-        let cols = (usable_width / CELL_WIDTH).floor().max(20.0) as u16;
-        let rows = (usable_height / LINE_HEIGHT).floor().max(4.0) as u16;
+        let rect = self.terminal_physical_rect();
+        let wants_focus = self.shell.terminal_focused();
+        let has_focus = self.terminal.as_ref().is_some_and(|terminal| terminal.has_focus());
         if let Some(terminal) = self.terminal.as_mut() {
-            terminal.resize(cols, rows);
-            terminal.pump();
-            self.shell.set_terminal_snapshot(terminal.snapshot().clone());
-        }
-    }
-
-    /// Kirim satu ketikan ke terminal. Mengembalikan false bila event ini bukan input
-    /// (misalnya hanya tombol modifier), agar pemanggil bisa meneruskannya ke jalur lain.
-    fn send_terminal_key(&mut self, event: &winit::event::KeyEvent, mods: Mods) -> bool {
-        let key = match &event.logical_key {
-            Key::Named(NamedKey::Space) if mods.ctrl || mods.alt => Some(TermKey::Char(' ')),
-            Key::Named(named) => named_to_terminal_key(*named),
-            Key::Character(value) if mods.ctrl != mods.alt => {
-                let mut chars = value.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(ch), None) => Some(TermKey::Char(ch)),
-                    _ => None,
-                }
+            terminal.set_rect(rect);
+            if has_focus && !wants_focus {
+                // Pengguna klik langsung di konsol: shell ikut menandai pane terminal fokus.
+                self.shell.focus_terminal();
+            } else if !has_focus && wants_focus {
+                terminal.focus();
             }
-            _ => None,
-        };
-        let Some(terminal) = self.terminal.as_mut() else {
-            return false;
-        };
-        if let Some(key) = key {
-            terminal.key(key, mods);
-            return true;
         }
-        // Teks biasa (termasuk huruf non-ASCII dan IME) dikirim apa adanya.
-        let Some(text) = event.text.as_deref() else {
-            return false;
-        };
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return false;
-        }
-        terminal.send(text);
-        true
-    }
-
-    /// Gulir riwayat terminal saat pointer di atas pane. Mengembalikan false bila tidak ada
-    /// yang digulir, sehingga roda tetap dipakai oleh halaman atau daftar folder.
-    fn scroll_terminal(&mut self, delta: winit::event::MouseScrollDelta, point: rb_ui::Vec2) -> bool {
-        if self.terminal.is_none() || !self.shell.terminal_pane_at(point) {
-            return false;
-        }
-        let lines = (wheel_lines(delta) * 3.0).round() as i32;
-        if lines == 0 {
-            return false;
-        }
-        if let Some(terminal) = self.terminal.as_mut() {
-            terminal.scroll(lines);
-        }
-        self.pump_terminal();
-        true
     }
 
     fn handle_agent_request(&mut self, request: AgentRequest) {
@@ -981,11 +919,8 @@ impl State {
             host.set_picker(false);
         }
         let text = element_message(&value);
-        let sent = match self.terminal.as_mut() {
-            Some(terminal) => {
-                terminal.send(&text);
-                Ok(())
-            }
+        let sent = match self.terminal.as_ref() {
+            Some(terminal) => terminal.send_text(&text),
             None => Err("terminal RushAgent belum dibuka".to_string()),
         };
         match sent {
@@ -1524,14 +1459,6 @@ impl State {
     }
 
     fn insert_text(&mut self, text: &str) {
-        if self.shell.terminal_focused() {
-            if let Some(terminal) = self.terminal.as_mut() {
-                terminal.send(text);
-                self.pump_terminal();
-                self.redraw();
-                return;
-            }
-        }
         self.shell.insert_text(text);
     }
 
@@ -1543,20 +1470,6 @@ impl State {
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
-
-        // Saat terminal fokus, semua ketikan (termasuk Ctrl+huruf dan tombol panah) menjadi
-        // input shell. Ctrl+Tab tetap milik aplikasi untuk pindah tab.
-        if self.shell.terminal_focused() && self.terminal.is_some() {
-            let app_shortcut = ctrl && matches!(event.logical_key, Key::Named(NamedKey::Tab));
-            if !app_shortcut {
-                let mods = Mods { ctrl, alt, shift };
-                if self.send_terminal_key(event, mods) {
-                    self.pump_terminal();
-                    self.redraw();
-                    return;
-                }
-            }
-        }
 
         match &event.logical_key {
             Key::Named(NamedKey::Tab) if ctrl => {
@@ -1801,7 +1714,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if state.scroll_terminal(delta, state.cursor) || state.shell.folder_picker_scroll(wheel_lines(delta)) {
+                if state.shell.folder_picker_scroll(wheel_lines(delta)) {
                     state.redraw();
                 }
             }
