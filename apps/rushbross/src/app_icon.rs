@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn downscale_keeps_size_and_alpha() {
-        let rgba = vec![0u8, 0, 0, 255].repeat(16);
+        let rgba = [0u8, 0, 0, 255].repeat(16);
         let out = downscale(&rgba, 4, 4, 2);
         assert_eq!(out.len(), 2 * 2 * 4);
         assert_eq!(&out[0..4], &[0, 0, 0, 255]);

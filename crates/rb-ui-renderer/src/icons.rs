@@ -108,7 +108,15 @@ fn render_mask(
     ));
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
-    Some(pixmap.data().chunks_exact(4).map(|px| px[3]).collect())
+    Some(
+        pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| px[3])
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -143,6 +151,8 @@ mod tests {
             Icon::Globe,
             Icon::Unsplit,
             Icon::Duplicate,
+            Icon::RushAgent,
+            Icon::Terminal,
         ];
         let mut registry = IconRegistry::default();
         for icon in icons {

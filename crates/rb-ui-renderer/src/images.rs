@@ -80,12 +80,16 @@ fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let rgba = match info.color_type {
         png::ColorType::Rgba => buffer,
         png::ColorType::Rgb => buffer
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         png::ColorType::Grayscale => buffer.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::GrayscaleAlpha => buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         png::ColorType::Indexed => return None,
@@ -113,7 +117,7 @@ fn shrink_source(decoded: (u32, u32, Vec<u8>), source: &Arc<[u8]>) -> (u32, u32,
 
 /// Abu-abu dan transparan sebagian. Dipakai untuk ikon halaman baru agar tidak mencolok.
 fn mute(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         let luma =
             0.299 * f32::from(pixel[0]) + 0.587 * f32::from(pixel[1]) + 0.114 * f32::from(pixel[2]);
         let value = luma.round().clamp(0.0, 255.0) as u8;

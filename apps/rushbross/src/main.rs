@@ -6,24 +6,47 @@ mod app_icon;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rb_tabs::TabId;
-use rb_ui::Rect;
+use rb_ui::{Frame, Rect, RectShape};
 use rb_ui_renderer::{RenderError, Renderer};
 use rb_ui_widgets::{BrowserShell, ChromeAction, ChromeElement, CursorRole};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowId};
+use winit::window::{
+    CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowId, WindowLevel,
+};
 
 use webview::{UserEvent, WebViewHost, WebViewRuntime};
+use windows::core::{w, BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::System::Threading::{
+    CreateProcessW, WaitForSingleObject, CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTUPINFOW,
+};
+use windows::Win32::UI::Shell::{
+    IFileOpenDialog, IShellItem, FileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+    FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW, SetParent,
+    SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, WM_CLOSE,
+    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 const VK_TAB: u32 = 0x09;
@@ -38,21 +61,61 @@ const VK_T: u32 = 0x54;
 const VK_W: u32 = 0x57;
 const RESIZE_EDGE: f32 = 6.0;
 
+struct OverlayState {
+    window: Arc<Window>,
+    renderer: Renderer,
+    bounds: Rect,
+    size: (u32, u32),
+    visible: bool,
+    cursor: rb_ui::Vec2,
+    cursor_icon: CursorIcon,
+}
+
+struct TerminalHost {
+    hwnd: HWND,
+    process: HANDLE,
+    thread: HANDLE,
+    last_bounds: Option<(i32, i32, i32, i32)>,
+}
+
+struct ConsoleWindowSearch<'a> {
+    token: &'a str,
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_console_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam.0 as *mut ConsoleWindowSearch<'_>) };
+    let length = unsafe { GetWindowTextLengthW(hwnd) };
+    if length <= 0 {
+        return BOOL(1);
+    }
+    let mut buffer = vec![0u16; length as usize + 1];
+    unsafe { GetWindowTextW(hwnd, &mut buffer) };
+    let title = String::from_utf16_lossy(&buffer[..length as usize]);
+    if title.contains(search.token) {
+        search.found = Some(hwnd);
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
 struct State {
     window: Arc<Window>,
     renderer: Renderer,
+    frame: Frame,
+    overlay: Option<OverlayState>,
     shell: BrowserShell,
     proxy: EventLoopProxy<UserEvent>,
     webview_env: Option<WebViewRuntime>,
     /// Satu WebView per tab: tab background tetap hidup sehingga audio/video tidak berhenti.
     webviews: HashMap<TabId, WebViewHost>,
     ready: HashSet<TabId>,
+    terminal: Option<TerminalHost>,
     /// Semua pane yang sedang tampil (satu tab biasa, atau hingga tiga pane split).
     visible_webviews: Vec<TabId>,
     /// Bounds WebView terakhir per tab, supaya SetBounds tidak dipanggil tiap frame.
     last_webview_bounds: HashMap<TabId, (i32, i32, i32, i32)>,
     window_shown: bool,
-    overlay_open: bool,
     cursor: rb_ui::Vec2,
     size: (f32, f32),
     modifiers: ModifiersState,
@@ -75,15 +138,17 @@ impl State {
         Ok(Self {
             window,
             renderer,
+            frame: Frame::default(),
+            overlay: None,
             shell,
             proxy,
             webview_env: None,
             webviews: HashMap::new(),
             ready: HashSet::new(),
+            terminal: None,
             visible_webviews: Vec::new(),
             last_webview_bounds: HashMap::new(),
             window_shown: false,
-            overlay_open: false,
             cursor: rb_ui::Vec2::new(-1000.0, -1000.0),
             size,
             modifiers: ModifiersState::empty(),
@@ -103,11 +168,128 @@ impl State {
         }
     }
 
+    fn init_overlay(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let owner = self.parent_hwnd()?;
+        let attributes = Window::default_attributes()
+            .with_title("")
+            .with_inner_size(LogicalSize::new(1.0, 1.0))
+            .with_decorations(false)
+            .with_skip_taskbar(true)
+            .with_active(false)
+            .with_visible(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_owner_window(owner.0 as isize);
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(|error| format!("create overlay window: {error}"))?,
+        );
+        let mut renderer = pollster::block_on(Renderer::new(window.clone()))?;
+        renderer.set_scale_factor(self.window.scale_factor() as f32);
+        self.overlay = Some(OverlayState {
+            window,
+            renderer,
+            bounds: Rect::default(),
+            size: (1, 1),
+            visible: false,
+            cursor: rb_ui::Vec2::new(0.0, 0.0),
+            cursor_icon: CursorIcon::Default,
+        });
+        Ok(())
+    }
+
     fn init_webview(&mut self) -> Result<(), String> {
         self.webview_env = Some(WebViewRuntime::new()?);
         self.pump_navigation();
-        // WebView tetap tersembunyi sampai event Loaded, lihat user_event.
         Ok(())
+    }
+
+    fn open_rush_agent(&mut self) {
+        let Ok(hwnd) = self.parent_hwnd() else {
+            return;
+        };
+        let Some(folder) = pick_folder(hwnd) else {
+            return;
+        };
+        self.stop_terminal();
+        match start_terminal(&folder, hwnd) {
+            Ok(terminal) => {
+                self.terminal = Some(terminal);
+                self.shell.open_terminal(folder);
+            }
+            Err(error) => eprintln!("start RushAgent terminal: {error}"),
+        }
+        self.redraw();
+    }
+
+    fn terminal_bounds(&self) -> Option<Rect> {
+        let body = self
+            .shell
+            .terminal_layout(self.inset_content_rect())?
+            .body;
+        let scale = self.window.scale_factor() as f32;
+        Some(Rect::new(
+            body.x * scale,
+            body.y * scale,
+            body.width * scale,
+            body.height * scale,
+        ))
+    }
+
+    fn terminal_exited(&self) -> bool {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        unsafe { WaitForSingleObject(terminal.process, 0) == WAIT_OBJECT_0 }
+    }
+
+    fn stop_terminal(&mut self) {
+        if let Some(terminal) = self.terminal.take() {
+            unsafe {
+                let _ = PostMessageW(Some(terminal.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = CloseHandle(terminal.thread);
+                let _ = CloseHandle(terminal.process);
+            }
+        }
+        self.shell.close_terminal();
+    }
+
+    fn sync_terminal(&mut self) {
+        if self.terminal.is_some() && self.terminal_exited() {
+            self.stop_terminal();
+            return;
+        }
+        if self.terminal.is_some() && !self.shell.terminal_is_open() {
+            self.stop_terminal();
+            return;
+        }
+        let Some(bounds) = self.terminal_bounds() else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        let key = (
+            bounds.x.round() as i32,
+            bounds.y.round() as i32,
+            bounds.width.round() as i32,
+            bounds.height.round() as i32,
+        );
+        if terminal.last_bounds == Some(key) {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                terminal.hwnd,
+                None,
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        terminal.last_bounds = Some(key);
     }
 
     fn draw(&mut self) {
@@ -115,8 +297,12 @@ impl State {
         if width <= 1.0 || height <= 1.0 {
             return;
         }
+        if self.terminal.is_some() && self.terminal_exited() {
+            self.stop_terminal();
+        }
         self.shell.set_maximized(self.window.is_maximized());
         let frame = self.shell.render(width, height);
+        self.frame = frame.clone();
         match self.renderer.render(&frame) {
             Ok(_) => {}
             Err(RenderError::Outdated) => self.renderer.reconfigure(),
@@ -136,8 +322,197 @@ impl State {
             self.window_shown = true;
             self.window.set_visible(true);
         }
-        self.overlay_open = frame.popup_open;
         self.sync_active_tab();
+        self.sync_terminal();
+    }
+
+    fn hide_overlay(&mut self) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        overlay.bounds = Rect::default();
+        if overlay.visible {
+            overlay.window.set_visible(false);
+            overlay.visible = false;
+        }
+    }
+
+    fn draw_overlay(&mut self) {
+        let Some(bounds) = self.shell.popup_bounds() else {
+            self.hide_overlay();
+            return;
+        };
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            self.hide_overlay();
+            return;
+        }
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let scale = self.window.scale_factor() as f32;
+        let width = (bounds.width * scale).ceil() as u32;
+        let height = (bounds.height * scale).ceil() as u32;
+        let width = width.max(1);
+        let height = height.max(1);
+        if overlay.size != (width, height) {
+            let _ = overlay
+                .window
+                .request_inner_size(PhysicalSize::new(width, height));
+            overlay.renderer.resize(width, height);
+            overlay.size = (width, height);
+        }
+        if let Ok(origin) = self.window.inner_position() {
+            overlay.window.set_outer_position(PhysicalPosition::new(
+                origin.x + (bounds.x * scale).round() as i32,
+                origin.y + (bounds.y * scale).round() as i32,
+            ));
+        }
+        overlay.bounds = bounds;
+        let mut frame = Frame::default();
+        let logical = Rect::new(
+            0.0,
+            0.0,
+            width as f32 / scale,
+            height as f32 / scale,
+        );
+        frame.base.push_rect(RectShape::filled(
+            logical,
+            self.shell.popup_background(),
+            0.0,
+        ));
+        frame.overlay = self.frame.popup.translated(bounds.x, bounds.y);
+        match overlay.renderer.render(&frame) {
+            Ok(_) => {}
+            Err(RenderError::Outdated) => overlay.renderer.reconfigure(),
+            Err(RenderError::Validation) => overlay.renderer.reconfigure(),
+            Err(RenderError::Lost) => {
+                let scale = overlay.renderer.scale_factor();
+                match pollster::block_on(Renderer::new(overlay.window.clone())) {
+                    Ok(mut renderer) => {
+                        renderer.set_scale_factor(scale);
+                        overlay.renderer = renderer;
+                    }
+                    Err(error) => eprintln!("recreate overlay renderer: {error}"),
+                }
+            }
+        }
+        if !overlay.visible {
+            overlay.window.set_visible(true);
+            overlay.visible = true;
+        }
+    }
+
+    fn overlay_id(&self) -> Option<WindowId> {
+        self.overlay.as_ref().map(|overlay| overlay.window.id())
+    }
+
+    fn overlay_point(&self, position: rb_ui::Vec2) -> rb_ui::Vec2 {
+        let Some(overlay) = self.overlay.as_ref() else {
+            return rb_ui::Vec2::new(-1000.0, -1000.0);
+        };
+        rb_ui::Vec2::new(
+            overlay.bounds.x + position.x,
+            overlay.bounds.y + position.y,
+        )
+    }
+
+    fn update_overlay_cursor(&mut self, point: rb_ui::Vec2) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return;
+        };
+        let cursor = match self.shell.cursor_role(point) {
+            CursorRole::Text => CursorIcon::Text,
+            CursorRole::Pointer => CursorIcon::Pointer,
+            CursorRole::Default => CursorIcon::Default,
+        };
+        if cursor != overlay.cursor_icon {
+            overlay.window.set_cursor(cursor);
+            overlay.cursor_icon = cursor;
+        }
+    }
+
+    fn overlay_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.hide_overlay(),
+            WindowEvent::Resized(size) => {
+                if let Some(overlay) = self.overlay.as_mut() {
+                    overlay.renderer.resize(size.width, size.height);
+                    overlay.size = (size.width, size.height);
+                    overlay.window.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(overlay) = self.overlay.as_mut() {
+                    overlay.renderer.set_scale_factor(scale_factor as f32);
+                    let size = overlay.window.inner_size();
+                    overlay.renderer.resize(size.width, size.height);
+                    overlay.size = (size.width, size.height);
+                    overlay.window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.draw_overlay(),
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.window.scale_factor() as f32;
+                let local = rb_ui::Vec2::new(position.x as f32 / scale, position.y as f32 / scale);
+                if let Some(overlay) = self.overlay.as_mut() {
+                    overlay.cursor = local;
+                }
+                let point = self.overlay_point(local);
+                self.update_overlay_cursor(point);
+                let dirty = self.shell.pointer_moved(point);
+                if dirty {
+                    self.draw();
+                    self.draw_overlay();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.shell.pointer_moved(rb_ui::Vec2::new(-1000.0, -1000.0));
+                self.draw();
+                self.draw_overlay();
+            }
+            WindowEvent::MouseInput {
+                state: pressed,
+                button,
+                ..
+            } => {
+                let local = self
+                    .overlay
+                    .as_ref()
+                    .map(|overlay| overlay.cursor)
+                    .unwrap_or(rb_ui::Vec2::new(-1000.0, -1000.0));
+                let point = self.overlay_point(local);
+                self.shell.pointer_moved(point);
+                match button {
+                    MouseButton::Left => match pressed {
+                        ElementState::Pressed => self.shell.left_click(point),
+                        ElementState::Released => self.shell.left_released(point),
+                    },
+                    MouseButton::Right if pressed == ElementState::Pressed => {
+                        self.shell.right_click(point)
+                    }
+                    _ => return,
+                }
+                if self.shell.take_rush_agent() {
+                    self.open_rush_agent();
+                    self.draw_overlay();
+                    return;
+                }
+                if self.shell.take_terminal_close() {
+                    self.stop_terminal();
+                }
+                self.window.focus_window();
+                self.pump_navigation();
+                self.draw();
+                self.draw_overlay();
+                if let Some(action) = self.shell.take_chrome_action() {
+                    self.apply_chrome_action(action, event_loop);
+                }
+                if self.shell.take_fullscreen_exit() {
+                    self.set_web_fullscreen(false);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn sync_active_tab(&mut self) {
@@ -149,26 +524,28 @@ impl State {
         self.sync_webview_bounds();
     }
 
-    /// Pane biasa memakai satu WebView; split view memakai hingga tiga WebView yang
-    /// semuanya tampil. Tab non-pane tetap hidup di background.
-    fn webview_layout(&self) -> Vec<(TabId, Rect)> {
+    fn inset_content_rect(&self) -> Rect {
         let (width, height) = self.size;
         let logical = self.shell.content_rect(width, height);
-        let scale = self.window.scale_factor() as f32;
-        // Saat fullscreen atau maximized, konten menempel ke tepi layar tanpa celah.
         let inset = if self.shell.is_fullscreen() || self.window.is_maximized() {
             0.0
         } else {
             RESIZE_EDGE
         };
-        let inset = Rect::new(
+        Rect::new(
             logical.x + inset,
             logical.y,
             (logical.width - inset * 2.0).max(0.0),
             (logical.height - inset).max(0.0),
-        );
+        )
+    }
+
+    /// Pane biasa memakai satu WebView; split view memakai hingga tiga WebView yang
+    /// semuanya tampil. Tab non-pane tetap hidup di background.
+    fn webview_layout(&self) -> Vec<(TabId, Rect)> {
+        let scale = self.window.scale_factor() as f32;
         self.shell
-            .webview_layout(inset)
+            .webview_layout(self.inset_content_rect())
             .into_iter()
             .map(|(tab_id, rect)| {
                 (
@@ -192,15 +569,11 @@ impl State {
     }
 
     fn sync_webview_visibility(&mut self) {
-        let target: Vec<TabId> = if self.overlay_open {
-            Vec::new()
-        } else {
-            self.webview_layout()
-                .into_iter()
-                .filter(|(tab_id, _)| self.ready.contains(tab_id))
-                .map(|(tab_id, _)| tab_id)
-                .collect()
-        };
+        let target: Vec<TabId> = self
+            .webview_layout()
+            .into_iter()
+            .map(|(tab_id, _)| tab_id)
+            .collect();
         for previous in &self.visible_webviews {
             if !target.contains(previous) {
                 if let Some(host) = self.webviews.get(previous) {
@@ -294,6 +667,11 @@ impl State {
 
     fn redraw(&self) {
         self.window.request_redraw();
+        if let Some(overlay) = self.overlay.as_ref() {
+            if overlay.visible {
+                overlay.window.request_redraw();
+            }
+        }
     }
 
     fn apply_chrome_action(&mut self, action: ChromeAction, event_loop: &ActiveEventLoop) {
@@ -454,6 +832,9 @@ impl State {
                     self.set_web_fullscreen(false);
                 } else {
                     self.shell.escape();
+                    if self.shell.take_terminal_close() {
+                        self.stop_terminal();
+                    }
                 }
             }
             Key::Named(NamedKey::Space) if !ctrl && !alt => {
@@ -579,7 +960,13 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        if let Err(error) = state.init_overlay(event_loop) {
+            eprintln!("create overlay: {error}");
+            event_loop.exit();
+            return;
+        }
         state.draw();
+        state.draw_overlay();
         self.state = Some(state);
         if let Some(state) = self.state.as_mut() {
             if let Err(error) = state.init_webview() {
@@ -598,12 +985,21 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        if window_id != state.window.id() {
+        let is_main = window_id == state.window.id();
+        let is_overlay = state.overlay_id() == Some(window_id);
+        if !is_main && !is_overlay {
+            return;
+        }
+        if is_overlay {
+            state.overlay_event(event_loop, event);
             return;
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                state.stop_terminal();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 state.renderer.resize(size.width, size.height);
                 let scale = state.window.scale_factor() as f32;
@@ -612,6 +1008,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.renderer.set_scale_factor(scale_factor as f32);
+                if let Some(overlay) = state.overlay.as_mut() {
+                    overlay.renderer.set_scale_factor(scale_factor as f32);
+                }
                 let physical = state.window.inner_size();
                 state.renderer.resize(physical.width, physical.height);
                 state.size = (
@@ -620,7 +1019,11 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 state.redraw();
             }
-            WindowEvent::RedrawRequested => state.draw(),
+            WindowEvent::Moved(_) => state.draw_overlay(),
+            WindowEvent::RedrawRequested => {
+                state.draw();
+                state.draw_overlay();
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 state.modifiers = modifiers.state();
             }
@@ -692,6 +1095,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     _ => {}
                 }
+                if state.shell.take_rush_agent() {
+                    state.open_rush_agent();
+                    return;
+                }
+                if state.shell.take_terminal_close() {
+                    state.stop_terminal();
+                }
                 state.pump_navigation();
                 state.redraw();
             }
@@ -753,11 +1163,121 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = self.state.as_mut() {
+            if state.terminal.is_some() && state.terminal_exited() {
+                state.stop_terminal();
+                state.redraw();
+            }
             if state.shell.has_animation() {
                 state.redraw();
             }
         }
     }
+}
+
+fn pick_folder(parent: HWND) -> Option<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
+        dialog
+            .SetOptions(FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM)
+            .ok()?;
+        dialog.SetTitle(w!("Pilih folder untuk RushAgent")).ok()?;
+        dialog.Show(Some(parent)).ok()?;
+        let item: IShellItem = dialog.GetResult().ok()?;
+        let path: PWSTR = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let folder = path.to_string().ok()?;
+        CoTaskMemFree(Some(path.0 as *const c_void));
+        Some(folder)
+    }
+}
+
+fn start_terminal(folder: &str, parent: HWND) -> Result<TerminalHost, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let token = format!("RushAgent-{}-{}", std::process::id(), nonce);
+    let mut command: Vec<u16> = format!("cmd.exe /K title {token} && cd /d \"{folder}\"")
+        .encode_utf16()
+        .collect();
+    command.push(0);
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(command.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NEW_CONSOLE,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut info,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let mut hwnd = None;
+    for _ in 0..40 {
+        hwnd = find_console_window(&token);
+        if hwnd.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let Some(hwnd) = hwnd else {
+        unsafe {
+            let _ = CloseHandle(info.hThread);
+            let _ = CloseHandle(info.hProcess);
+        }
+        return Err("jendela console tidak ditemukan".into());
+    };
+    unsafe {
+        let _ = SetParent(hwnd, Some(parent));
+        let old_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let remove = (WS_POPUP
+            | WS_CAPTION
+            | WS_THICKFRAME
+            | WS_SYSMENU
+            | WS_MAXIMIZEBOX
+            | WS_MINIMIZEBOX)
+            .0 as isize;
+        let add = (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN).0 as isize;
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (old_style & !remove) | add);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            1,
+            1,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+    Ok(TerminalHost {
+        hwnd,
+        process: info.hProcess,
+        thread: info.hThread,
+        last_bounds: None,
+    })
+}
+
+fn find_console_window(token: &str) -> Option<HWND> {
+    let mut search = ConsoleWindowSearch {
+        token,
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_console_window),
+            LPARAM(&mut search as *mut ConsoleWindowSearch<'_> as isize),
+        );
+    }
+    search.found
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -835,7 +1355,9 @@ fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
     let height = info.height;
     let mut rgba = match info.color_type {
         png::ColorType::Rgb => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
             .collect(),
         png::ColorType::Rgba => bytes.to_vec(),
@@ -844,7 +1366,9 @@ fn icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
             .flat_map(|value| [*value, *value, *value, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
             .collect(),
         png::ColorType::Indexed => return None,

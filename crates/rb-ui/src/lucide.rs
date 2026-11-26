@@ -34,6 +34,8 @@ pub enum Icon {
     Globe,
     /// Keluar dari split view dan kembali ke satu tab penuh.
     Unsplit,
+    RushAgent,
+    Terminal,
 }
 
 impl Icon {
@@ -68,6 +70,8 @@ impl Icon {
             Self::Check => Some(LucideIcon::Check),
             Self::Globe => Some(LucideIcon::Globe),
             Self::Unsplit => Some(LucideIcon::Maximize2),
+            Self::RushAgent => Some(LucideIcon::SquareTerminal),
+            Self::Terminal => Some(LucideIcon::Terminal),
         }
     }
 }
@@ -109,6 +113,8 @@ mod tests {
             Icon::Check,
             Icon::Globe,
             Icon::Unsplit,
+            Icon::RushAgent,
+            Icon::Terminal,
         ];
         for icon in icons {
             let lucide = icon.lucide().expect("lucide icon");

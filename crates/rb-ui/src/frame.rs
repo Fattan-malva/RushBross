@@ -238,12 +238,112 @@ impl Layer {
     pub fn push_text(&mut self, text: TextShape) {
         self.texts.push(text);
     }
+
+    pub fn bounds(&self) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        let mut include = |rect: Rect| {
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                return;
+            }
+            bounds = Some(match bounds {
+                Some(current) => current.union(rect),
+                None => rect,
+            });
+        };
+        for shape in &self.shapes {
+            include(shape.rect);
+        }
+        for icon in &self.icons {
+            include(icon.rect);
+        }
+        for image in &self.images {
+            include(image.rect);
+        }
+        for text in &self.texts {
+            let width = if text.width.is_finite() && text.width > 0.0 {
+                text.width
+            } else {
+                (text.text.chars().count() as f32 * text.size * 0.62).max(text.size)
+            };
+            let lines = text.text.lines().count().max(1) as f32;
+            let height = text.size * text.line_height * lines + text.size * 0.5;
+            let rect = Rect::new(
+                text.x - text.offset_x,
+                text.y - text.size,
+                width + text.offset_x,
+                height,
+            );
+            include(match text.clip {
+                Some(clip) => {
+                    let x = rect.x.max(clip.x);
+                    let y = rect.y.max(clip.y);
+                    let right = rect.right().min(clip.right());
+                    let bottom = rect.bottom().min(clip.bottom());
+                    Rect::new(x, y, (right - x).max(0.0), (bottom - y).max(0.0))
+                }
+                None => rect,
+            });
+        }
+        bounds
+    }
+
+    pub fn translated(&self, dx: f32, dy: f32) -> Layer {
+        Layer {
+            shapes: self
+                .shapes
+                .iter()
+                .cloned()
+                .map(|mut shape| {
+                    shape.rect.x -= dx;
+                    shape.rect.y -= dy;
+                    shape
+                })
+                .collect(),
+            icons: self
+                .icons
+                .iter()
+                .cloned()
+                .map(|mut icon| {
+                    icon.rect.x -= dx;
+                    icon.rect.y -= dy;
+                    icon
+                })
+                .collect(),
+            images: self
+                .images
+                .iter()
+                .cloned()
+                .map(|mut image| {
+                    image.rect.x -= dx;
+                    image.rect.y -= dy;
+                    image
+                })
+                .collect(),
+            texts: self
+                .texts
+                .iter()
+                .cloned()
+                .map(|mut text| {
+                    text.x -= dx;
+                    text.y -= dy;
+                    if let Some(clip) = text.clip.as_mut() {
+                        clip.x -= dx;
+                        clip.y -= dy;
+                    }
+                    text
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub base: Layer,
     pub overlay: Layer,
-    /// Ada popup (tooltip, menu, popover) yang harus tampil di atas WebView.
+    /// Popup yang harus tampil di atas WebView (menu, popover, split picker).
+    /// Digambar oleh jendela overlay native di atas kontrol WebView2.
+    pub popup: Layer,
+    /// Ada popup (menu, popover, split picker) yang harus tampil di atas WebView.
     pub popup_open: bool,
 }

@@ -92,7 +92,9 @@ fn read_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let bytes = &buffer[..info.buffer_size()];
     let rgba = match info.color_type {
         png::ColorType::Rgb => bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
             .collect(),
         png::ColorType::Rgba => bytes.to_vec(),
@@ -101,7 +103,9 @@ fn read_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
             .flat_map(|value| [*value, *value, *value, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
             .collect(),
         png::ColorType::Indexed => return Err("indexed PNG is not supported".to_string()),

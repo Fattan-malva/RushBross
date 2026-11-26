@@ -39,6 +39,9 @@ const SPLIT_PALETTE: [Color; 5] = [
 ];
 const CONTEXT_ITEM_HEIGHT: f32 = 30.0;
 const TAB_CONTEXT_WIDTH: f32 = 220.0;
+const TERMINAL_RATIO: f32 = 0.46;
+const TERMINAL_MIN_RATIO: f32 = 0.2;
+const TERMINAL_MAX_RATIO: f32 = 0.8;
 
 const TOOLBAR_HEIGHT: f32 = 48.0;
 const ADDRESS_HEIGHT: f32 = 36.0;
@@ -83,6 +86,10 @@ enum Element {
     ToolbarMenu,
     Profile,
     ToolbarMore,
+    RushAgent,
+    TerminalPane,
+    TerminalDivider,
+    TerminalClose,
     Address,
     AddressClear,
     BookmarkStar,
@@ -197,6 +204,18 @@ struct TabContextMenu {
 struct SplitPicker {
     selected: Vec<TabId>,
     position: Vec2,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalPane {
+    title: String,
+    ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalLayout {
+    pub pane: Rect,
+    pub body: Rect,
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +369,10 @@ pub struct BrowserShell {
     /// Semua grup split. Satu tab hanya boleh menjadi anggota satu grup.
     splits: Vec<SplitView>,
     split_drag: Option<usize>,
+    terminal: Option<TerminalPane>,
+    terminal_drag: bool,
+    pending_rush_agent: bool,
+    pending_terminal_close: bool,
     pointer: Vec2,
     hover: Option<Element>,
     hits: Vec<(Element, Rect)>,
@@ -357,6 +380,7 @@ pub struct BrowserShell {
     layout: Layout,
     tab_rects: Vec<(TabId, Rect)>,
     tab_drag: Option<TabDrag>,
+    popup_bounds: Option<Rect>,
     chrome: WindowChrome,
     maximized: bool,
     pending_chrome: Option<ChromeAction>,
@@ -391,6 +415,10 @@ impl BrowserShell {
             split_picker: None,
             splits: Vec::new(),
             split_drag: None,
+            terminal: None,
+            terminal_drag: false,
+            pending_rush_agent: false,
+            pending_terminal_close: false,
             pointer: Vec2::new(-1000.0, -1000.0),
             hover: None,
             hits: Vec::new(),
@@ -398,6 +426,7 @@ impl BrowserShell {
             layout: Layout::default(),
             tab_rects: Vec::new(),
             tab_drag: None,
+            popup_bounds: None,
             chrome: WindowChrome::layout(0.0, 0.0),
             maximized: false,
             pending_chrome: None,
@@ -412,7 +441,103 @@ impl BrowserShell {
     }
 
     pub fn render(&mut self, width: f32, height: f32) -> Frame {
-        self.build(width, height)
+        let frame = self.build(width, height);
+        self.popup_bounds = frame
+            .popup
+            .shapes
+            .iter()
+            .map(|shape| shape.rect)
+            .reduce(|current, next| current.union(next));
+        frame
+    }
+
+    pub fn popup_bounds(&self) -> Option<Rect> {
+        self.popup_bounds
+    }
+
+    pub fn popup_background(&self) -> Color {
+        self.theme.popover
+    }
+
+    pub fn open_terminal(&mut self, folder: impl Into<String>) {
+        let folder = folder.into();
+        let title = folder
+            .rsplit(['\\', '/'])
+            .find(|part| !part.is_empty())
+            .unwrap_or("RushAgent")
+            .to_string();
+        self.terminal = Some(TerminalPane {
+            title,
+            ratio: TERMINAL_RATIO,
+        });
+        self.terminal_drag = false;
+        self.pending_terminal_close = false;
+        self.show_bookmarks = false;
+        self.editing = None;
+        self.context_menu = None;
+        self.tab_context_menu = None;
+        self.split_picker = None;
+        self.blur();
+    }
+
+    pub fn close_terminal(&mut self) {
+        self.terminal = None;
+        self.terminal_drag = false;
+        self.pending_terminal_close = false;
+    }
+
+    pub fn terminal_is_open(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    pub fn take_rush_agent(&mut self) -> bool {
+        std::mem::take(&mut self.pending_rush_agent)
+    }
+
+    pub fn take_terminal_close(&mut self) -> bool {
+        std::mem::take(&mut self.pending_terminal_close)
+    }
+
+    pub fn terminal_layout(&self, content: Rect) -> Option<TerminalLayout> {
+        let terminal = self.terminal.as_ref()?;
+        let usable = (content.width - SPLIT_GAP).max(0.0);
+        let web_width = (usable * (1.0 - terminal.ratio)).max(0.0);
+        let x = content.x + web_width + SPLIT_GAP;
+        let width = (content.right() - x).max(0.0);
+        let header = SPLIT_HEADER_HEIGHT.min(content.height);
+        Some(TerminalLayout {
+            pane: Rect::new(x, content.y, width, content.height),
+            body: Rect::new(
+                x,
+                content.y + header,
+                width,
+                (content.height - header).max(0.0),
+            ),
+        })
+    }
+
+    fn web_area_rect(&self, content: Rect) -> Rect {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return content;
+        };
+        let usable = (content.width - SPLIT_GAP).max(0.0);
+        Rect::new(
+            content.x,
+            content.y,
+            (usable * (1.0 - terminal.ratio)).max(0.0),
+            content.height,
+        )
+    }
+
+    fn update_terminal_divider(&mut self, x: f32) {
+        let content = self.content_rect(self.size.x, self.size.y);
+        if content.width <= 1.0 {
+            return;
+        }
+        let ratio = (content.right() - x) / content.width;
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.ratio = ratio.clamp(TERMINAL_MIN_RATIO, TERMINAL_MAX_RATIO);
+        }
     }
 
     /// Memperbarui posisi pointer. Mengembalikan `true` jika tampilan perlu digambar
@@ -424,6 +549,10 @@ impl BrowserShell {
         // tanpa membangun frame dua kali.
         self.hover = self.hit_at(position).map(|(element, _)| element);
         let mut dirty = self.hover != previous_hover;
+        if self.terminal_drag {
+            self.update_terminal_divider(position.x);
+            return true;
+        }
         if let Some(index) = self.split_drag {
             self.update_split_divider(index, position.x);
             return true;
@@ -513,8 +642,12 @@ impl BrowserShell {
 
         self.address_dragging = false;
         self.split_drag = None;
+        self.terminal_drag = false;
         if let Some((Element::SplitDivider(index), _)) = hit {
             self.split_drag = Some(index);
+        }
+        if let Some((Element::TerminalDivider, _)) = hit {
+            self.terminal_drag = true;
         }
         if let Some((Element::Tab(id), rect)) = hit {
             let mut ids = self
@@ -594,6 +727,7 @@ impl BrowserShell {
         self.tab_drag = None;
         self.address_dragging = false;
         self.split_drag = None;
+        self.terminal_drag = false;
     }
 
     pub fn animate_tabs(&mut self) -> bool {
@@ -826,6 +960,10 @@ impl BrowserShell {
             self.editing = None;
             return;
         }
+        if self.terminal.is_some() {
+            self.pending_terminal_close = true;
+            return;
+        }
         self.blur();
     }
 
@@ -945,6 +1083,7 @@ impl BrowserShell {
 
     /// Rectangle WebView per pane. Header pane dan jarak antar pane tidak ikut.
     pub fn webview_layout(&self, content: Rect) -> Vec<(TabId, Rect)> {
+        let content = self.web_area_rect(content);
         if let Some(split) = self.shown_split() {
             return split
                 .pane_rects(content)
@@ -1491,6 +1630,17 @@ impl BrowserShell {
                     self.blur();
                 }
             }
+            Element::RushAgent => {
+                self.pending_rush_agent = true;
+                self.show_bookmarks = false;
+                self.editing = None;
+                self.context_menu = None;
+                self.tab_context_menu = None;
+                self.split_picker = None;
+                self.blur();
+            }
+            Element::TerminalPane | Element::TerminalDivider => {}
+            Element::TerminalClose => self.pending_terminal_close = true,
             Element::FullscreenClose => {
                 self.pending_fullscreen_exit = true;
             }
@@ -1808,6 +1958,9 @@ impl BrowserShell {
             if self.split_is_shown() {
                 self.build_split_view(base, viewport, hover);
             }
+            if self.terminal.is_some() {
+                self.build_terminal_pane(base, viewport, hover);
+            }
             self.build_fullscreen(&mut frame, width, hover);
             return frame;
         }
@@ -1857,6 +2010,9 @@ impl BrowserShell {
         if self.split_is_shown() {
             self.build_split_view(base, viewport, hover);
         }
+        if self.terminal.is_some() {
+            self.build_terminal_pane(base, viewport, hover);
+        }
         if !self.maximized {
             base.push_rect(RectShape::bordered(
                 Rect::new(0.5, 0.5, (width - 1.0).max(0.0), (height - 1.0).max(0.0)),
@@ -1889,26 +2045,19 @@ impl BrowserShell {
                 _ => None,
             })
             .and_then(|id| {
-                self.tab_rects
+                let rect = self
+                    .tab_rects
                     .iter()
                     .find(|(tab_id, _)| *tab_id == id)
-                    .map(|(_, rect)| (id, *rect))
-            })
-            .and_then(|(id, rect)| {
+                    .map(|(_, rect)| *rect)?;
                 let tab = self.tabs.tab(id)?;
-                let close_x = rect.right() - 10.0 - 20.0;
-                let title_width = (close_x - 8.0 - (rect.x + 10.0)).max(0.0);
-                if approx_text_width(&tab.title, 12.0) > title_width {
-                    Some((rect.center().x, rect.bottom() + 6.0, tab.title.clone()))
-                } else {
-                    None
-                }
-            });
+                Some((rect.center().x, rect.bottom() + 6.0, tab.title.clone()))
+            })
+            .filter(|(_, _, text)| !text.is_empty());
         frame.popup_open = show_bookmarks
             || context_menu.is_some()
             || tab_context_menu.is_some()
-            || picker_is_open
-            || tooltip.is_some();
+            || picker_is_open;
         if let Some((center_x, y, text)) = tooltip {
             let tooltip_width = (approx_text_width(&text, 12.0) + 16.0).min(width - 16.0);
             let x = (center_x - tooltip_width * 0.5)
@@ -2007,6 +2156,91 @@ impl BrowserShell {
             ));
             self.push_hit(Element::SplitDivider(index), divider);
         }
+    }
+
+    fn build_terminal_pane(
+        &mut self,
+        layer: &mut rb_ui::Layer,
+        content: Rect,
+        hover: Option<Element>,
+    ) {
+        let Some(layout) = self.terminal_layout(content) else {
+            return;
+        };
+        let Some(title) = self.terminal.as_ref().map(|terminal| terminal.title.clone()) else {
+            return;
+        };
+        if layout.pane.width <= 0.0 || layout.pane.height <= 0.0 {
+            return;
+        }
+        let theme = self.theme;
+        layer.push_rect(RectShape::filled(layout.pane, theme.background, 0.0));
+        layer.push_rect(RectShape::filled(
+            layout.body,
+            Color::rgb(0x0c, 0x0c, 0x0c),
+            0.0,
+        ));
+        self.push_hit(Element::TerminalPane, layout.pane);
+
+        let divider = Rect::new(
+            layout.pane.x - SPLIT_GAP,
+            content.y,
+            SPLIT_GAP,
+            content.height,
+        );
+        let divider_hover = hover == Some(Element::TerminalDivider);
+        let center = divider.center().x;
+        layer.push_rect(RectShape::filled(
+            Rect::new(center - 1.0, divider.y, 2.0, divider.height),
+            if divider_hover {
+                theme.primary
+            } else {
+                theme.border
+            },
+            1.0,
+        ));
+        layer.push_rect(RectShape::filled(
+            Rect::new(center - 2.0, divider.center().y - 14.0, 4.0, 28.0),
+            if divider_hover {
+                theme.primary
+            } else {
+                theme.muted
+            },
+            2.0,
+        ));
+        self.push_hit(Element::TerminalDivider, divider);
+
+        let header = Rect::new(
+            layout.pane.x,
+            content.y,
+            layout.pane.width,
+            SPLIT_HEADER_HEIGHT.min(content.height),
+        );
+        layer.push_rect(RectShape::filled(header, theme.tab_inactive, 0.0));
+        layer.push_icon(IconShape::new(
+            Icon::Terminal,
+            icon_rect(
+                Vec2::new(header.x + 10.0 + 8.0, header.center().y),
+                14.0,
+            ),
+            theme.muted_foreground,
+        ));
+        layer.push_text(
+            TextShape::new(title, header.x + 34.0, header.y + 7.0, 12.0, theme.foreground)
+                .width((header.width - 64.0).max(0.0))
+                .ellipsis()
+                .weight(500),
+        );
+        let close_rect = Rect::new(header.right() - 22.0, header.y + 6.0, 16.0, 16.0);
+        if hover == Some(Element::TerminalClose) {
+            layer.push_rect(RectShape::filled(close_rect, theme.accent, 4.0));
+        }
+        layer.push_icon(IconShape::new(
+            Icon::Close,
+            icon_rect(close_rect.center(), 10.0),
+            theme.muted_foreground,
+        ));
+        self.push_hit(Element::TerminalClose, close_rect);
     }
 
     /// Menggambar satu tab. Mengembalikan warna latar dan batas kanan judul jika judul terpotong,
@@ -2435,12 +2669,18 @@ impl BrowserShell {
             NAV_BUTTON_SIZE,
             NAV_BUTTON_SIZE,
         );
+        let agent_rect = Rect::new(
+            menu_rect.x - gap - NAV_BUTTON_SIZE,
+            button_y,
+            NAV_BUTTON_SIZE,
+            NAV_BUTTON_SIZE,
+        );
         self.layout.manage_button = more_rect;
 
         let form = Rect::new(
             reload_rect.right() + gap,
             toolbar.y + 6.0,
-            (menu_rect.x - gap - reload_rect.right() - gap).max(1.0),
+            (agent_rect.x - gap - reload_rect.right() - gap).max(1.0),
             ADDRESS_HEIGHT,
         );
 
@@ -2503,6 +2743,14 @@ impl BrowserShell {
         );
         nav_button(
             layer,
+            agent_rect,
+            Icon::RushAgent,
+            Element::RushAgent,
+            true,
+            0.0,
+        );
+        nav_button(
+            layer,
             menu_rect,
             Icon::Menu,
             Element::ToolbarMenu,
@@ -2528,6 +2776,7 @@ impl BrowserShell {
         self.push_hit(Element::Back, back_rect);
         self.push_hit(Element::Forward, forward_rect);
         self.push_hit(Element::Reload, reload_rect);
+        self.push_hit(Element::RushAgent, agent_rect);
         self.push_hit(Element::ToolbarMenu, menu_rect);
         self.push_hit(Element::Profile, profile_rect);
         self.push_hit(Element::ToolbarMore, more_rect);
@@ -2905,7 +3154,7 @@ impl BrowserShell {
         let popover_height = 8.0 + 24.0 + 8.0 + list_height.max(empty_height) + edit_height + 8.0;
 
         let popover = Rect::new(x, y, POPOVER_WIDTH, popover_height);
-        let layer = &mut frame.overlay;
+        let layer = &mut frame.popup;
         layer.push_rect(RectShape::bordered(
             popover,
             theme.popover,
@@ -3173,7 +3422,7 @@ impl BrowserShell {
             .max(8.0)
             .min((height - menu_height - 8.0).max(8.0));
         let rect = Rect::new(x, y, CONTEXT_WIDTH, menu_height);
-        let layer = &mut frame.overlay;
+        let layer = &mut frame.popup;
         layer.push_rect(RectShape::bordered(
             rect,
             theme.popover,
@@ -3374,7 +3623,7 @@ impl BrowserShell {
             .max(8.0)
             .min((height - picker_height - 8.0).max(8.0));
         let rect = Rect::new(x, y, picker_width, picker_height);
-        let layer = &mut frame.overlay;
+        let layer = &mut frame.popup;
         layer.push_rect(RectShape::bordered(
             rect,
             theme.popover,
@@ -3528,7 +3777,7 @@ impl BrowserShell {
             .max(8.0)
             .min((height - menu_height - 8.0).max(8.0));
         let rect = Rect::new(x, y, TAB_CONTEXT_WIDTH, menu_height);
-        let layer = &mut frame.overlay;
+        let layer = &mut frame.popup;
         layer.push_rect(RectShape::bordered(
             rect,
             theme.popover,
@@ -3779,6 +4028,37 @@ mod tests {
         let request = shell.take_navigation().expect("new tab navigation");
         assert_eq!(request.url, NEW_TAB_URL);
         assert!(shell.address.text().is_empty());
+    }
+
+    #[test]
+    fn hovering_tab_shows_its_title_tooltip() {
+        let mut shell = BrowserShell::new();
+        shell.render(1000.0, 800.0);
+        let title = shell.tabs.tabs()[0].title.clone();
+        let point = shell.tab_rects[0].1.center();
+        shell.pointer_moved(point);
+        let frame = shell.render(1000.0, 800.0);
+        assert!(frame
+            .overlay
+            .texts
+            .iter()
+            .any(|text| text.text == title));
+    }
+
+    #[test]
+    fn rush_agent_terminal_shrinks_web_area_and_can_close() {
+        let mut shell = BrowserShell::new();
+        let area = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let before = shell.webview_layout(area);
+        shell.open_terminal("C:/Projects/RushBross");
+        let layout = shell.terminal_layout(area).expect("terminal layout");
+        let after = shell.webview_layout(area);
+        assert!(shell.terminal_is_open());
+        assert_eq!(shell.terminal.as_ref().unwrap().title, "RushBross");
+        assert!(layout.body.height > 0.0);
+        assert!(after[0].1.width < before[0].1.width);
+        shell.close_terminal();
+        assert!(!shell.terminal_is_open());
     }
 
     #[test]
