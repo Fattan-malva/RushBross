@@ -7,6 +7,8 @@ pub use crate::lucide::Icon;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontFamily {
     Sans,
+    /// Font monospace untuk grid terminal (Consolas di Windows).
+    Mono,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

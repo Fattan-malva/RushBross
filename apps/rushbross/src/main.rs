@@ -10,6 +10,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 
 use rb_agent::{AgentRequest, AgentServer};
+use rb_terminal::{Key as TermKey, Mods, CELL_WIDTH, LINE_HEIGHT};
+use rb_ui_widgets::{TERMINAL_PADDING_X, TERMINAL_PADDING_Y};
 use terminal::PtyTerminal;
 use rb_tabs::TabId;
 use rb_ui::{Frame, Rect, RectShape};
@@ -201,6 +203,39 @@ fn tool_definitions() -> Value {
 
 fn js_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Terjemahkan tombol navigasi dan fungsi winit ke tombol terminal.
+fn named_to_terminal_key(named: NamedKey) -> Option<TermKey> {
+    Some(match named {
+        NamedKey::Enter => TermKey::Enter,
+        NamedKey::Backspace => TermKey::Backspace,
+        NamedKey::Tab => TermKey::Tab,
+        NamedKey::Escape => TermKey::Escape,
+        NamedKey::ArrowUp => TermKey::Up,
+        NamedKey::ArrowDown => TermKey::Down,
+        NamedKey::ArrowLeft => TermKey::Left,
+        NamedKey::ArrowRight => TermKey::Right,
+        NamedKey::Home => TermKey::Home,
+        NamedKey::End => TermKey::End,
+        NamedKey::PageUp => TermKey::PageUp,
+        NamedKey::PageDown => TermKey::PageDown,
+        NamedKey::Insert => TermKey::Insert,
+        NamedKey::Delete => TermKey::Delete,
+        NamedKey::F1 => TermKey::F(1),
+        NamedKey::F2 => TermKey::F(2),
+        NamedKey::F3 => TermKey::F(3),
+        NamedKey::F4 => TermKey::F(4),
+        NamedKey::F5 => TermKey::F(5),
+        NamedKey::F6 => TermKey::F(6),
+        NamedKey::F7 => TermKey::F(7),
+        NamedKey::F8 => TermKey::F(8),
+        NamedKey::F9 => TermKey::F(9),
+        NamedKey::F10 => TermKey::F(10),
+        NamedKey::F11 => TermKey::F(11),
+        NamedKey::F12 => TermKey::F(12),
+        _ => return None,
+    })
 }
 
 fn wheel_lines(delta: winit::event::MouseScrollDelta) -> f32 {
@@ -545,6 +580,10 @@ impl State {
     }
 
     fn open_rush_agent(&mut self) {
+        // Pane kosong langsung tampil; folder dipilih lewat tombol di dalamnya.
+        if self.terminal.is_none() {
+            self.shell.open_terminal_placeholder();
+        }
         self.shell.open_folder_picker();
         self.redraw();
     }
@@ -591,14 +630,66 @@ impl State {
         let Some(body) = self.shell.terminal_layout(self.inset_content_rect()) else {
             return;
         };
-        let scale = self.window.scale_factor() as f32;
-        let cols = ((body.body.width * scale) / 8.0).round().max(20.0) as u16;
-        let rows = ((body.body.height * scale) / 16.0).round().max(4.0) as u16;
+        // Ukuran grid dihitung dari metrik sel yang sama dengan penggambaran (logical px).
+        let usable_width = (body.body.width - TERMINAL_PADDING_X * 2.0).max(0.0);
+        let usable_height = (body.body.height - TERMINAL_PADDING_Y * 2.0).max(0.0);
+        let cols = (usable_width / CELL_WIDTH).floor().max(20.0) as u16;
+        let rows = (usable_height / LINE_HEIGHT).floor().max(4.0) as u16;
         if let Some(terminal) = self.terminal.as_mut() {
             terminal.resize(cols, rows);
             terminal.pump();
-            self.shell.set_terminal_lines(terminal.lines());
+            self.shell.set_terminal_snapshot(terminal.snapshot().clone());
         }
+    }
+
+    /// Kirim satu ketikan ke terminal. Mengembalikan false bila event ini bukan input
+    /// (misalnya hanya tombol modifier), agar pemanggil bisa meneruskannya ke jalur lain.
+    fn send_terminal_key(&mut self, event: &winit::event::KeyEvent, mods: Mods) -> bool {
+        let key = match &event.logical_key {
+            Key::Named(NamedKey::Space) if mods.ctrl || mods.alt => Some(TermKey::Char(' ')),
+            Key::Named(named) => named_to_terminal_key(*named),
+            Key::Character(value) if mods.ctrl != mods.alt => {
+                let mut chars = value.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(ch), None) => Some(TermKey::Char(ch)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(terminal) = self.terminal.as_mut() else {
+            return false;
+        };
+        if let Some(key) = key {
+            terminal.key(key, mods);
+            return true;
+        }
+        // Teks biasa (termasuk huruf non-ASCII dan IME) dikirim apa adanya.
+        let Some(text) = event.text.as_deref() else {
+            return false;
+        };
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return false;
+        }
+        terminal.send(text);
+        true
+    }
+
+    /// Gulir riwayat terminal saat pointer di atas pane. Mengembalikan false bila tidak ada
+    /// yang digulir, sehingga roda tetap dipakai oleh halaman atau daftar folder.
+    fn scroll_terminal(&mut self, delta: winit::event::MouseScrollDelta, point: rb_ui::Vec2) -> bool {
+        if self.terminal.is_none() || !self.shell.terminal_pane_at(point) {
+            return false;
+        }
+        let lines = (wheel_lines(delta) * 3.0).round() as i32;
+        if lines == 0 {
+            return false;
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.scroll(lines);
+        }
+        self.pump_terminal();
+        true
     }
 
     fn handle_agent_request(&mut self, request: AgentRequest) {
@@ -1453,43 +1544,13 @@ impl State {
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
 
-        if self.shell.terminal_focused() && ctrl {
-            let control = match &event.logical_key {
-                Key::Character(value) => match value.to_lowercase().as_str() {
-                    "c" => Some("\x03"),
-                    "d" => Some("\x04"),
-                    "z" => Some("\x1a"),
-                    "l" => Some("\x0c"),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let (Some(sequence), Some(terminal)) = (control, self.terminal.as_mut()) {
-                terminal.send(sequence);
-                self.pump_terminal();
-                self.redraw();
-                return;
-            }
-        }
-
-        if self.shell.terminal_focused() {
-            let sequence = match &event.logical_key {
-                Key::Named(NamedKey::Enter) => Some("\r"),
-                Key::Named(NamedKey::Backspace) => Some("\x7f"),
-                Key::Named(NamedKey::Tab) => Some("\t"),
-                Key::Named(NamedKey::Escape) => Some("\x1b"),
-                Key::Named(NamedKey::ArrowUp) => Some("\x1b[A"),
-                Key::Named(NamedKey::ArrowDown) => Some("\x1b[B"),
-                Key::Named(NamedKey::ArrowRight) => Some("\x1b[C"),
-                Key::Named(NamedKey::ArrowLeft) => Some("\x1b[D"),
-                Key::Named(NamedKey::Home) => Some("\x1b[H"),
-                Key::Named(NamedKey::End) => Some("\x1b[F"),
-                Key::Named(NamedKey::Delete) => Some("\x1b[3~"),
-                _ => None,
-            };
-            if let Some(sequence) = sequence {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    terminal.send(sequence);
+        // Saat terminal fokus, semua ketikan (termasuk Ctrl+huruf dan tombol panah) menjadi
+        // input shell. Ctrl+Tab tetap milik aplikasi untuk pindah tab.
+        if self.shell.terminal_focused() && self.terminal.is_some() {
+            let app_shortcut = ctrl && matches!(event.logical_key, Key::Named(NamedKey::Tab));
+            if !app_shortcut {
+                let mods = Mods { ctrl, alt, shift };
+                if self.send_terminal_key(event, mods) {
                     self.pump_terminal();
                     self.redraw();
                     return;
@@ -1740,7 +1801,7 @@ impl ApplicationHandler<UserEvent> for App {
                 state.redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if state.shell.folder_picker_scroll(wheel_lines(delta)) {
+                if state.scroll_terminal(delta, state.cursor) || state.shell.folder_picker_scroll(wheel_lines(delta)) {
                     state.redraw();
                 }
             }

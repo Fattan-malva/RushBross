@@ -8,6 +8,7 @@ mod chrome;
 pub use chrome::{ChromeAction, ChromeElement, WindowChrome};
 
 use rb_bookmarks::{Bookmark, BookmarkId, BookmarkStore};
+use rb_terminal::{Snapshot, CELL_WIDTH, DEFAULT_BG, FONT_SIZE, LINE_HEIGHT};
 use rb_tabs::{Tab, TabId, TabManager};
 use rb_ui::text_input::{index_at_offset, text_width};
 use rb_ui::{
@@ -112,6 +113,7 @@ enum Element {
     TerminalPane,
     TerminalDivider,
     TerminalClose,
+    TerminalPlaceholderButton,
     Address,
     AddressClear,
     BookmarkStar,
@@ -342,10 +344,16 @@ struct SplitPicker {
     position: Vec2,
 }
 
+/// Jarak isi grid terminal dari tepi body pane (logical px).
+pub const TERMINAL_PADDING_X: f32 = 8.0;
+pub const TERMINAL_PADDING_Y: f32 = 4.0;
+
 #[derive(Clone, Debug)]
 struct TerminalPane {
     title: String,
     ratio: f32,
+    /// True saat RushAgent dibuka tapi folder belum dipilih.
+    placeholder: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -509,7 +517,7 @@ pub struct BrowserShell {
     splits: Vec<SplitView>,
     split_drag: Option<usize>,
     terminal: Option<TerminalPane>,
-    terminal_lines: Vec<String>,
+    terminal_snapshot: Snapshot,
     terminal_drag: bool,
     pending_rush_agent: bool,
     pending_agent_connect: bool,
@@ -565,7 +573,7 @@ impl BrowserShell {
             splits: Vec::new(),
             split_drag: None,
             terminal: None,
-            terminal_lines: Vec::new(),
+            terminal_snapshot: Snapshot::default(),
             terminal_drag: false,
             pending_rush_agent: false,
             pending_agent_connect: false,
@@ -622,10 +630,23 @@ impl BrowserShell {
             .find(|part| !part.is_empty())
             .unwrap_or("RushAgent")
             .to_string();
+        self.show_terminal_pane(title, false);
+        // Terminal langsung menerima ketikan, seperti terminal sungguhan.
+        self.focus_terminal();
+    }
+
+    /// Tampilkan pane RushAgent kosong sebelum folder dipilih.
+    pub fn open_terminal_placeholder(&mut self) {
+        self.show_terminal_pane("RushAgent".to_string(), true);
+    }
+
+    fn show_terminal_pane(&mut self, title: String, placeholder: bool) {
         self.terminal = Some(TerminalPane {
             title,
             ratio: TERMINAL_RATIO,
+            placeholder,
         });
+        self.terminal_snapshot = Snapshot::default();
         self.terminal_drag = false;
         self.pending_terminal_close = false;
         self.show_bookmarks = false;
@@ -638,7 +659,7 @@ impl BrowserShell {
 
     pub fn close_terminal(&mut self) {
         self.terminal = None;
-        self.terminal_lines.clear();
+        self.terminal_snapshot = Snapshot::default();
         self.terminal_drag = false;
         self.pending_terminal_close = false;
         if self.focus == Some(Focus::Terminal) {
@@ -747,8 +768,17 @@ impl BrowserShell {
         self.agent_actions_enabled = enabled;
     }
 
-    pub fn set_terminal_lines(&mut self, lines: &[String]) {
-        self.terminal_lines = lines.to_vec();
+    /// Ganti keadaan layar terminal yang akan digambar (hasil `PtyTerminal::snapshot`).
+    pub fn set_terminal_snapshot(&mut self, snapshot: Snapshot) {
+        self.terminal_snapshot = snapshot;
+    }
+
+    /// True bila titik (logical px) berada di atas pane RushAgent.
+    pub fn terminal_pane_at(&self, point: Vec2) -> bool {
+        matches!(
+            self.hit_at(point),
+            Some((Element::TerminalPane | Element::TerminalPlaceholderButton, _))
+        )
     }
 
     pub fn terminal_focused(&self) -> bool {
@@ -1928,6 +1958,7 @@ impl BrowserShell {
             Element::TerminalPane => self.focus = Some(Focus::Terminal),
             Element::TerminalDivider => {}
             Element::TerminalClose => self.pending_terminal_close = true,
+            Element::TerminalPlaceholderButton => self.pending_rush_agent = true,
             Element::FullscreenClose => {
                 self.pending_fullscreen_exit = true;
             }
@@ -2520,6 +2551,116 @@ impl BrowserShell {
         }
     }
 
+    /// Gambar grid terminal: latar per sel, teks monospace per potongan ber-gaya, dan kursor.
+    /// Setiap potongan ditempatkan pada kolom absolutnya, jadi lebar sel selalu konsisten.
+    fn build_terminal_grid(&self, layer: &mut rb_ui::Layer, body: Rect) {
+        let origin_x = body.x + TERMINAL_PADDING_X;
+        let origin_y = body.y + TERMINAL_PADDING_Y;
+        let body_bottom = body.y + body.height;
+        let snapshot = &self.terminal_snapshot;
+
+        for (row, runs) in snapshot.lines.iter().enumerate() {
+            let y = origin_y + row as f32 * LINE_HEIGHT;
+            if y >= body_bottom {
+                break;
+            }
+            for run in runs {
+                let Some(bg) = run.bg else { continue };
+                let cells = run.text.chars().count() as f32;
+                layer.push_rect(RectShape::filled(
+                    Rect::new(
+                        origin_x + run.col as f32 * CELL_WIDTH,
+                        y,
+                        cells * CELL_WIDTH,
+                        LINE_HEIGHT,
+                    ),
+                    Color::rgb(bg[0], bg[1], bg[2]),
+                    0.0,
+                ));
+            }
+        }
+
+        for (row, runs) in snapshot.lines.iter().enumerate() {
+            let y = origin_y + row as f32 * LINE_HEIGHT;
+            if y >= body_bottom {
+                break;
+            }
+            for run in runs {
+                let color = Color::rgb(run.fg[0], run.fg[1], run.fg[2]);
+                layer.push_text(
+                    TextShape::new(
+                        run.text.clone(),
+                        origin_x + run.col as f32 * CELL_WIDTH,
+                        y,
+                        FONT_SIZE,
+                        color,
+                    )
+                    .family(rb_ui::FontFamily::Mono)
+                    .weight(if run.bold { 700 } else { 400 })
+                    .line_height(LINE_HEIGHT)
+                    .clip(body),
+                );
+            }
+        }
+
+        // Kursor hanya tampil saat pane fokus, supaya jelas mana yang menerima ketikan.
+        if let (Some((row, col)), true) = (snapshot.cursor, self.terminal_focused()) {
+            layer.push_rect(RectShape::filled(
+                Rect::new(
+                    origin_x + col as f32 * CELL_WIDTH,
+                    origin_y + row as f32 * LINE_HEIGHT,
+                    CELL_WIDTH,
+                    LINE_HEIGHT,
+                ),
+                Color::rgba(0xff, 0xff, 0xff, 0xb0),
+                0.0,
+            ));
+        }
+    }
+
+    /// Keadaan kosong: petunjuk dan tombol untuk memilih folder.
+    fn build_terminal_placeholder(&mut self, layer: &mut rb_ui::Layer, body: Rect, hover: Option<Element>) {
+        let theme = self.theme;
+        let text_y = body.y + body.height / 2.0 - 40.0;
+        layer.push_text(
+            TextShape::new(
+                "Pilih folder untuk memulai RushAgent",
+                body.x + 16.0,
+                text_y,
+                13.0,
+                theme.muted_foreground,
+            )
+            .width((body.width - 32.0).max(0.0))
+            .align(rb_ui::Align::Center),
+        );
+        let button_width = 160.0_f32.min((body.width - 32.0).max(0.0));
+        let button = Rect::new(
+            body.x + (body.width - button_width) / 2.0,
+            text_y + 32.0,
+            button_width,
+            32.0,
+        );
+        let hovered = hover == Some(Element::TerminalPlaceholderButton);
+        layer.push_rect(RectShape::filled(
+            button,
+            if hovered { theme.accent } else { theme.tab_inactive },
+            6.0,
+        ));
+        layer.push_text(
+            TextShape::new(
+                "Pilih folder",
+                button.x,
+                button.y + 8.0,
+                13.0,
+                theme.foreground,
+            )
+            .width(button.width)
+            .align(rb_ui::Align::Center)
+            .weight(500),
+        );
+        self.push_hit(Element::TerminalPlaceholderButton, button);
+    }
+
     fn build_terminal_pane(
         &mut self,
         layer: &mut rb_ui::Layer,
@@ -2529,7 +2670,11 @@ impl BrowserShell {
         let Some(layout) = self.terminal_layout(content) else {
             return;
         };
-        let Some(title) = self.terminal.as_ref().map(|terminal| terminal.title.clone()) else {
+        let Some((title, placeholder)) = self
+            .terminal
+            .as_ref()
+            .map(|terminal| (terminal.title.clone(), terminal.placeholder))
+        else {
             return;
         };
         if layout.pane.width <= 0.0 || layout.pane.height <= 0.0 {
@@ -2537,29 +2682,20 @@ impl BrowserShell {
         }
         let theme = self.theme;
         layer.push_rect(RectShape::filled(layout.pane, theme.background, 0.0));
+        let body = layout.body;
         layer.push_rect(RectShape::filled(
-            layout.body,
-            Color::rgb(0x0c, 0x0c, 0x0c),
+            body,
+            Color::rgb(DEFAULT_BG[0], DEFAULT_BG[1], DEFAULT_BG[2]),
             0.0,
         ));
-        let line_height = 16.0;
-        let visible_lines = (layout.body.height / line_height).floor().max(0.0) as usize;
-        let start = self.terminal_lines.len().saturating_sub(visible_lines);
-        for (index, line) in self.terminal_lines[start..].iter().enumerate() {
-            layer.push_text(
-                TextShape::new(
-                    line.clone(),
-                    layout.body.x + 8.0,
-                    layout.body.y + 4.0 + index as f32 * line_height,
-                    12.0,
-                    Color::rgb(0xd4, 0xd4, 0xd4),
-                )
-                .width((layout.body.width - 16.0).max(0.0))
-                .line_height(line_height)
-                .ellipsis(),
-            );
-        }
+        // Pane didaftarkan sebelum isinya: hit-test memakai entri terakhir, jadi tombol
+        // di dalam placeholder tetap menang atas pane.
         self.push_hit(Element::TerminalPane, layout.pane);
+        if placeholder {
+            self.build_terminal_placeholder(layer, body, hover);
+        } else {
+            self.build_terminal_grid(layer, body);
+        }
 
         let divider = Rect::new(
             layout.pane.x - SPLIT_GAP,

@@ -626,6 +626,7 @@ impl Renderer {
         let metrics = Metrics::new(font_size, line_height);
         let family = match text.family {
             FontFamily::Sans => Family::Name(self.ui_family),
+            FontFamily::Mono => Family::Name("Consolas"),
         };
         let attrs = Attrs::new().family(family).weight(Weight(text.weight));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
