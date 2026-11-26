@@ -236,6 +236,67 @@ fn upsert_json_config(
         .map_err(|error| error.to_string())
 }
 
+fn remove_json_config(
+    path: &std::path::Path,
+    keys: &[&str],
+    server_key: &str,
+) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut root: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("{} bukan JSON murni", path.display()))?;
+    let mut cursor = &mut root;
+    for key in keys {
+        let Some(next) = cursor.as_object_mut().and_then(|object| object.get_mut(*key)) else {
+            return Ok(false);
+        };
+        cursor = next;
+    }
+    let removed = cursor
+        .as_object_mut()
+        .is_some_and(|object| object.remove(server_key).is_some());
+    if removed {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(removed)
+}
+
+fn remove_agent_configs() -> Result<Vec<String>, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let mut targets = vec![
+        (cwd.join("opencode.json"), vec!["mcp", "servers"]),
+        (cwd.join(".mcp.json"), vec!["mcpServers"]),
+        (cwd.join(".kilo").join("kilo.json"), vec!["mcp"]),
+        (cwd.join(".agents").join("mcp_config.json"), vec!["mcpServers"]),
+    ];
+    if !home.is_empty() {
+        targets.push((
+            std::path::Path::new(&home).join(".claude.json"),
+            vec!["mcpServers"],
+        ));
+    }
+    let mut removed = Vec::new();
+    let mut failures = Vec::new();
+    for (path, keys) in targets {
+        match remove_json_config(&path, &keys, "rushbross") {
+            Ok(true) => removed.push(path.display().to_string()),
+            Ok(false) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    if removed.is_empty() && !failures.is_empty() {
+        return Err(failures.join("; "));
+    }
+    Ok(removed)
+}
+
 fn write_agent_configs() -> Result<Vec<String>, String> {
     let exe = std::env::current_exe()
         .map_err(|error| error.to_string())?
@@ -461,18 +522,14 @@ impl State {
     }
 
     fn open_rush_agent(&mut self) {
-        let folder = std::env::current_dir()
-            .or_else(|_| std::env::var("USERPROFILE").map(std::path::PathBuf::from))
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "C:\\".to_string());
-        self.start_rush_agent(folder);
         self.shell.open_folder_picker();
         self.redraw();
     }
 
     fn start_rush_agent(&mut self, folder: String) {
         self.stop_terminal();
-        match PtyTerminal::start(&folder) {
+        let window = self.window.clone();
+        match PtyTerminal::start(&folder, move || window.request_redraw()) {
             Ok(terminal) => {
                 self.terminal = Some(terminal);
                 self.shell.open_terminal(folder);
@@ -726,13 +783,26 @@ impl State {
     }
 
     fn connect_agent(&mut self) {
-        match write_agent_configs() {
-            Ok(paths) => {
-                self.shell.set_agent_connected(true);
-                self.shell
-                    .show_toast(format!("MCP tersambung ({} config)", paths.len()));
+        if self.shell.agent_connected() {
+            match remove_agent_configs() {
+                Ok(paths) => {
+                    self.shell.set_agent_connected(false);
+                    self.shell.show_toast(format!(
+                        "Connect MCP dinonaktifkan ({} config dibersihkan)",
+                        paths.len()
+                    ));
+                }
+                Err(error) => self.shell.show_toast(format!("MCP gagal dinonaktifkan: {error}")),
             }
-            Err(error) => self.shell.show_toast(format!("MCP gagal: {error}")),
+        } else {
+            match write_agent_configs() {
+                Ok(paths) => {
+                    self.shell.set_agent_connected(true);
+                    self.shell
+                        .show_toast(format!("MCP tersambung ({} config)", paths.len()));
+                }
+                Err(error) => self.shell.show_toast(format!("MCP gagal: {error}")),
+            }
         }
         self.redraw();
     }
@@ -785,15 +855,9 @@ impl State {
         if width <= 1.0 || height <= 1.0 {
             return;
         }
-        if self.shell.take_folder_cancel() {
-            self.stop_terminal();
-        }
-        if let Some(path) = self.shell.take_cd() {
-            if let Some(terminal) = self.terminal.as_mut() {
-                terminal.send(&format!("cd /d \"{path}\"\r"));
-                self.shell.focus_terminal();
-                self.shell.show_toast("Folder diterapkan ke RushAgent");
-            }
+        let _ = self.shell.take_folder_cancel();
+        if let Some(path) = self.shell.take_folder_selection() {
+            self.start_rush_agent(path);
         }
         if self.terminal_exited() {
             self.stop_terminal();
@@ -814,6 +878,9 @@ impl State {
             }
         }
         self.shell.set_maximized(self.window.is_maximized());
+        // Drain PTY output before building the frame so terminal text is
+        // visible in the redraw requested by the PTY reader thread.
+        self.pump_terminal();
         let frame = self.shell.render(width, height);
         self.frame = frame.clone();
         match self.renderer.render(&frame) {
@@ -836,7 +903,6 @@ impl State {
             self.window.set_visible(true);
         }
         self.sync_active_tab();
-        self.pump_terminal();
     }
 
     fn hide_overlay(&mut self) {
@@ -1333,12 +1399,38 @@ impl State {
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
 
+        if self.shell.terminal_focused() && ctrl {
+            let control = match &event.logical_key {
+                Key::Character(value) => match value.to_lowercase().as_str() {
+                    "c" => Some("\x03"),
+                    "d" => Some("\x04"),
+                    "z" => Some("\x1a"),
+                    "l" => Some("\x0c"),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let (Some(sequence), Some(terminal)) = (control, self.terminal.as_mut()) {
+                terminal.send(sequence);
+                self.pump_terminal();
+                self.redraw();
+                return;
+            }
+        }
+
         if self.shell.terminal_focused() {
             let sequence = match &event.logical_key {
                 Key::Named(NamedKey::Enter) => Some("\r"),
                 Key::Named(NamedKey::Backspace) => Some("\x7f"),
                 Key::Named(NamedKey::Tab) => Some("\t"),
                 Key::Named(NamedKey::Escape) => Some("\x1b"),
+                Key::Named(NamedKey::ArrowUp) => Some("\x1b[A"),
+                Key::Named(NamedKey::ArrowDown) => Some("\x1b[B"),
+                Key::Named(NamedKey::ArrowRight) => Some("\x1b[C"),
+                Key::Named(NamedKey::ArrowLeft) => Some("\x1b[D"),
+                Key::Named(NamedKey::Home) => Some("\x1b[H"),
+                Key::Named(NamedKey::End) => Some("\x1b[F"),
+                Key::Named(NamedKey::Delete) => Some("\x1b[3~"),
                 _ => None,
             };
             if let Some(sequence) = sequence {

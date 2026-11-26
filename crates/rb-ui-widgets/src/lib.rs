@@ -40,7 +40,7 @@ const SPLIT_PALETTE: [Color; 5] = [
 ];
 const CONTEXT_ITEM_HEIGHT: f32 = 30.0;
 const TAB_CONTEXT_WIDTH: f32 = 220.0;
-const TERMINAL_RATIO: f32 = 0.46;
+const TERMINAL_RATIO: f32 = 0.5;
 const TERMINAL_MIN_RATIO: f32 = 0.2;
 const TERMINAL_MAX_RATIO: f32 = 0.8;
 
@@ -50,8 +50,8 @@ const BOOKMARK_BAR_HEIGHT: f32 = 32.0;
 const BOOKMARK_CHIP_HEIGHT: f32 = 24.0;
 const POPOVER_WIDTH: f32 = 320.0;
 const POPOVER_MAX_LIST_HEIGHT: f32 = 240.0;
-const FOLDER_PICKER_WIDTH: f32 = 420.0;
-const FOLDER_PICKER_HEIGHT: f32 = 440.0;
+const FOLDER_PICKER_WIDTH: f32 = 560.0;
+const FOLDER_PICKER_HEIGHT: f32 = 480.0;
 const FOLDER_ROW_HEIGHT: f32 = 28.0;
 const FOLDER_VISIBLE_ROWS: usize = 9;
 const FOLDER_SCAN_LIMIT: usize = 2000;
@@ -500,7 +500,7 @@ pub struct BrowserShell {
     show_bookmarks: bool,
     editing: Option<BookmarkEdit>,
     folder_picker: Option<FolderPicker>,
-    pending_cd: Option<String>,
+    pending_folder_selection: Option<String>,
     pending_folder_cancel: bool,
     context_menu: Option<ContextMenu>,
     tab_context_menu: Option<TabContextMenu>,
@@ -557,7 +557,7 @@ impl BrowserShell {
             show_bookmarks: false,
             editing: None,
             folder_picker: None,
-            pending_cd: None,
+            pending_folder_selection: None,
             pending_folder_cancel: false,
             context_menu: None,
             tab_context_menu: None,
@@ -681,7 +681,8 @@ impl BrowserShell {
             return false;
         };
         let max = picker.filtered.len().saturating_sub(FOLDER_VISIBLE_ROWS);
-        let next = (picker.scroll as isize + lines.round() as isize).clamp(0, max as isize) as usize;
+        // Windows reports positive wheel deltas when the user scrolls upward.
+        let next = (picker.scroll as isize - lines.round() as isize).clamp(0, max as isize) as usize;
         if next == picker.scroll {
             return false;
         }
@@ -695,8 +696,8 @@ impl BrowserShell {
         }
     }
 
-    pub fn take_cd(&mut self) -> Option<String> {
-        self.pending_cd.take()
+    pub fn take_folder_selection(&mut self) -> Option<String> {
+        self.pending_folder_selection.take()
     }
 
     pub fn take_folder_cancel(&mut self) -> bool {
@@ -709,21 +710,19 @@ impl BrowserShell {
     }
 
     fn confirm_folder_picker(&mut self) {
-        let mut folder = None;
-        if let Some(picker) = self.folder_picker.as_ref() {
-            if let Some(index) = picker.selected {
-                folder = picker.filtered.get(index).cloned();
-            }
-            if folder.is_none() {
-                folder = picker.current().cloned();
-            }
-        }
+        let folder = self.folder_picker.as_ref().and_then(|picker| {
+            // If a directory is open, choose that directory itself rather
+            // than the first child that happens to be highlighted.
+            picker
+                .current()
+                .cloned()
+                .or_else(|| picker.selected.and_then(|index| picker.filtered.get(index).cloned()))
+        });
         if let Some(folder) = folder {
             if folder.is_dir() {
-                self.pending_cd = Some(folder.to_string_lossy().into_owned());
+                self.pending_folder_selection = Some(folder.to_string_lossy().into_owned());
                 self.close_folder_picker();
-                self.focus_terminal();
-                self.show_toast("RushAgent siap di folder ini");
+                self.show_toast("Folder dipilih untuk RushAgent");
             }
         }
     }
@@ -738,6 +737,10 @@ impl BrowserShell {
 
     pub fn set_agent_connected(&mut self, connected: bool) {
         self.agent_connected = connected;
+    }
+
+    pub fn agent_connected(&self) -> bool {
+        self.agent_connected
     }
 
     pub fn set_agent_actions_enabled(&mut self, enabled: bool) {
@@ -3051,16 +3054,16 @@ impl BrowserShell {
             AGENT_BUTTON_WIDTH,
             NAV_BUTTON_SIZE,
         );
-        let select_rect = Rect::new(
-            agent_rect.x - gap - NAV_BUTTON_SIZE,
-            button_y,
-            NAV_BUTTON_SIZE,
-            NAV_BUTTON_SIZE,
-        );
         let connect_rect = Rect::new(
-            select_rect.x - gap - CONNECT_BUTTON_WIDTH,
+            agent_rect.x - gap - CONNECT_BUTTON_WIDTH,
             button_y,
             CONNECT_BUTTON_WIDTH,
+            NAV_BUTTON_SIZE,
+        );
+        let select_rect = Rect::new(
+            connect_rect.x - gap - NAV_BUTTON_SIZE,
+            button_y,
+            NAV_BUTTON_SIZE,
             NAV_BUTTON_SIZE,
         );
         self.layout.manage_button = more_rect;
@@ -3068,7 +3071,7 @@ impl BrowserShell {
         let form = Rect::new(
             reload_rect.right() + gap,
             toolbar.y + 6.0,
-            (connect_rect.x - gap - reload_rect.right() - gap).max(1.0),
+            (select_rect.x - gap - reload_rect.right() - gap).max(1.0),
             ADDRESS_HEIGHT,
         );
 
@@ -3180,6 +3183,8 @@ impl BrowserShell {
             connect_rect,
             if connect_hover {
                 theme.accent
+            } else if connected {
+                Color::rgb(0x16, 0x3b, 0x2a)
             } else {
                 theme.muted
             },
@@ -3879,11 +3884,13 @@ impl BrowserShell {
         hover: Option<Element>,
     ) {
         let theme = self.theme;
+        let panel_width = FOLDER_PICKER_WIDTH.min((width - 16.0).max(160.0));
+        let panel_height = FOLDER_PICKER_HEIGHT.min((height - 16.0).max(240.0));
         let panel = Rect::new(
-            ((width - FOLDER_PICKER_WIDTH) * 0.5).max(8.0),
-            ((height - FOLDER_PICKER_HEIGHT) * 0.5).max(8.0),
-            FOLDER_PICKER_WIDTH,
-            FOLDER_PICKER_HEIGHT,
+            ((width - panel_width) * 0.5).max(8.0),
+            ((height - panel_height) * 0.5).max(8.0),
+            panel_width,
+            panel_height,
         );
         let layer = &mut frame.popup;
         layer.push_rect(RectShape::bordered(
@@ -3984,15 +3991,51 @@ impl BrowserShell {
         }
 
         let search_rect = Rect::new(panel.x + 16.0, panel.y + 82.0, panel.width - 32.0, 32.0);
-        self.build_edit_input(
-            layer,
+        let search_focused = focus == Some(Focus::FolderSearch);
+        layer.push_rect(RectShape::bordered(
             search_rect,
-            picker.search.text(),
-            picker.search.cursor(),
-            focus == Some(Focus::FolderSearch),
-            "Cari folder...",
-            Element::FolderSearch,
-        );
+            theme.background,
+            4.0,
+            1.0,
+            if search_focused { theme.ring } else { theme.border },
+        ));
+        layer.push_icon(IconShape::new(
+            Icon::Search,
+            icon_rect(Vec2::new(search_rect.x + 16.0, search_rect.center().y), 14.0),
+            theme.muted_foreground,
+        ));
+        let search_value = picker.search.text();
+        let search_text_y = search_rect.y + (search_rect.height - 12.0 * 1.3) * 0.5;
+        if search_value.is_empty() {
+            layer.push_text(
+                TextShape::new(
+                    "Cari folder...",
+                    search_rect.x + 34.0,
+                    search_text_y,
+                    12.0,
+                    theme.muted_foreground,
+                )
+                .width(search_rect.width - 44.0)
+                .ellipsis(),
+            );
+        } else {
+            layer.push_text(
+                TextShape::new(
+                    search_value,
+                    search_rect.x + 34.0,
+                    search_text_y,
+                    12.0,
+                    theme.popover_foreground,
+                )
+                .width(search_rect.width - 44.0)
+                .ellipsis()
+                .caret(
+                    if search_focused { Some(picker.search.cursor()) } else { None },
+                    theme.foreground,
+                ),
+            );
+        }
+        self.push_hit(Element::FolderSearch, search_rect);
 
         let list_y = search_rect.bottom() + 10.0;
         let total = picker.filtered.len();
@@ -4052,11 +4095,22 @@ impl BrowserShell {
                 .width(rect.width - 90.0)
                 .ellipsis(),
             );
-            if row_hover {
+            if is_drive {
+                layer.push_icon(IconShape::new(
+                    Icon::ChevronRight,
+                    icon_rect(Vec2::new(rect.right() - 14.0, rect.center().y), 12.0),
+                    theme.muted_foreground,
+                ));
+            } else if row_hover {
+                layer.push_icon(IconShape::new(
+                    Icon::Check,
+                    icon_rect(Vec2::new(rect.right() - 54.0, rect.center().y), 12.0),
+                    theme.foreground,
+                ));
                 layer.push_text(
                     TextShape::new(
                         "Pilih".to_string(),
-                        rect.right() - 48.0,
+                        rect.right() - 40.0,
                         rect.y + 6.0,
                         11.0,
                         theme.foreground,
@@ -4096,15 +4150,25 @@ impl BrowserShell {
                 if active { theme.accent } else { theme.muted },
                 6.0,
             ));
+            let label_x = if element == Element::FolderOpen {
+                layer.push_icon(IconShape::new(
+                    Icon::Check,
+                    icon_rect(Vec2::new(rect.x + 22.0, rect.center().y), 14.0),
+                    theme.foreground,
+                ));
+                rect.x + 34.0
+            } else {
+                rect.x + 12.0
+            };
             layer.push_text(
                 TextShape::new(
                     label.to_string(),
-                    rect.x + 12.0,
+                    label_x,
                     rect.y + 8.0,
                     12.0,
                     theme.foreground,
                 )
-                .width(rect.width - 24.0)
+                .width((rect.right() - label_x - 12.0).max(0.0))
                 .ellipsis(),
             );
             self.push_hit(element, rect);
@@ -5168,7 +5232,7 @@ mod tests {
         shell.open_folder_picker();
         assert!(shell.folder_picker.is_some());
         shell.submit();
-        assert!(shell.take_cd().is_some());
+        assert!(shell.take_folder_selection().is_some());
         assert!(shell.folder_picker.is_none());
         shell.activate(Element::FolderCancel);
         assert!(shell.take_folder_cancel());
@@ -5183,9 +5247,9 @@ mod tests {
         picker.filtered = (0..30)
             .map(|index| PathBuf::from(format!("C:\\folder{index}")))
             .collect();
-        assert!(shell.folder_picker_scroll(3.0));
+        assert!(shell.folder_picker_scroll(-3.0));
         assert_eq!(shell.folder_picker.as_ref().unwrap().scroll, 3);
-        assert!(shell.folder_picker_scroll(-100.0));
+        assert!(shell.folder_picker_scroll(100.0));
         assert_eq!(shell.folder_picker.as_ref().unwrap().scroll, 0);
     }
 }

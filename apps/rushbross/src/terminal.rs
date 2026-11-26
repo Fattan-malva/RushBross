@@ -15,7 +15,13 @@ pub struct PtyTerminal {
 }
 
 impl PtyTerminal {
-    pub fn start(folder: &str) -> Result<Self, String> {
+    pub fn start<F>(folder: &str, on_output: F) -> Result<Self, String>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        if !std::path::Path::new(folder).is_dir() {
+            return Err(format!("Folder tidak ditemukan: {folder}"));
+        }
         let cols = 100u16;
         let rows = 30u16;
         let pty_system = native_pty_system();
@@ -27,9 +33,19 @@ impl PtyTerminal {
                 pixel_height: 0,
             })
             .map_err(|error| error.to_string())?;
-        let mut command = CommandBuilder::new("cmd.exe");
+        let shell_path = std::env::var_os("COMSPEC")
+            .filter(|path| std::path::Path::new(path).is_file())
+            .or_else(|| {
+                std::env::var_os("SystemRoot")
+                    .map(std::path::PathBuf::from)
+                    .map(|root| root.join("System32").join("cmd.exe"))
+                    .filter(|path| path.is_file())
+            })
+            .unwrap_or_else(|| "cmd.exe".into());
+        let shell_path = shell_path.to_string_lossy().into_owned();
+        let mut command = CommandBuilder::new(&shell_path);
         command.args(["/D", "/Q", "/K"]);
-        command.arg(format!("cd /d \"{folder}\""));
+        command.env("PROMPT", "$P$G");
         command.env("TERM", "xterm-256color");
         command.cwd(folder);
         let child = pair
@@ -43,6 +59,7 @@ impl PtyTerminal {
             .try_clone_reader()
             .map_err(|error| error.to_string())?;
         let (tx, rx) = mpsc::channel();
+        let on_output = std::sync::Arc::new(on_output);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             loop {
@@ -54,8 +71,11 @@ impl PtyTerminal {
                             .copied()
                             .filter(|byte| *byte != 7)
                             .collect();
-                        if !data.is_empty() && tx.send(data).is_err() {
-                            break;
+                        if !data.is_empty() {
+                            if tx.send(data).is_err() {
+                                break;
+                            }
+                            on_output();
                         }
                     }
                 }
@@ -288,10 +308,14 @@ mod tests {
 
     #[test]
     fn pty_starts_and_captures_output() {
-        let mut terminal = PtyTerminal::start(env!("CARGO_MANIFEST_DIR")).expect("pty");
+        let mut terminal =
+            PtyTerminal::start(env!("CARGO_MANIFEST_DIR"), || {}).expect("pty");
         sleep(Duration::from_millis(400));
         terminal.pump();
-        assert!(!terminal.lines().is_empty());
+        assert!(
+            terminal.lines().iter().any(|line| !line.trim().is_empty()),
+            "shell started but did not emit a visible prompt"
+        );
         terminal.kill();
     }
 }

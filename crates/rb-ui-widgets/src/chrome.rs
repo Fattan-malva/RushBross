@@ -22,10 +22,10 @@ pub struct WindowChrome {
 }
 
 impl WindowChrome {
-    const BUTTON_SIZE: f32 = 32.0;
-    const SLOT_WIDTH: f32 = 44.0;
-    const RIGHT_PADDING: f32 = 8.0;
+    const BUTTON_WIDTH: f32 = 46.0;
     const STRIP_HEIGHT: f32 = 40.0;
+    const SLOT_WIDTH: f32 = Self::BUTTON_WIDTH;
+    const RIGHT_PADDING: f32 = 0.0;
 
     pub fn reserved_width() -> f32 {
         Self::SLOT_WIDTH * 3.0 + Self::RIGHT_PADDING
@@ -33,20 +33,19 @@ impl WindowChrome {
 
     pub fn layout(width: f32, after_x: f32) -> Self {
         let start = (width - Self::reserved_width()).max(after_x);
-        let y = (Self::STRIP_HEIGHT - Self::BUTTON_SIZE) * 0.5;
         let buttons = [
-            Rect::new(start, y, Self::BUTTON_SIZE, Self::BUTTON_SIZE),
+            Rect::new(start, 0.0, Self::BUTTON_WIDTH, Self::STRIP_HEIGHT),
             Rect::new(
                 start + Self::SLOT_WIDTH,
-                y,
-                Self::BUTTON_SIZE,
-                Self::BUTTON_SIZE,
+                0.0,
+                Self::BUTTON_WIDTH,
+                Self::STRIP_HEIGHT,
             ),
             Rect::new(
                 start + Self::SLOT_WIDTH * 2.0,
-                y,
-                Self::BUTTON_SIZE,
-                Self::BUTTON_SIZE,
+                0.0,
+                Self::BUTTON_WIDTH,
+                Self::STRIP_HEIGHT,
             ),
         ];
         let drag = Rect::new(
@@ -118,14 +117,19 @@ impl WindowChrome {
                 } else {
                     theme.accent
                 };
-                layer.push_rect(RectShape::filled(*rect, color, Self::BUTTON_SIZE * 0.5));
+                layer.push_rect(RectShape::filled(*rect, color, 0.0));
             }
             let color = if is_hover {
                 theme.primary_foreground
             } else {
                 theme.muted_foreground
             };
-            let icon_rect = Rect::new(rect.x + 9.0, rect.y + 9.0, 14.0, 14.0);
+            let icon_rect = Rect::new(
+                rect.center().x - 7.0,
+                rect.center().y - 7.0,
+                14.0,
+                14.0,
+            );
             layer.push_icon(IconShape::new(icons[index], icon_rect, color));
         }
     }
