@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rb_agent::{AgentRequest, AgentServer};
 use terminal::PtyTerminal;
@@ -56,32 +55,40 @@ struct OverlayState {
     cursor_icon: CursorIcon,
 }
 
-fn json_rpc(id: Option<u64>, result: Result<Value, String>) -> String {
+fn json_rpc(id: Option<Value>, result: Result<Value, String>) -> String {
     match result {
-        Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string(),
-        Err(error) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": -32603, "message": error }
-        })
-        .to_string(),
+        Ok(value) => rb_agent::rpc_result(id, value),
+        Err(error) => rb_agent::rpc_error(id, rb_agent::ERR_INTERNAL, &error),
     }
 }
 
 fn tool_content(result: Result<Value, String>) -> Value {
-    match result {
-        Ok(value) => json!({
-            "content": [{ "type": "text", "text": value.to_string() }],
-            "isError": false
-        }),
-        Err(error) => json!({
-            "content": [{ "type": "text", "text": error }],
-            "isError": true
-        }),
-    }
+    rb_agent::tool_result(result)
 }
 
-fn tool_channel(reply: Sender<String>, id: Option<u64>) -> mpsc::Sender<Result<Value, String>> {
+/// Nama tool yang diiklankan lewat `tools/list`. Pemanggilan nama lain dibalas error protokol.
+fn is_known_tool(name: &str) -> bool {
+    tool_definitions()
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+}
+
+/// Token acak per sesi. Dibuat dari RandomState (seed acak OS), bukan waktu/PID saja.
+fn new_session_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    (0..2)
+        .map(|_| {
+            format!(
+                "{:016x}",
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish()
+            )
+        })
+        .collect()
+}
+
+fn tool_channel(reply: Sender<String>, id: Option<Value>) -> mpsc::Sender<Result<Value, String>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         if let Ok(result) = receiver.recv() {
@@ -267,25 +274,96 @@ fn remove_json_config(
     Ok(removed)
 }
 
+/// Lokasi binary bridge stdio. Config tidak memuat token: bridge membaca sesi aktif
+/// dari `rushbross-agent.json` di folder temp, jadi config tetap valid setiap RushBross dibuka.
+fn bridge_command() -> Result<String, String> {
+    Ok(std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .with_file_name("rushbross-mcp.exe")
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// Config JSON yang dikenali CLI agent. `keys` adalah jalur objek induknya.
+fn json_targets(cwd: &std::path::Path, home: Option<&std::path::Path>) -> Vec<(std::path::PathBuf, Vec<&'static str>, bool)> {
+    // Argumen ketiga: true bila formatnya `"command": [...]` (opencode/kilo), false bila `command` + `args`.
+    let mut targets = vec![
+        (cwd.join("opencode.json"), vec!["mcp"], true),
+        (cwd.join(".kilo").join("kilo.json"), vec!["mcp"], true),
+        (cwd.join(".mcp.json"), vec!["mcpServers"], false),
+        (cwd.join(".agents").join("mcp_config.json"), vec!["mcpServers"], false),
+    ];
+    if let Some(home) = home {
+        targets.push((home.join(".claude.json"), vec!["mcpServers"], false));
+        targets.push((home.join(".gemini").join("settings.json"), vec!["mcpServers"], false));
+        targets.push((home.join(".cursor").join("mcp.json"), vec!["mcpServers"], false));
+    }
+    targets
+}
+
+fn codex_config(home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    home.map(|home| home.join(".codex").join("config.toml"))
+}
+
+fn write_agent_configs() -> Result<Vec<String>, String> {
+    let command = bridge_command()?;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let home = user_home();
+
+    let local_server = json!({
+        "type": "local",
+        "command": [command.clone()],
+        "enabled": true,
+        "timeout": 30000
+    });
+    let stdio_server = json!({
+        "type": "stdio",
+        "command": command.clone(),
+        "args": []
+    });
+
+    let mut written = Vec::new();
+    let mut failures = Vec::new();
+    for (path, keys, is_local) in json_targets(&cwd, home.as_deref()) {
+        let server = if is_local { local_server.clone() } else { stdio_server.clone() };
+        match upsert_json_config(&path, &keys, "rushbross", server) {
+            Ok(()) => written.push(path.display().to_string()),
+            Err(error) => failures.push(error),
+        }
+    }
+    if let Some(path) = codex_config(home.as_deref()) {
+        match upsert_toml_server(&path, &command) {
+            Ok(()) => written.push(path.display().to_string()),
+            Err(error) => failures.push(error),
+        }
+    }
+    if written.is_empty() {
+        return Err(failures.join("; "));
+    }
+    Ok(written)
+}
+
 fn remove_agent_configs() -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let mut targets = vec![
-        (cwd.join("opencode.json"), vec!["mcp", "servers"]),
-        (cwd.join(".mcp.json"), vec!["mcpServers"]),
-        (cwd.join(".kilo").join("kilo.json"), vec!["mcp"]),
-        (cwd.join(".agents").join("mcp_config.json"), vec!["mcpServers"]),
-    ];
-    if !home.is_empty() {
-        targets.push((
-            std::path::Path::new(&home).join(".claude.json"),
-            vec!["mcpServers"],
-        ));
-    }
+    let home = user_home();
     let mut removed = Vec::new();
     let mut failures = Vec::new();
-    for (path, keys) in targets {
+    for (path, keys, _) in json_targets(&cwd, home.as_deref()) {
         match remove_json_config(&path, &keys, "rushbross") {
+            Ok(true) => removed.push(path.display().to_string()),
+            Ok(false) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    if let Some(path) = codex_config(home.as_deref()) {
+        match remove_toml_server(&path) {
             Ok(true) => removed.push(path.display().to_string()),
             Ok(false) => {}
             Err(error) => failures.push(error),
@@ -297,94 +375,49 @@ fn remove_agent_configs() -> Result<Vec<String>, String> {
     Ok(removed)
 }
 
-fn write_agent_configs() -> Result<Vec<String>, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| error.to_string())?
-        .with_file_name("rushbross-mcp.exe");
-    let command = exe.to_string_lossy().into_owned();
-    let addr = std::env::var("RUSHBROSS_MCP_ADDR").map_err(|error| error.to_string())?;
-    let token = std::env::var("RUSHBROSS_MCP_TOKEN").map_err(|error| error.to_string())?;
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-
-    let local_server = json!({
-        "type": "local",
-        "command": [command.clone()],
-        "environment": {
-            "RUSHBROSS_MCP_ADDR": addr,
-            "RUSHBROSS_MCP_TOKEN": token
-        },
-        "enabled": true,
-        "timeout": 30000
-    });
-    let stdio_server = json!({
-        "type": "stdio",
-        "command": command,
-        "args": [],
-        "env": {
-            "RUSHBROSS_MCP_ADDR": addr.clone(),
-            "RUSHBROSS_MCP_TOKEN": token.clone()
-        }
-    });
-
-    let targets = [
-        (cwd.join("opencode.json"), vec!["mcp", "servers"], local_server.clone()),
-        (cwd.join(".mcp.json"), vec!["mcpServers"], stdio_server.clone()),
-        (
-            cwd.join(".kilo").join("kilo.json"),
-            vec!["mcp"],
-            local_server,
-        ),
-        (
-            cwd.join(".agents").join("mcp_config.json"),
-            vec!["mcpServers"],
-            stdio_server,
-        ),
-    ];
-    let mut written = Vec::new();
-    let mut failures = Vec::new();
-    for (path, keys, server) in targets {
-        match upsert_json_config(&path, &keys, "rushbross", server) {
-            Ok(()) => written.push(path.display().to_string()),
-            Err(error) => failures.push(error),
-        }
+fn upsert_toml_server(path: &std::path::Path, command: &str) -> Result<(), String> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path).map_err(|error| error.to_string())?
+    } else {
+        String::new()
+    };
+    let updated = rb_agent::toml_upsert_server(
+        &text,
+        "mcp_servers.rushbross",
+        &[
+            ("command", rb_agent::TomlValue::Str(command)),
+            ("args", rb_agent::TomlValue::StrArray(&[])),
+        ],
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    if !home.is_empty() {
-        let global = std::path::Path::new(&home)
-            .join(".claude.json");
-        if let Err(error) = upsert_json_config(&global, &["mcpServers"], "rushbross", json!({
-            "type": "stdio",
-            "command": exe.to_string_lossy().into_owned(),
-            "args": [],
-            "env": {
-                "RUSHBROSS_MCP_ADDR": std::env::var("RUSHBROSS_MCP_ADDR").unwrap_or_default(),
-                "RUSHBROSS_MCP_TOKEN": std::env::var("RUSHBROSS_MCP_TOKEN").unwrap_or_default()
-            }
-        })) {
-            failures.push(error);
-        } else {
-            written.push(global.display().to_string());
-        }
-    }
-    if written.is_empty() {
-        return Err(failures.join("; "));
-    }
-    Ok(written)
+    std::fs::write(path, updated).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+fn remove_toml_server(path: &std::path::Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    match rb_agent::toml_remove_server(&text, "mcp_servers.rushbross") {
+        Some(updated) => {
+            std::fs::write(path, updated).map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Satu baris JSON tanpa CR/LF. Teks yang dikirim ke terminal tidak akan
+/// tereksekusi baris demi baris (cmd) atau terkirim sebagai pesan terpisah ke CLI agent.
+/// Newline di HTML/teks sudah di-escape JSON, dan tidak ada tombol Enter yang ikut dikirim.
 fn element_message(selection: &Value) -> String {
-    let get = |key: &str| selection.get(key).and_then(Value::as_str).unwrap_or("");
-    let rect = selection.get("rect").map(Value::to_string).unwrap_or_default();
-    format!(
-        "[RushBross selected element]\nURL: {}\nTitle: {}\nSelector: {}\nTag: {}\nText: {}\nHTML: {}\nRect: {}\n\nGunakan elemen ini sebagai konteks untuk tugas berikutnya.",
-        get("url"),
-        get("title"),
-        get("selector"),
-        get("tag"),
-        get("text"),
-        get("html"),
-        rect
-    )
+    let mut payload = selection.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("type");
+    }
+    format!("[RushBross selected element] {}", payload)
 }
 
 struct State {
@@ -427,20 +460,10 @@ impl State {
         );
         let shell = BrowserShell::new();
         let agent_proxy = proxy.clone();
-        let token = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let agent_server = AgentServer::start(token, move |request| {
+        let agent_server = AgentServer::start(new_session_token(), move |request| {
             let _ = agent_proxy.send_event(UserEvent::Agent(request));
         })
         .map_err(|error| format!("start agent server: {error}"))?;
-        std::env::set_var("RUSHBROSS_MCP_ADDR", agent_server.endpoint());
-        std::env::set_var("RUSHBROSS_MCP_TOKEN", &agent_server.token);
         let session = json!({
             "addr": agent_server.endpoint(),
             "token": agent_server.token
@@ -579,33 +602,64 @@ impl State {
     }
 
     fn handle_agent_request(&mut self, request: AgentRequest) {
-        let id = request.id;
-        let result = match request.method.as_str() {
-            "initialize" => Ok(json!({
-                "protocolVersion": rb_agent::PROTOCOL_VERSION,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "rushbross", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Gunakan tool browser_* untuk mengendalikan RushBross. Kursor hijau menandai aksi agent."
-            })),
-            "notifications/initialized" => return,
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        let id = request.id.clone();
+        let response = match request.method.as_str() {
+            "initialize" => {
+                let requested = request.params.get("protocolVersion").and_then(Value::as_str);
+                json_rpc(
+                    id,
+                    Ok(json!({
+                        "protocolVersion": rb_agent::negotiate_protocol_version(requested),
+                        "capabilities": {
+                            "tools": { "listChanged": false },
+                            "resources": { "listChanged": false },
+                            "prompts": { "listChanged": false }
+                        },
+                        "serverInfo": { "name": "rushbross", "version": env!("CARGO_PKG_VERSION") },
+                        "instructions": "Gunakan tool browser_* untuk mengendalikan RushBross. Kursor hijau menandai aksi agent. browser_get_selection mengembalikan elemen yang dipilih pengguna lewat mode Select."
+                    })),
+                )
+            }
+            "notifications/initialized" | "notifications/cancelled" => return,
+            "ping" => json_rpc(id, Ok(json!({}))),
+            "tools/list" => json_rpc(id, Ok(json!({ "tools": tool_definitions() }))),
+            // Server ini tidak punya resource atau prompt, tetapi CLI sering memanggil daftarnya.
+            "resources/list" => json_rpc(id, Ok(json!({ "resources": [] }))),
+            "resources/templates/list" => json_rpc(id, Ok(json!({ "resourceTemplates": [] }))),
+            "prompts/list" => json_rpc(id, Ok(json!({ "prompts": [] }))),
             "tools/call" => {
-                match self.start_tool(&request.params, request.reply.clone(), id) {
-                    Some(result) => result,
-                    None => return,
+                let name = request.params.get("name").and_then(Value::as_str).unwrap_or("");
+                if !is_known_tool(name) {
+                    rb_agent::rpc_error(
+                        id,
+                        rb_agent::ERR_INVALID_PARAMS,
+                        &format!("tool tidak dikenal: {name}"),
+                    )
+                } else {
+                    match self.start_tool(&request.params, request.reply.clone(), id.clone()) {
+                        // Hasil tool sudah berbentuk `content` + `isError`.
+                        Some(Ok(value)) => json_rpc(id, Ok(value)),
+                        // Kegagalan tool dikirim sebagai hasil tool (`isError: true`), bukan error protokol.
+                        Some(Err(error)) => json_rpc(id, Ok(tool_content(Err(error)))),
+                        // Balasan akan dikirim belakangan lewat tool_channel.
+                        None => return,
+                    }
                 }
             }
-            _ => Err(format!("method tidak dikenal: {}", request.method)),
+            other => rb_agent::rpc_error(
+                id,
+                rb_agent::ERR_METHOD_NOT_FOUND,
+                &format!("method tidak dikenal: {other}"),
+            ),
         };
-        let _ = request.reply.send(json_rpc(id, result));
+        let _ = request.reply.send(response);
     }
 
     fn start_tool(
         &mut self,
         params: &Value,
         reply: Sender<String>,
-        id: Option<u64>,
+        id: Option<Value>,
     ) -> Option<Result<Value, String>> {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args = params
