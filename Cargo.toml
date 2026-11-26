@@ -24,7 +24,6 @@ rb-ui = { path = "crates/rb-ui" }
 rb-ui-widgets = { path = "crates/rb-ui-widgets" }
 rb-ui-renderer = { path = "crates/rb-ui-renderer" }
 rb-agent = { path = "crates/rb-agent" }
-rb-terminal = { path = "crates/rb-terminal" }
 alacritty_terminal = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

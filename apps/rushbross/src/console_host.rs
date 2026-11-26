@@ -11,21 +11,20 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use windows::core::{BOOL, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HWND};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetConsoleWindow, WriteConsoleInputW, INPUT_RECORD,
-    INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+    AttachConsole, FreeConsole, GetConsoleWindow, WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0,
+    KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{AttachThreadInput, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId, IsChild, SetParent,
-    SetWindowLongW, GUITHREADINFO,
-    SetWindowPos, ShowWindow, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    AttachThreadInput, GetGUIThreadInfo, GetWindowLongW, GetWindowThreadProcessId, IsChild,
+    SetParent, SetWindowLongW, SetWindowPos, ShowWindow, GUITHREADINFO, GWL_STYLE, HWND_TOP,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
 };
 
 /// Shell bawaan Windows: COMSPEC (biasanya cmd.exe), sama seperti terminal bawaan.
@@ -156,7 +155,11 @@ impl ConsoleHost {
                 } else {
                     0
                 };
-                let unit = if unit == u16::from(b'\n') { u16::from(b'\r') } else { unit };
+                let unit = if unit == u16::from(b'\n') {
+                    u16::from(b'\r')
+                } else {
+                    unit
+                };
                 [true, false].map(|down| key_record(down, virtual_key, unit))
             })
             .collect();
@@ -262,7 +265,8 @@ fn embed(hwnd: HWND, parent: HWND, rect: (i32, i32, i32, i32)) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let removed = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_POPUP;
+        let removed =
+            WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_POPUP;
         let style = (style & !removed) | WS_CHILD | WS_VISIBLE;
         SetWindowLongW(hwnd, GWL_STYLE, style as i32);
         let _ = SetParent(hwnd, Some(parent));
